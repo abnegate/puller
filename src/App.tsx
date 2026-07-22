@@ -1,53 +1,294 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { RefreshCw } from 'lucide-react';
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { RefreshCw } from "lucide-react";
+import {
+  AnimatePresence,
+  LayoutGroup,
+  motion,
+  useReducedMotion,
+} from "motion/react";
 
-import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
+import { getPulls, getRecentReleases } from "./api";
+import { useAuto, type AutoController } from "./auto";
+import HiddenPullsMenu, { type HiddenPull } from "./components/HiddenPullsMenu";
+import NewTaskForm from "./components/NewTaskForm";
+import ReadinessSection from "./components/ReadinessSection";
+import RecentReleases from "./components/RecentReleases";
+import ReleaseDialog from "./components/ReleaseDialog";
+import ThemeToggle from "./components/ThemeToggle";
+import { Button } from "./components/ui/button";
 import {
   Card,
   CardContent,
   CardFooter,
   CardHeader,
-} from '@/components/ui/card';
-import { Separator } from '@/components/ui/separator';
-import { Skeleton } from '@/components/ui/skeleton';
-import { getPulls } from './api';
-import ReadinessSection from './components/ReadinessSection';
-import type { PullsResponse } from './types';
+} from "./components/ui/card";
+import { Separator } from "./components/ui/separator";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "./components/ui/select";
+import { Skeleton } from "./components/ui/skeleton";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "./components/ui/tooltip";
+import {
+  EMPTY_VIEWED_FILES,
+  EMPTY_VIEWED_FILES_BY_PULL,
+  getPullDiffKey,
+  pruneViewedFiles,
+  type ToggleViewedFile,
+  type ViewedFilesByPull,
+} from "./diffs";
+import {
+  movementPullKey,
+  PullMovementTracker,
+  type PullMovement,
+  type PullMovementEntry,
+  type ReadinessRank,
+} from "./movements";
+import { getPullKey, selectPullView, usePullPreferences } from "./preferences";
+import {
+  groupPulls,
+  isRunActive,
+  reconcilePulls,
+  usePullRuns,
+  type RunState,
+} from "./runs";
+import { ThemeProvider } from "./theme";
+import { isTaskActive, useTasks, type TaskState } from "./tasks";
+import type {
+  CreateReleaseResponse,
+  MergePullResponse,
+  PullReadiness,
+  PullsResponse,
+  RecentReleasesResponse,
+} from "./types";
+import { reconcileRecentReleases } from "./verifications";
 
-const REFRESH_INTERVAL = 5 * 60 * 1_000;
-const DEFAULT_QUERY =
-  'is:pr author:@me state:open archived:false sort:updated-desc';
+const REFRESH_INTERVAL = 10_000;
+const PULL_ID = String.raw`[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9._-]+#[1-9]\d*`;
+const SILENT_REVALIDATION_NOTICE = new RegExp(
+  String.raw`^GitHub (?:(?:(?:changed CI while refreshing|returned (?:conflicting(?: CI)? state|incomplete evidence) for|could not refresh) ${PULL_ID})|(?:could not completely revalidate (?:this pull request|${PULL_ID})))(?:; (?:readiness|the pull request) was (?:marked incomplete|not updated))?\.$`,
+);
 
 const snapshotFormatter = new Intl.DateTimeFormat(undefined, {
-  day: '2-digit',
-  hour: '2-digit',
-  minute: '2-digit',
-  month: 'short',
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  month: "short",
 });
 
 const formatSnapshot = (snapshotAt: string): string => {
   const date = new Date(snapshotAt);
 
   return Number.isNaN(date.getTime())
-    ? 'time unavailable'
+    ? "time unavailable"
     : snapshotFormatter.format(date);
 };
 
-const getErrorText = (error: unknown): string =>
-  error instanceof Error
-    ? error.message
-    : 'The readiness service could not be reached.';
+const getErrorText = (error: unknown, fallback: string): string =>
+  error instanceof Error ? error.message : fallback;
 
-export default function App() {
+const isAbortError = (error: unknown): boolean =>
+  typeof error === "object" &&
+  error !== null &&
+  "name" in error &&
+  error.name === "AbortError";
+
+type PullLoadKind =
+  | "automatic"
+  | "initial"
+  | "manual"
+  | "mutation"
+  | "visibility";
+
+type PullRequest = {
+  controller: AbortController;
+  generation: number;
+  kind: PullLoadKind;
+};
+
+type ArtifactProof = {
+  epoch: number;
+  viewerLogin: string | null;
+};
+
+const artifactViewer = (snapshot: PullsResponse): string | null => {
+  if (snapshot.partial || snapshot.stale || snapshot.viewerLogin === null) {
+    return null;
+  }
+
+  const viewer = snapshot.viewerLogin.trim().toLowerCase();
+  return viewer || null;
+};
+
+const pullIdentity = (
+  pull: Pick<PullReadiness, "headRefOid" | "number" | "repository">,
+): string =>
+  `${pull.repository.toLowerCase()}#${pull.number}@${pull.headRefOid.toLowerCase()}`;
+
+export const countActiveLocalWork = (
+  pulls: readonly PullReadiness[],
+  runs: ReadonlyMap<string, RunState>,
+  tasks: readonly TaskState[],
+): number => {
+  const active = new Set<string>();
+
+  for (const pull of pulls) {
+    if (isRunActive(runs.get(pull.url))) active.add(getPullKey(pull));
+  }
+
+  for (const state of tasks) {
+    if (!isTaskActive(state.task)) continue;
+    const request = state.task.pullRequest;
+    active.add(
+      request
+        ? `${state.task.repository.trim().toLowerCase()}#${request.number}`
+        : `task:${state.task.id}`,
+    );
+  }
+
+  return active.size;
+};
+
+function AutoControl({
+  auto,
+  trusted,
+}: {
+  auto: AutoController;
+  trusted: boolean;
+}) {
+  const descriptionId = useId();
+  const disabled = !auto.available || !trusted;
+  const description =
+    auto.available && !trusted
+      ? "Auto will be available after a complete, current pull request snapshot loads."
+      : auto.description;
+  const showIndicator =
+    auto.enabled && (auto.leader || auto.paused || auto.queued > 0);
+  const waiting = auto.paused || auto.status === "queued";
+  const active = auto.enabled
+    ? "bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/15 hover:text-emerald-800 dark:bg-emerald-400/10 dark:text-emerald-300 dark:hover:bg-emerald-400/15 dark:hover:text-emerald-200"
+    : "";
+
+  return (
+    <div className="min-w-0 flex-1 sm:flex-none">
+      <Tooltip>
+        <div
+          aria-describedby={descriptionId}
+          aria-label="Auto fix controls"
+          className="inline-flex min-h-11 w-full min-w-0 items-stretch overflow-hidden rounded-md border bg-background shadow-xs sm:min-h-7 sm:w-auto"
+          data-auto-control=""
+          role="group"
+        >
+          <TooltipTrigger asChild>
+            <span className="flex min-w-0 flex-1 sm:flex-none">
+              <Button
+                aria-describedby={descriptionId}
+                aria-pressed={auto.enabled}
+                className={`min-h-0 min-w-0 flex-1 rounded-none border-0 shadow-none sm:flex-none ${active}`}
+                data-auto-status={auto.status}
+                disabled={disabled}
+                onClick={() => auto.setEnabled(!auto.enabled)}
+                size="sm"
+                type="button"
+                variant="outline"
+              >
+                {showIndicator && (
+                  <span
+                    aria-hidden="true"
+                    className={`size-1.5 rounded-full ${
+                      waiting
+                        ? "bg-amber-500"
+                        : "bg-emerald-500 dark:bg-emerald-400"
+                    } ${auto.status === "running" ? "animate-pulse" : ""}`}
+                    data-auto-indicator=""
+                  />
+                )}
+                Auto
+              </Button>
+            </span>
+          </TooltipTrigger>
+          <Select
+            onValueChange={(value) => {
+              const parallelism = Number(value);
+              if (
+                parallelism === 1 ||
+                parallelism === 2 ||
+                parallelism === 3 ||
+                parallelism === 4
+              ) {
+                auto.setParallelism(parallelism);
+              }
+            }}
+            value={String(auto.parallelism)}
+          >
+            <SelectTrigger
+              aria-label="Auto maximum parallelism"
+              className={`h-auto min-h-0 w-[3.75rem] rounded-none border-0 border-l px-2 tabular-nums shadow-none focus-visible:z-10 ${active}`}
+              size="sm"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent className="min-w-16" position="popper">
+              {[1, 2, 3, 4].map((parallelism) => (
+                <SelectItem key={parallelism} value={String(parallelism)}>
+                  {parallelism}×
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <TooltipContent sideOffset={6}>{description}</TooltipContent>
+      </Tooltip>
+      <span className="sr-only" id={descriptionId}>
+        Status: {auto.status}. {description}
+        {auto.error && auto.error !== description ? ` ${auto.error}` : ""}
+      </span>
+    </div>
+  );
+}
+
+function Dashboard() {
+  const reducedMotion = useReducedMotion();
+  const [artifactProof, setArtifactProof] = useState<ArtifactProof>({
+    epoch: 0,
+    viewerLogin: null,
+  });
   const [data, setData] = useState<PullsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [currentPulls, setCurrentPulls] = useState<PullReadiness[]>([]);
+  const [initialLoading, setInitialLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [recent, setRecent] = useState<RecentReleasesResponse | null>(null);
+  const [recentError, setRecentError] = useState<string | null>(null);
+  const [recentLoading, setRecentLoading] = useState(false);
+  const [viewedFiles, setViewedFiles] = useState<ViewedFilesByPull>(
+    () => EMPTY_VIEWED_FILES_BY_PULL,
+  );
   const refreshTimer = useRef<number | null>(null);
-  const nextRefreshAt = useRef<number | null>(null);
-  const inFlight = useRef(false);
+  const pullRequest = useRef<PullRequest | null>(null);
+  const pullGeneration = useRef(0);
+  const recentController = useRef<AbortController | null>(null);
+  const recentGeneration = useRef(0);
+  const movementTimer = useRef<number | null>(null);
+  const movementTracker = useRef(new PullMovementTracker());
   const mounted = useRef(true);
-  const loadRef = useRef<(manual?: boolean) => Promise<void>>(
+  const mergedPulls = useRef(new Set<string>());
+  const loadRef = useRef<(kind?: PullLoadKind) => Promise<void>>(
     async () => undefined,
   );
 
@@ -58,191 +299,531 @@ export default function App() {
     }
   }, []);
 
-  const armRefreshTimer = useCallback(
-    (dueAt: number) => {
-      clearRefreshTimer();
-      nextRefreshAt.current = dueAt;
+  const scheduleRefresh = useCallback(() => {
+    clearRefreshTimer();
+    if (document.visibilityState !== "visible") return;
 
-      if (document.visibilityState !== 'visible') {
-        return;
+    refreshTimer.current = window.setTimeout(() => {
+      refreshTimer.current = null;
+      if (document.visibilityState === "visible") {
+        void loadRef.current("automatic");
       }
-
-      refreshTimer.current = window.setTimeout(
-        () => {
-          refreshTimer.current = null;
-
-          if (document.visibilityState === 'visible') {
-            void loadRef.current();
-          }
-        },
-        Math.max(0, dueAt - Date.now()),
-      );
-    },
-    [clearRefreshTimer],
-  );
+    }, REFRESH_INTERVAL);
+  }, [clearRefreshTimer]);
 
   const load = useCallback(
-    async (manual = false) => {
-      if (inFlight.current) {
-        return;
+    async (kind: PullLoadKind = "initial") => {
+      clearRefreshTimer();
+
+      const active = pullRequest.current;
+      if (active) {
+        if (kind === "automatic" || kind === "initial") return;
+        if (active.kind === "manual") setRefreshing(false);
+        active.controller.abort();
       }
 
-      clearRefreshTimer();
-      inFlight.current = true;
-      setRefreshing(true);
+      const controller = new AbortController();
+      const generation = ++pullGeneration.current;
+      pullRequest.current = { controller, generation, kind };
+      if (kind === "initial") setInitialLoading(true);
+      if (kind === "manual") setRefreshing(true);
 
       try {
-        const next = await getPulls(manual);
-
-        if (mounted.current) {
-          setData(next);
-          setError(null);
+        const next = await getPulls(kind !== "initial", controller.signal);
+        if (
+          !mounted.current ||
+          pullRequest.current?.generation !== generation
+        ) {
+          return;
         }
+
+        const pulls = [...next.ready, ...next.notReady];
+        const ready = next.ready.filter(
+          (pull) => !mergedPulls.current.has(pullIdentity(pull)),
+        );
+        const notReady = next.notReady.filter(
+          (pull) => !mergedPulls.current.has(pullIdentity(pull)),
+        );
+        const visible = [...ready, ...notReady];
+        const snapshot =
+          visible.length === pulls.length
+            ? next
+            : {
+                ...next,
+                counts: {
+                  notReady: notReady.length,
+                  ready: ready.length,
+                  total: visible.length,
+                },
+                notReady,
+                ready,
+              };
+
+        const viewer = artifactViewer(next);
+        setArtifactProof((current) => {
+          if (current.viewerLogin === viewer) return current;
+          return { epoch: current.epoch + 1, viewerLogin: viewer };
+        });
+
+        setCurrentPulls((current) =>
+          reconcilePulls(current, visible, !next.partial && !next.stale),
+        );
+        setData(snapshot);
+        setError(null);
       } catch (loadError) {
-        if (mounted.current) {
-          setError(getErrorText(loadError));
+        if (
+          mounted.current &&
+          pullRequest.current?.generation === generation &&
+          !isAbortError(loadError)
+        ) {
+          setArtifactProof((current) =>
+            current.viewerLogin === null
+              ? current
+              : { epoch: current.epoch + 1, viewerLogin: null },
+          );
+          setError(
+            getErrorText(
+              loadError,
+              "The readiness service could not be reached.",
+            ),
+          );
         }
       } finally {
-        inFlight.current = false;
-
-        if (mounted.current) {
-          setRefreshing(false);
-          armRefreshTimer(Date.now() + REFRESH_INTERVAL);
+        if (mounted.current && pullRequest.current?.generation === generation) {
+          pullRequest.current = null;
+          if (kind === "manual") setRefreshing(false);
+          setInitialLoading(false);
+          scheduleRefresh();
         }
       }
     },
-    [armRefreshTimer, clearRefreshTimer],
+    [clearRefreshTimer, scheduleRefresh],
   );
 
   loadRef.current = load;
 
+  const loadRecent = useCallback(async (refresh = false) => {
+    if (recentController.current && !refresh) return;
+    recentController.current?.abort();
+    const controller = new AbortController();
+    const generation = ++recentGeneration.current;
+    recentController.current = controller;
+    setRecentLoading(true);
+
+    try {
+      const next = await getRecentReleases(refresh, controller.signal);
+      if (!mounted.current || generation !== recentGeneration.current) return;
+
+      setRecent((current) => reconcileRecentReleases(current, next));
+      setRecentError(null);
+    } catch (loadError) {
+      if (
+        mounted.current &&
+        generation === recentGeneration.current &&
+        !isAbortError(loadError)
+      ) {
+        setRecentError(
+          getErrorText(loadError, "The release service could not be reached."),
+        );
+      }
+    } finally {
+      if (mounted.current && generation === recentGeneration.current) {
+        recentController.current = null;
+        setRecentLoading(false);
+      }
+    }
+  }, []);
+
   useEffect(() => {
     mounted.current = true;
-    void load();
+    void loadRef.current("initial");
+    void loadRecent(false);
 
     return () => {
       mounted.current = false;
       clearRefreshTimer();
+      queueMicrotask(() => {
+        if (mounted.current) return;
+
+        pullGeneration.current += 1;
+        pullRequest.current?.controller.abort();
+        pullRequest.current = null;
+        recentGeneration.current += 1;
+        recentController.current?.abort();
+        recentController.current = null;
+      });
     };
-  }, [clearRefreshTimer, load]);
+  }, [clearRefreshTimer, loadRecent]);
 
   useEffect(() => {
     const handleVisibility = () => {
-      if (document.visibilityState !== 'visible') {
-        clearRefreshTimer();
-        return;
-      }
-
-      const dueAt = nextRefreshAt.current;
-
-      if (dueAt === null) {
-        return;
-      }
-
-      if (Date.now() >= dueAt) {
-        void loadRef.current();
-      } else {
-        armRefreshTimer(dueAt);
+      clearRefreshTimer();
+      if (document.visibilityState === "visible") {
+        void loadRef.current("visibility");
       }
     };
 
-    document.addEventListener('visibilitychange', handleVisibility);
-
+    document.addEventListener("visibilitychange", handleVisibility);
     return () => {
-      document.removeEventListener('visibilitychange', handleVisibility);
+      document.removeEventListener("visibilitychange", handleVisibility);
       clearRefreshTimer();
     };
-  }, [armRefreshTimer, clearRefreshTimer]);
+  }, [clearRefreshTimer]);
 
-  const query = data?.query || DEFAULT_QUERY;
-  const hasGlobalEmptyState = data?.counts.total === 0;
+  const refreshAfterRepair = useCallback(() => {
+    void loadRef.current("mutation");
+  }, []);
+  const runs = usePullRuns(currentPulls, refreshAfterRepair);
+  const tasks = useTasks();
+  const preferences = usePullPreferences();
+  const groupedPulls = useMemo(
+    () => groupPulls(currentPulls, runs.states),
+    [currentPulls, runs.states],
+  );
+  const movementEntries = useMemo<readonly PullMovementEntry[]>(
+    () =>
+      (Object.entries(groupedPulls) as [ReadinessRank, PullReadiness[]][])
+        .flatMap(([rank, pulls]) =>
+          pulls.map((pull) => ({
+            number: pull.number,
+            rank,
+            repository: pull.repository,
+          })),
+        )
+        .sort((left, right) => {
+          const leftKey = movementPullKey(left) ?? "";
+          const rightKey = movementPullKey(right) ?? "";
+          return leftKey.localeCompare(rightKey);
+        }),
+    [groupedPulls],
+  );
+  const view = useMemo(
+    () =>
+      selectPullView({
+        favorites: preferences.favorites,
+        hidden: preferences.hidden,
+        pulls: currentPulls,
+        runs: runs.states,
+        tasks: tasks.states,
+      }),
+    [
+      currentPulls,
+      preferences.favorites,
+      preferences.hidden,
+      runs.states,
+      tasks.states,
+    ],
+  );
+  const hiddenPulls = useMemo<HiddenPull[]>(
+    () =>
+      view.hidden.flatMap((item) => {
+        if (item.identity === null) return [];
+        if (item.kind === "pull") {
+          return [
+            {
+              identity: item.identity,
+              number: item.pull.number,
+              repository: item.pull.repository,
+            },
+          ];
+        }
+
+        const pullRequest = item.state.task.pullRequest;
+        return pullRequest
+          ? [
+              {
+                identity: item.identity,
+                number: pullRequest.number,
+                repository: item.state.task.repository,
+              },
+            ]
+          : [];
+      }),
+    [view.hidden],
+  );
+  const visibleItemKeys = useMemo(
+    () =>
+      new Set(
+        [
+          ...view.groups.ready,
+          ...view.groups.progress,
+          ...view.groups.blocked,
+        ].map((item) => item.key),
+      ),
+    [view.groups.blocked, view.groups.progress, view.groups.ready],
+  );
+  const artifactEpoch = artifactProof.epoch;
+  const viewerLogin = artifactProof.viewerLogin;
+  const autoAuthoritative =
+    data !== null &&
+    !initialLoading &&
+    error === null &&
+    !data.partial &&
+    !data.stale &&
+    viewerLogin !== null;
+  const auto = useAuto({
+    authoritative: autoAuthoritative,
+    pulls: currentPulls,
+    runs,
+    tasks: tasks.states,
+    viewerLogin,
+  });
+  const [movements, setMovements] = useState<ReadonlyMap<string, PullMovement>>(
+    () => new Map(),
+  );
+
+  useEffect(() => {
+    const tracker = movementTracker.current;
+    let cancelled = false;
+
+    const scheduleExpiration = (): void => {
+      if (movementTimer.current !== null) {
+        window.clearTimeout(movementTimer.current);
+        movementTimer.current = null;
+      }
+      const expiration = tracker.nextExpiration();
+      if (expiration === null || cancelled) return;
+      movementTimer.current = window.setTimeout(
+        () => {
+          movementTimer.current = null;
+          if (cancelled) return;
+          setMovements(tracker.current());
+          scheduleExpiration();
+        },
+        Math.max(0, expiration - Date.now()),
+      );
+    };
+
+    setMovements(
+      tracker.observe({
+        complete: autoAuthoritative,
+        pulls: movementEntries,
+        viewerLogin,
+      }),
+    );
+    scheduleExpiration();
+
+    return () => {
+      cancelled = true;
+      if (movementTimer.current !== null) {
+        window.clearTimeout(movementTimer.current);
+        movementTimer.current = null;
+      }
+    };
+  }, [autoAuthoritative, movementEntries, viewerLogin]);
+
+  useEffect(() => {
+    setViewedFiles((current) =>
+      pruneViewedFiles(current, currentPulls, viewerLogin, artifactEpoch),
+    );
+  }, [artifactEpoch, currentPulls, viewerLogin]);
+
+  const toggleViewedFile = useCallback<ToggleViewedFile>(
+    (pull, path) => {
+      if (viewerLogin === null) return;
+
+      const key = getPullDiffKey(pull, viewerLogin, artifactEpoch);
+
+      setViewedFiles((current) => {
+        const files = new Set(current.get(key) ?? EMPTY_VIEWED_FILES);
+
+        if (files.has(path)) files.delete(path);
+        else files.add(path);
+
+        const next = new Map(current);
+        if (files.size === 0) next.delete(key);
+        else next.set(key, files);
+        return next;
+      });
+    },
+    [artifactEpoch, viewerLogin],
+  );
+
+  const observeRepair = runs.observeRepair;
+
+  const handleMerge = useCallback(
+    (pull: PullReadiness, response: MergePullResponse) => {
+      if (
+        response.repository.toLowerCase() !== pull.repository.toLowerCase() ||
+        response.number !== pull.number
+      ) {
+        return;
+      }
+
+      if (response.merged) {
+        const matches = (candidate: PullReadiness) =>
+          candidate.repository.toLowerCase() ===
+            pull.repository.toLowerCase() &&
+          candidate.number === pull.number &&
+          candidate.headRefOid.toLowerCase() === pull.headRefOid.toLowerCase();
+        mergedPulls.current.add(pullIdentity(pull));
+        setCurrentPulls((current) => current.filter((item) => !matches(item)));
+        setData((current) => {
+          if (!current) return current;
+          const ready = current.ready.filter((item) => !matches(item));
+          const notReady = current.notReady.filter((item) => !matches(item));
+          return {
+            ...current,
+            counts: {
+              notReady: notReady.length,
+              ready: ready.length,
+              total: ready.length + notReady.length,
+            },
+            notReady,
+            ready,
+          };
+        });
+        void loadRecent(true);
+      } else {
+        void observeRepair(pull, response);
+      }
+
+      void loadRef.current("mutation");
+    },
+    [loadRecent, observeRepair],
+  );
+
+  const handleManualRefresh = () => {
+    void loadRef.current("manual");
+    void loadRecent(true);
+  };
+
+  const handleReleaseCreated = useCallback(
+    async (_release: CreateReleaseResponse) => {
+      await Promise.allSettled([loadRef.current("mutation"), loadRecent(true)]);
+    },
+    [loadRecent],
+  );
+
+  const stats = useMemo(
+    () => ({
+      active: countActiveLocalWork(currentPulls, runs.states, tasks.states),
+      blocked: groupedPulls.blocked.length,
+      open: new Set(currentPulls.map(getPullKey)).size,
+      ready: groupedPulls.ready.length,
+    }),
+    [currentPulls, groupedPulls, runs.states, tasks.states],
+  );
+  const hasGlobalEmptyState = view.visibleCount === 0 && !tasks.loading;
+  const allCurrentPullsHidden = hasGlobalEmptyState && view.hiddenCount > 0;
   const notices = [
+    tasks.error ? `Task restore failed: ${tasks.error}` : null,
     error && data
       ? `Refresh failed: ${error} Showing the last successful snapshot.`
       : null,
-    data?.stale ? 'This snapshot is stale.' : null,
-    data?.partial ? 'Some pull requests could not be fully evaluated.' : null,
-    ...(data?.warnings ?? []),
+    data?.stale ? "This snapshot is stale." : null,
+    data?.partial ? "Some pull requests could not be fully evaluated." : null,
+    ...(data?.warnings ?? []).filter(
+      (warning) => !SILENT_REVALIDATION_NOTICE.test(warning),
+    ),
   ].filter((notice): notice is string => Boolean(notice));
 
   return (
     <main className="min-h-svh bg-background text-foreground">
-      <div className="mx-auto flex w-full max-w-7xl flex-col gap-5 px-3 py-4 sm:px-5 sm:py-6">
+      <div className="mx-auto flex w-full max-w-[1600px] flex-col gap-5 px-3 py-4 sm:px-5 sm:py-6">
         <header>
-          <Card className="gap-0 py-0" size="sm">
-            <CardHeader className="flex flex-col gap-3 px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
-              <div className="flex min-w-0 items-center gap-2">
+          <Card
+            className="gap-0 overflow-visible py-0"
+            data-dashboard-header=""
+            size="sm"
+          >
+            <CardHeader className="flex flex-col gap-3 px-3 py-3 xl:flex-row xl:items-center xl:justify-between">
+              <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
                 <h1 className="font-heading text-base leading-none font-semibold tracking-tight">
                   Pull readiness
                 </h1>
-                <Badge
-                  aria-label={
-                    data
-                      ? `${data.counts.total} open pull requests`
-                      : 'Open pull request count unavailable'
-                  }
-                  className="tabular-nums"
-                  variant="secondary"
+                <dl
+                  aria-label="Pull request stats"
+                  className="flex min-w-0 items-center divide-x overflow-hidden rounded-md border bg-muted/30 text-xs"
+                  data-dashboard-stats=""
                 >
-                  {data ? data.counts.total : '—'} open
-                </Badge>
+                  {(
+                    [
+                      ["Open", stats.open],
+                      ["Ready", stats.ready],
+                      ["Blocked", stats.blocked],
+                      ["Active", stats.active],
+                    ] as const
+                  ).map(([label, value]) => (
+                    <div
+                      aria-label={`${label} ${data ? value : "unavailable"}`}
+                      className="flex items-baseline gap-1.5 px-2 py-1"
+                      key={label}
+                    >
+                      <dt className="text-muted-foreground">{label}</dt>
+                      <dd className="m-0 font-medium tabular-nums">
+                        {data || label === "Active" ? value : "—"}
+                      </dd>
+                    </div>
+                  ))}
+                </dl>
               </div>
 
-              <div className="flex w-full items-center justify-between gap-3 sm:w-auto sm:justify-end">
+              <div className="flex w-full min-w-0 flex-col gap-2 sm:flex-row sm:items-center xl:w-auto">
                 <div
-                  className="min-w-0 text-xs whitespace-nowrap text-muted-foreground"
                   aria-live="polite"
+                  className="min-w-0 text-xs whitespace-nowrap text-muted-foreground sm:mr-auto xl:mr-1"
                 >
                   {data ? (
                     <>
-                      Updated{' '}
+                      Updated{" "}
                       <time dateTime={data.generatedAt}>
                         {formatSnapshot(data.generatedAt)}
                       </time>
                     </>
                   ) : (
-                    'Awaiting snapshot'
+                    "Awaiting snapshot"
                   )}
                 </div>
-                <Button
-                  className="min-h-11 sm:min-h-7"
-                  disabled={refreshing}
-                  onClick={() => void load(true)}
-                  size="sm"
-                  type="button"
-                  variant="outline"
-                >
-                  <RefreshCw
-                    aria-hidden="true"
-                    className={refreshing ? 'animate-spin' : undefined}
-                    data-icon="inline-start"
+                <div className="flex w-full flex-wrap items-center gap-1.5 sm:w-auto sm:flex-nowrap">
+                  <HiddenPullsMenu
+                    hidden={hiddenPulls}
+                    onShow={preferences.show}
+                    onShowAll={preferences.showAll}
                   />
-                  {refreshing ? 'Refreshing' : 'Refresh'}
-                </Button>
+                  <ReleaseDialog onCreated={handleReleaseCreated} />
+                  <AutoControl auto={auto} trusted={autoAuthoritative} />
+                  <ThemeToggle />
+                  <Button
+                    aria-busy={refreshing}
+                    className="min-h-11 flex-1 sm:min-h-7 sm:flex-none"
+                    disabled={initialLoading || refreshing}
+                    onClick={handleManualRefresh}
+                    size="sm"
+                    type="button"
+                    variant="outline"
+                  >
+                    <RefreshCw
+                      aria-hidden="true"
+                      className={refreshing ? "animate-spin" : undefined}
+                      data-icon="inline-start"
+                    />
+                    {refreshing ? "Refreshing" : "Refresh"}
+                  </Button>
+                </div>
               </div>
             </CardHeader>
 
             <Separator />
-
-            <CardFooter className="flex flex-col items-start gap-2 border-t-0 bg-muted/30 px-3 py-2.5 text-xs sm:flex-row sm:items-center sm:justify-between">
-              <div className="flex min-w-0 items-baseline gap-2">
-                <span className="shrink-0 font-medium text-muted-foreground">
-                  Query
-                </span>
-                <code className="min-w-0 break-all text-foreground/80">
-                  {query}
-                </code>
-              </div>
-              <div className="flex shrink-0 items-baseline gap-2">
-                <span className="font-medium text-muted-foreground">Sort</span>
-                <code className="text-foreground/80">updated-desc</code>
-              </div>
-            </CardFooter>
+            <CardContent className="bg-muted/20 p-0">
+              <NewTaskForm
+                error={tasks.optionsError}
+                loading={tasks.optionsLoading}
+                options={tasks.options}
+                refreshOptions={tasks.refreshOptions}
+                start={tasks.start}
+              />
+            </CardContent>
           </Card>
         </header>
 
         {notices.length > 0 && (
-          <Card className="gap-0 bg-muted/40 py-0" role="status" size="sm">
+          <Card
+            className="gap-0 bg-muted/40 py-0"
+            data-dashboard-notices=""
+            role="status"
+            size="sm"
+          >
             <CardContent className="space-y-1 px-3 py-2.5 text-xs text-muted-foreground">
               {notices.map((notice, index) => (
                 <p key={`${notice}-${index}`}>{notice}</p>
@@ -251,91 +832,238 @@ export default function App() {
           </Card>
         )}
 
-        {!data && refreshing && (
-          <section
-            aria-busy="true"
-            aria-live="polite"
-            aria-labelledby="loading-heading"
-          >
-            <div className="sr-only">
-              <h2 id="loading-heading">Loading pull requests…</h2>
-              <p>
-                Checking review threads, CI checks, and Greptile confidence.
-              </p>
-            </div>
-            <div aria-hidden="true" className="grid gap-5">
-              {['ready', 'blocked'].map((section) => (
-                <div className="space-y-2.5" key={section}>
-                  <div className="flex items-center justify-between">
-                    <Skeleton className="h-4 w-20" />
-                    <Skeleton className="h-5 w-8 rounded-full" />
-                  </div>
-                  <Card className="gap-3" size="sm">
-                    <CardContent className="space-y-3 px-3">
-                      <Skeleton className="h-3 w-32" />
-                      <Skeleton className="h-4 w-3/4" />
-                      <Skeleton className="h-3 w-1/2" />
+        <div
+          className="grid items-start gap-5 lg:grid-cols-[minmax(0,1.7fr)_minmax(22rem,0.8fr)] xl:grid-cols-[minmax(0,2fr)_minmax(24rem,0.9fr)]"
+          data-dashboard-columns=""
+        >
+          <div className="min-w-0 space-y-5" data-pull-column="">
+            {!data && initialLoading && (
+              <section
+                aria-busy="true"
+                aria-labelledby="loading-heading"
+                aria-live="polite"
+              >
+                <div className="sr-only">
+                  <h2 id="loading-heading">Loading pull requests…</h2>
+                  <p>
+                    Checking review threads, CI checks, and Greptile confidence.
+                  </p>
+                </div>
+                <div aria-hidden="true" className="grid gap-5">
+                  {["Ready", "In progress", "Not ready"].map((section) => (
+                    <div
+                      className="space-y-2.5"
+                      data-loading-section={section}
+                      key={section}
+                    >
+                      <div className="flex items-center justify-between">
+                        <Skeleton className="h-4 w-20" />
+                        <Skeleton className="h-5 w-8 rounded-full" />
+                      </div>
+                      <Card className="gap-3" size="sm">
+                        <CardContent className="space-y-3 px-3">
+                          <Skeleton className="h-3 w-32" />
+                          <Skeleton className="h-4 w-3/4" />
+                          <Skeleton className="h-3 w-1/2" />
+                        </CardContent>
+                      </Card>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {!data && error && !initialLoading && (
+              <Card role="alert" size="sm">
+                <CardHeader className="px-3">
+                  <h2 className="font-heading text-sm font-medium">
+                    The pull request snapshot is unavailable.
+                  </h2>
+                </CardHeader>
+                <CardContent className="px-3 text-sm text-muted-foreground">
+                  <p>{error}</p>
+                </CardContent>
+                <CardFooter className="justify-end px-3 py-2.5">
+                  <Button
+                    className="min-h-11 sm:min-h-7"
+                    onClick={() => void loadRef.current("manual")}
+                    size="sm"
+                    type="button"
+                  >
+                    Try again
+                  </Button>
+                </CardFooter>
+              </Card>
+            )}
+
+            <AnimatePresence initial={false}>
+              {!data && !tasks.loading && view.visibleCount > 0 && (
+                <motion.div
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={reducedMotion ? { opacity: 0 } : { opacity: 0, y: -6 }}
+                  initial={reducedMotion ? false : { opacity: 0, y: 6 }}
+                  key="task-readiness"
+                  layout
+                  transition={reducedMotion ? { duration: 0 } : undefined}
+                >
+                  <LayoutGroup id="task-readiness">
+                    <ReadinessSection
+                      artifactEpoch={artifactEpoch}
+                      emptyMessage="No CI checks or local fixes are in progress."
+                      hidePull={preferences.hide}
+                      items={view.groups.progress}
+                      movements={movements}
+                      onMutationComplete={handleMerge}
+                      onToggleViewed={toggleViewedFile}
+                      runs={runs}
+                      setFavorite={preferences.setFavorite}
+                      taskCancel={tasks.cancel}
+                      title="In progress"
+                      variant="progress"
+                      visibleItemKeys={visibleItemKeys}
+                      viewerLogin={viewerLogin}
+                      viewedFiles={EMPTY_VIEWED_FILES_BY_PULL}
+                    />
+                  </LayoutGroup>
+                </motion.div>
+              )}
+
+              {!data && !tasks.loading && allCurrentPullsHidden && (
+                <motion.div
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={reducedMotion ? { opacity: 0 } : { opacity: 0, y: -6 }}
+                  initial={reducedMotion ? false : { opacity: 0, y: 6 }}
+                  key="tasks-hidden"
+                  layout
+                  transition={reducedMotion ? { duration: 0 } : undefined}
+                >
+                  <Card size="sm">
+                    <CardHeader className="px-3">
+                      <h2 className="font-heading text-sm font-medium">
+                        All open pull requests are hidden.
+                      </h2>
+                    </CardHeader>
+                    <CardContent className="px-3 text-sm text-muted-foreground">
+                      <p>Use the Hidden menu above to show them again.</p>
                     </CardContent>
                   </Card>
-                </div>
-              ))}
-            </div>
-          </section>
-        )}
+                </motion.div>
+              )}
 
-        {!data && error && !refreshing && (
-          <Card role="alert" size="sm">
-            <CardHeader className="px-3">
-              <h2 className="font-heading text-sm font-medium">
-                The pull request snapshot is unavailable.
-              </h2>
-            </CardHeader>
-            <CardContent className="px-3 text-sm text-muted-foreground">
-              <p>{error}</p>
-            </CardContent>
-            <CardFooter className="justify-end px-3 py-2.5">
-              <Button
-                className="min-h-11 sm:min-h-7"
-                onClick={() => void load(true)}
-                size="sm"
-                type="button"
-              >
-                Try again
-              </Button>
-            </CardFooter>
-          </Card>
-        )}
+              {data && hasGlobalEmptyState && (
+                <motion.div
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={reducedMotion ? { opacity: 0 } : { opacity: 0, y: -6 }}
+                  initial={reducedMotion ? false : { opacity: 0, y: 6 }}
+                  key={allCurrentPullsHidden ? "all-hidden" : "global-empty"}
+                  layout
+                  transition={reducedMotion ? { duration: 0 } : undefined}
+                >
+                  <Card size="sm">
+                    <CardHeader className="px-3">
+                      <h2 className="font-heading text-sm font-medium">
+                        {allCurrentPullsHidden
+                          ? "All open pull requests are hidden."
+                          : "No open authored pull requests."}
+                      </h2>
+                    </CardHeader>
+                    <CardContent className="px-3 text-sm text-muted-foreground">
+                      <p>
+                        {allCurrentPullsHidden
+                          ? "Use the Hidden menu above to show them again."
+                          : "The current GitHub query returned no results."}
+                      </p>
+                    </CardContent>
+                  </Card>
+                </motion.div>
+              )}
 
-        {data && hasGlobalEmptyState && (
-          <Card size="sm">
-            <CardHeader className="px-3">
-              <h2 className="font-heading text-sm font-medium">
-                No open authored pull requests.
-              </h2>
-            </CardHeader>
-            <CardContent className="px-3 text-sm text-muted-foreground">
-              <p>The current GitHub query returned no results.</p>
-            </CardContent>
-          </Card>
-        )}
-
-        {data && !hasGlobalEmptyState && (
-          <div className="flex flex-col gap-5">
-            <ReadinessSection
-              emptyMessage="No pulls meet every readiness check."
-              pulls={data.ready}
-              title="Ready"
-              variant="ready"
-            />
-            <ReadinessSection
-              emptyMessage="Everything is ready."
-              pulls={data.notReady}
-              title="Not ready"
-              variant="blocked"
-            />
+              {data && !hasGlobalEmptyState && (
+                <motion.div
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={reducedMotion ? { opacity: 0 } : { opacity: 0, y: -6 }}
+                  initial={reducedMotion ? false : { opacity: 0, y: 6 }}
+                  key="pull-readiness"
+                  layout="position"
+                  transition={reducedMotion ? { duration: 0 } : undefined}
+                >
+                  <LayoutGroup id="pull-readiness">
+                    <div className="flex flex-col gap-5">
+                      <ReadinessSection
+                        artifactEpoch={artifactEpoch}
+                        emptyMessage="No pulls meet every readiness check."
+                        hidePull={preferences.hide}
+                        items={view.groups.ready}
+                        movements={movements}
+                        onMutationComplete={handleMerge}
+                        onToggleViewed={toggleViewedFile}
+                        runs={runs}
+                        setFavorite={preferences.setFavorite}
+                        title="Ready"
+                        variant="ready"
+                        visibleItemKeys={visibleItemKeys}
+                        viewerLogin={viewerLogin}
+                        viewedFiles={viewedFiles}
+                      />
+                      <ReadinessSection
+                        artifactEpoch={artifactEpoch}
+                        emptyMessage="No CI checks or local fixes are in progress."
+                        hidePull={preferences.hide}
+                        items={view.groups.progress}
+                        movements={movements}
+                        onMutationComplete={handleMerge}
+                        onToggleViewed={toggleViewedFile}
+                        runs={runs}
+                        setFavorite={preferences.setFavorite}
+                        taskCancel={tasks.cancel}
+                        title="In progress"
+                        variant="progress"
+                        visibleItemKeys={visibleItemKeys}
+                        viewerLogin={viewerLogin}
+                        viewedFiles={viewedFiles}
+                      />
+                      <ReadinessSection
+                        artifactEpoch={artifactEpoch}
+                        emptyMessage="No pull requests are waiting on fixes."
+                        hidePull={preferences.hide}
+                        items={view.groups.blocked}
+                        movements={movements}
+                        onMutationComplete={handleMerge}
+                        onToggleViewed={toggleViewedFile}
+                        runs={runs}
+                        setFavorite={preferences.setFavorite}
+                        title="Not ready"
+                        variant="blocked"
+                        visibleItemKeys={visibleItemKeys}
+                        viewerLogin={viewerLogin}
+                        viewedFiles={viewedFiles}
+                      />
+                    </div>
+                  </LayoutGroup>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
-        )}
+          <aside className="min-w-0" data-release-column="">
+            <RecentReleases
+              data={recent}
+              error={recentError}
+              loading={recentLoading}
+              onRefresh={() => void loadRecent(true)}
+            />
+          </aside>
+        </div>
       </div>
     </main>
+  );
+}
+
+export default function App() {
+  return (
+    <ThemeProvider defaultTheme="system">
+      <TooltipProvider>
+        <Dashboard />
+      </TooltipProvider>
+    </ThemeProvider>
   );
 }

@@ -15,6 +15,20 @@ function snapshot(total = 1) {
 }
 
 describe('snapshot cache', () => {
+  it('peeks at the last snapshot without loading or changing its freshness', async () => {
+    let current = 1_000
+    const load = vi.fn(async () => snapshot())
+    const cache = createSnapshotCache({ load, now: () => current })
+
+    expect(cache.peek()).toBeNull()
+    await cache.get()
+    expect(cache.peek()).toMatchObject({ expired: false, stale: false })
+    current = 20_000
+
+    expect(load).toHaveBeenCalledOnce()
+    expect(cache.peek()).toMatchObject({ expired: true, stale: false })
+  })
+
   it('serves fresh cached reads without repeating GitHub work', async () => {
     const load = vi.fn(async () => snapshot())
     const cache = createSnapshotCache({ load, now: () => 1_000 })
@@ -59,7 +73,7 @@ describe('snapshot cache', () => {
     await expect(first).resolves.toMatchObject({ stale: false })
   })
 
-  it('uses a five-minute TTL and never overlaps the refresh at expiry', async () => {
+  it('uses a ten-second TTL and never overlaps the refresh at expiry', async () => {
     let current = 0
     let finish
     const load = vi
@@ -74,17 +88,57 @@ describe('snapshot cache', () => {
     const cache = createSnapshotCache({ load, now: () => current })
 
     await cache.get()
-    current = 299_999
+    current = 9_999
     await cache.get()
     expect(load).toHaveBeenCalledTimes(1)
 
-    current = 300_000
+    current = 10_000
     const expired = cache.get()
     const joined = cache.get()
     expect(expired).toBe(joined)
     expect(load).toHaveBeenCalledTimes(2)
     finish(snapshot(2))
     await expired
+  })
+
+  it('offers an explicit fresh path that never returns stale last-good data', async () => {
+    const load = vi
+      .fn()
+      .mockResolvedValueOnce(snapshot(1))
+      .mockRejectedValueOnce(new GithubError('Fresh evidence failed.'))
+    const cache = createSnapshotCache({ load })
+
+    await cache.get()
+    await expect(cache.loadFresh()).rejects.toThrow('Fresh evidence failed')
+    expect(cache.peek()).toMatchObject({
+      stale: true,
+      warnings: ['Showing the last successful snapshot. Fresh evidence failed.'],
+    })
+    expect(load).toHaveBeenCalledTimes(2)
+  })
+
+  it('coalesces ordinary and strict refreshes while preserving strict failure semantics', async () => {
+    let rejectRefresh
+    const load = vi
+      .fn()
+      .mockResolvedValueOnce(snapshot(1))
+      .mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectRefresh = reject
+          }),
+      )
+    const cache = createSnapshotCache({ load })
+    await cache.get()
+
+    const ordinary = cache.get({ refresh: true })
+    const strict = cache.getFresh()
+    expect(load).toHaveBeenCalledTimes(2)
+
+    rejectRefresh(new GithubError('Fresh evidence failed.'))
+    await expect(ordinary).resolves.toMatchObject({ stale: true })
+    await expect(strict).rejects.toThrow('Fresh evidence failed')
+    expect(load).toHaveBeenCalledTimes(2)
   })
 
   it('keeps the original last-good timestamp and marks a failed refresh stale', async () => {

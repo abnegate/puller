@@ -1,0 +1,937 @@
+// @vitest-environment jsdom
+
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import {
+  canVerifyEntireRelease,
+  canVerifyRelease,
+  isVerificationActive,
+  reconcileRecentReleases,
+  releaseVerificationKey,
+  useReleaseVerificationBatches,
+  useVerificationRuns,
+  verificationKey,
+} from "./verifications";
+import type {
+  RecentRelease,
+  RecentReleasesResponse,
+  ReleaseVerificationEvent,
+  ReleasedPull,
+  VerificationRunEvent,
+  VerificationRunRequest,
+} from "./types";
+
+const api = vi.hoisted(() => ({
+  cancel: vi.fn(),
+  cancelBatch: vi.fn(),
+  stream: vi.fn(),
+  streamBatch: vi.fn(),
+}));
+
+vi.mock("./api", () => ({
+  cancelReleaseVerification: api.cancelBatch,
+  cancelVerification: api.cancel,
+  streamReleaseVerification: api.streamBatch,
+  streamVerification: api.stream,
+}));
+
+const createDeferred = <Value>() => {
+  let resolve!: (value: Value | PromiseLike<Value>) => void;
+  const promise = new Promise<Value>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
+};
+
+const waitForAbort = (signal: AbortSignal): Promise<void> =>
+  signal.aborted
+    ? Promise.resolve()
+    : new Promise((resolve) =>
+        signal.addEventListener("abort", () => resolve(), { once: true }),
+      );
+
+const release = (id: string, number: number): RecentRelease => ({
+  complete: true,
+  id,
+  name: `Release ${id}`,
+  publishedAt: "2026-07-17T10:00:00.000Z",
+  pulls: [
+    {
+      headSha:
+        number === 1
+          ? "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          : "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      mergedAt: "2026-07-17T09:00:00.000Z",
+      number,
+      repository: "appwrite/cloud",
+      title: `Released pull ${number}`,
+      url: `https://github.com/appwrite/cloud/pull/${number}`,
+    },
+  ],
+  repository: "appwrite/cloud",
+  repositoryUrl: "https://github.com/appwrite/cloud",
+  source: "comparison",
+  tag: `v1.0.${number}`,
+  url: `https://github.com/appwrite/cloud/releases/tag/v1.0.${number}`,
+  warning: null,
+});
+
+afterEach(() => {
+  cleanup();
+  vi.resetAllMocks();
+});
+
+describe("useVerificationRuns", () => {
+  it("streams concurrent release verifications independently", async () => {
+    const firstGate = createDeferred<void>();
+    const secondGate = createDeferred<void>();
+    const releases = [release("release-1", 1), release("release-2", 2)];
+    api.stream.mockImplementation(async function* (
+      request: VerificationRunRequest,
+    ): AsyncGenerator<VerificationRunEvent, void, undefined> {
+      yield { ...request, runId: `run-${request.pullNumber}`, type: "start" };
+      yield { text: `output-${request.pullNumber}\n`, type: "text" };
+      await (request.pullNumber === 1 ? firstGate.promise : secondGate.promise);
+      yield { exitCode: 0, type: "complete" };
+    });
+    const view = renderHook(() => useVerificationRuns(releases));
+    const firstKey = verificationKey(releases[0]!, releases[0]!.pulls[0]!);
+    const secondKey = verificationKey(releases[1]!, releases[1]!.pulls[0]!);
+
+    act(() => {
+      void view.result.current.start(releases[0]!, releases[0]!.pulls[0]!);
+      void view.result.current.start(releases[1]!, releases[1]!.pulls[0]!);
+    });
+
+    await waitFor(() => {
+      expect(view.result.current.states.get(firstKey)).toMatchObject({
+        output: "output-1\n",
+        runId: "run-1",
+        status: "running",
+      });
+      expect(view.result.current.states.get(secondKey)).toMatchObject({
+        output: "output-2\n",
+        runId: "run-2",
+        status: "running",
+      });
+    });
+
+    await act(async () => {
+      firstGate.resolve();
+      await firstGate.promise;
+    });
+    await waitFor(() =>
+      expect(view.result.current.states.get(firstKey)?.status).toBe(
+        "completed",
+      ),
+    );
+    expect(view.result.current.states.get(secondKey)?.status).toBe("running");
+
+    await act(async () => {
+      secondGate.resolve();
+      await secondGate.promise;
+    });
+  });
+
+  it("preserves a present run across authoritative release object refreshes", async () => {
+    const item = release("release-1", 1);
+    const gate = createDeferred<void>();
+    api.stream.mockImplementation(async function* (
+      request: VerificationRunRequest,
+    ): AsyncGenerator<VerificationRunEvent, void, undefined> {
+      yield { ...request, runId: "run-preserved", type: "start" };
+      yield { text: "still running\n", type: "text" };
+      await gate.promise;
+      yield { exitCode: 0, type: "complete" };
+    });
+    const view = renderHook(({ releases }) => useVerificationRuns(releases), {
+      initialProps: { releases: [item] },
+    });
+    const key = verificationKey(item, item.pulls[0]!);
+
+    act(() => {
+      void view.result.current.start(item, item.pulls[0]!);
+    });
+    await waitFor(() =>
+      expect(view.result.current.states.get(key)?.status).toBe("running"),
+    );
+
+    view.rerender({ releases: [{ ...item, pulls: [{ ...item.pulls[0]! }] }] });
+    expect(view.result.current.states.get(key)).toMatchObject({
+      output: "still running\n",
+      runId: "run-preserved",
+      status: "running",
+    });
+    expect(api.cancel).not.toHaveBeenCalled();
+
+    await act(async () => {
+      gate.resolve();
+      await gate.promise;
+    });
+  });
+
+  it("cancels a running verification without affecting another row", async () => {
+    const releases = [release("release-1", 1), release("release-2", 2)];
+    api.cancel.mockResolvedValue(undefined);
+    api.stream.mockImplementation(async function* (
+      request: VerificationRunRequest,
+      signal: AbortSignal,
+    ): AsyncGenerator<VerificationRunEvent, void, undefined> {
+      yield { ...request, runId: `run-${request.pullNumber}`, type: "start" };
+      await waitForAbort(signal);
+    });
+    const view = renderHook(() => useVerificationRuns(releases));
+    const firstKey = verificationKey(releases[0]!, releases[0]!.pulls[0]!);
+    const secondKey = verificationKey(releases[1]!, releases[1]!.pulls[0]!);
+
+    act(() => {
+      void view.result.current.start(releases[0]!, releases[0]!.pulls[0]!);
+      void view.result.current.start(releases[1]!, releases[1]!.pulls[0]!);
+    });
+    await waitFor(() => {
+      expect(view.result.current.states.get(firstKey)?.status).toBe("running");
+      expect(view.result.current.states.get(secondKey)?.status).toBe("running");
+    });
+    await act(async () => {
+      await view.result.current.cancel(firstKey);
+    });
+
+    expect(api.cancel).toHaveBeenCalledWith("run-1", expect.any(AbortSignal));
+    expect(view.result.current.states.get(firstKey)?.status).toBe("cancelled");
+    expect(view.result.current.states.get(secondKey)?.status).toBe("running");
+  });
+
+  it("detaches and purges a removed active verification", async () => {
+    const item = release("release-1", 1);
+    let streamSignal!: AbortSignal;
+    api.cancel.mockResolvedValue(undefined);
+    api.stream.mockImplementation(async function* (
+      request: VerificationRunRequest,
+      signal: AbortSignal,
+    ): AsyncGenerator<VerificationRunEvent, void, undefined> {
+      streamSignal = signal;
+      yield { ...request, runId: "run-removed", type: "start" };
+      await waitForAbort(signal);
+    });
+    const view = renderHook(({ releases }) => useVerificationRuns(releases), {
+      initialProps: { releases: [item] },
+    });
+    const key = verificationKey(item, item.pulls[0]!);
+
+    act(() => {
+      void view.result.current.start(item, item.pulls[0]!);
+    });
+    await waitFor(() =>
+      expect(view.result.current.states.get(key)?.status).toBe("running"),
+    );
+    view.rerender({ releases: [] });
+
+    await waitFor(() => expect(streamSignal.aborted).toBe(true));
+    expect(api.cancel).toHaveBeenCalledWith(
+      "run-removed",
+      expect.any(AbortSignal),
+    );
+    expect(view.result.current.states.has(key)).toBe(false);
+  });
+
+  it("retains an omitted active stream for a partial catalog and cancels it after a complete catalog", async () => {
+    const item = release("release-1", 1);
+    let streamSignal!: AbortSignal;
+    api.cancel.mockResolvedValue(undefined);
+    api.stream.mockImplementation(async function* (
+      request: VerificationRunRequest,
+      signal: AbortSignal,
+    ): AsyncGenerator<VerificationRunEvent, void, undefined> {
+      streamSignal = signal;
+      yield { ...request, runId: "run-partial", type: "start" };
+      await waitForAbort(signal);
+    });
+    const view = renderHook(
+      ({ authoritative, releases }) =>
+        useVerificationRuns(releases, authoritative),
+      {
+        initialProps: { authoritative: true, releases: [item] },
+      },
+    );
+    const key = verificationKey(item, item.pulls[0]!);
+
+    act(() => {
+      void view.result.current.start(item, item.pulls[0]!);
+    });
+    await waitFor(() =>
+      expect(view.result.current.states.get(key)?.status).toBe("running"),
+    );
+
+    view.rerender({ authoritative: false, releases: [] });
+    expect(streamSignal.aborted).toBe(false);
+    expect(view.result.current.states.get(key)?.status).toBe("running");
+    expect(api.cancel).not.toHaveBeenCalled();
+
+    view.rerender({ authoritative: true, releases: [] });
+    await waitFor(() => expect(streamSignal.aborted).toBe(true));
+    await waitFor(() =>
+      expect(api.cancel).toHaveBeenCalledWith(
+        "run-partial",
+        expect.any(AbortSignal),
+      ),
+    );
+    expect(view.result.current.states.has(key)).toBe(false);
+  });
+
+  it("allows a listed pull discovered from release notes to reach the server guard", async () => {
+    const item = {
+      ...release("release-1", 1),
+      complete: false,
+      source: "notes-fallback" as const,
+    };
+    api.stream.mockImplementation(async function* (
+      request: VerificationRunRequest,
+    ): AsyncGenerator<VerificationRunEvent, void, undefined> {
+      yield { ...request, runId: "run-notes", type: "start" };
+      yield { exitCode: 0, type: "complete" };
+    });
+    const view = renderHook(() => useVerificationRuns([item]));
+
+    expect(canVerifyRelease(item, item.pulls[0]!)).toBe(true);
+    await act(async () => {
+      await view.result.current.start(item, item.pulls[0]!);
+    });
+
+    expect(api.stream).toHaveBeenCalledWith(
+      expect.objectContaining({
+        pullNumber: item.pulls[0]!.number,
+        releaseId: item.id,
+        tag: item.tag,
+      }),
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("refuses verification for unavailable membership or an unlisted pull", () => {
+    const item = release("release-1", 1);
+    const unavailable = {
+      ...item,
+      complete: false,
+      source: "unavailable" as const,
+    };
+    const unlisted = {
+      ...item.pulls[0]!,
+      number: 99,
+      url: "https://github.com/appwrite/cloud/pull/99",
+    };
+    const view = renderHook(() => useVerificationRuns([item, unavailable]));
+
+    expect(canVerifyRelease(unavailable, unavailable.pulls[0]!)).toBe(false);
+    expect(canVerifyRelease(item, unlisted)).toBe(false);
+    act(() => {
+      void view.result.current.start(unavailable, unavailable.pulls[0]!);
+      void view.result.current.start(item, unlisted);
+    });
+
+    expect(api.stream).not.toHaveBeenCalled();
+    expect(view.result.current.states.size).toBe(0);
+  });
+});
+
+const batchRelease = (): RecentRelease => {
+  const item = release("10", 1);
+  const second = {
+    ...item.pulls[0]!,
+    headSha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    number: 2,
+    title: "Released pull 2",
+    url: "https://github.com/appwrite/cloud/pull/2",
+  };
+  const third = {
+    ...item.pulls[0]!,
+    headSha: "cccccccccccccccccccccccccccccccccccccccc",
+    number: 3,
+    title: "Released pull 3",
+    url: "https://github.com/appwrite/cloud/pull/3",
+  };
+
+  return {
+    ...item,
+    complete: false,
+    pulls: [item.pulls[0]!, second, third],
+    source: "notes-fallback",
+    tag: "v1.2.4",
+    warning:
+      "Release membership was discovered from release notes and will be rechecked before verification.",
+  };
+};
+
+const batchStart = (
+  item: RecentRelease,
+  pulls: readonly ReleasedPull[] = item.pulls,
+): Extract<ReleaseVerificationEvent, { type: "batch-start" }> => ({
+  batchId: "batch-1",
+  pulls: pulls.map((pull) => ({
+    headSha: pull.headSha,
+    pullNumber: pull.number,
+    pullUrl: pull.url,
+    releaseId: item.id,
+    repository: item.repository,
+    tag: item.tag,
+  })),
+  releaseId: item.id,
+  repository: item.repository,
+  tag: item.tag,
+  type: "batch-start",
+});
+
+const batchVerification = (
+  item: RecentRelease,
+  index: number,
+  state: Extract<ReleaseVerificationEvent, { type: "verification" }>["state"],
+  event?: VerificationRunEvent,
+): Extract<ReleaseVerificationEvent, { type: "verification" }> => {
+  const pull = item.pulls[index]!;
+  return {
+    batchId: "batch-1",
+    event,
+    headSha: pull.headSha,
+    pullNumber: pull.number,
+    pullUrl: pull.url,
+    state,
+    type: "verification",
+  };
+};
+
+describe("useReleaseVerificationBatches", () => {
+  it("reconciles an authoritative subset, keeps omitted rows settled, and supports newly returned members", async () => {
+    const item = batchRelease();
+    const added = {
+      ...item.pulls[0]!,
+      headSha: "dddddddddddddddddddddddddddddddddddddddd",
+      number: 4,
+      title: "Newly discovered released pull",
+      url: "https://github.com/appwrite/cloud/pull/4",
+    };
+    const authoritative = {
+      ...item,
+      pulls: [item.pulls[0]!, added],
+    };
+    api.streamBatch.mockImplementation(async function* (): AsyncGenerator<
+      ReleaseVerificationEvent,
+      void,
+      undefined
+    > {
+      yield batchStart(authoritative);
+      yield batchVerification(authoritative, 0, "queued");
+      yield batchVerification(authoritative, 0, "complete", {
+        exitCode: 0,
+        type: "complete",
+      });
+      yield batchVerification(authoritative, 1, "queued");
+      yield batchVerification(authoritative, 1, "existing");
+      yield {
+        batchId: "batch-1",
+        totals: { complete: 1, error: 0, existing: 1, total: 2 },
+        type: "complete",
+      };
+    });
+    const view = renderHook(() => useReleaseVerificationBatches([item]));
+
+    await act(async () => {
+      await view.result.current.start(item);
+    });
+
+    expect(
+      view.result.current.pullStates.get(verificationKey(item, item.pulls[0]!))
+        ?.status,
+    ).toBe("completed");
+    for (const pull of item.pulls.slice(1)) {
+      const state = view.result.current.pullStates.get(
+        verificationKey(item, pull),
+      );
+      expect(state).toMatchObject({
+        cancelling: false,
+        status: "membership-changed",
+      });
+      expect(state?.output).toContain("Release membership changed on GitHub");
+      expect(isVerificationActive(state)).toBe(false);
+    }
+    expect(
+      view.result.current.pullStates.get(verificationKey(item, added)),
+    ).toMatchObject({ status: "existing" });
+    expect(
+      view.result.current.states.get(releaseVerificationKey(item)),
+    ).toMatchObject({
+      existing: 1,
+      settled: 2,
+      status: "completed",
+      total: 2,
+    });
+    expect(api.streamBatch).toHaveBeenCalledWith(
+      {
+        releaseId: item.id,
+        repository: item.repository,
+        tag: item.tag,
+      },
+      expect.any(AbortSignal),
+    );
+    expect(api.streamBatch).toHaveBeenCalledTimes(1);
+    expect(api.stream).not.toHaveBeenCalled();
+  });
+
+  it("settles every optimistic row when the authoritative batch has no members without per-pull fanout", async () => {
+    const item = batchRelease();
+    api.streamBatch.mockImplementation(async function* (): AsyncGenerator<
+      ReleaseVerificationEvent,
+      void,
+      undefined
+    > {
+      yield batchStart(item, []);
+      yield {
+        batchId: "batch-1",
+        totals: { complete: 0, error: 0, existing: 0, total: 0 },
+        type: "complete",
+      };
+    });
+    const view = renderHook(() => useReleaseVerificationBatches([item]));
+
+    await act(async () => {
+      await view.result.current.start(item);
+    });
+
+    for (const pull of item.pulls) {
+      const state = view.result.current.pullStates.get(
+        verificationKey(item, pull),
+      );
+      expect(state).toMatchObject({
+        cancelling: false,
+        status: "membership-changed",
+      });
+      expect(state?.output).toContain(
+        "this pull request is no longer included in this release",
+      );
+      expect(isVerificationActive(state)).toBe(false);
+    }
+    expect(
+      view.result.current.states.get(releaseVerificationKey(item)),
+    ).toMatchObject({ settled: 0, status: "completed", total: 0 });
+    expect(api.streamBatch).toHaveBeenCalledWith(
+      {
+        releaseId: item.id,
+        repository: item.repository,
+        tag: item.tag,
+      },
+      expect.any(AbortSignal),
+    );
+    expect(api.streamBatch).toHaveBeenCalledTimes(1);
+    expect(api.stream).not.toHaveBeenCalled();
+  });
+
+  it("preserves completed and existing results when a later authoritative batch omits them", async () => {
+    const item = batchRelease();
+    api.streamBatch
+      .mockImplementationOnce(async function* (): AsyncGenerator<
+        ReleaseVerificationEvent,
+        void,
+        undefined
+      > {
+        yield batchStart(item);
+        yield batchVerification(item, 0, "queued");
+        yield batchVerification(item, 0, "complete", {
+          exitCode: 0,
+          type: "complete",
+        });
+        yield batchVerification(item, 1, "queued");
+        yield batchVerification(item, 1, "existing");
+        yield batchVerification(item, 2, "queued");
+        yield batchVerification(item, 2, "error", {
+          message: "Verification failed.",
+          type: "error",
+        });
+        yield {
+          batchId: "batch-1",
+          totals: { complete: 1, error: 1, existing: 1, total: 3 },
+          type: "complete",
+        };
+      })
+      .mockImplementationOnce(async function* (): AsyncGenerator<
+        ReleaseVerificationEvent,
+        void,
+        undefined
+      > {
+        yield batchStart(item, []);
+        yield {
+          batchId: "batch-1",
+          totals: { complete: 0, error: 0, existing: 0, total: 0 },
+          type: "complete",
+        };
+      });
+    const view = renderHook(() => useReleaseVerificationBatches([item]));
+
+    await act(async () => {
+      await view.result.current.start(item);
+    });
+    await act(async () => {
+      await view.result.current.start(item);
+    });
+
+    expect(
+      view.result.current.pullStates.get(verificationKey(item, item.pulls[0]!))
+        ?.status,
+    ).toBe("completed");
+    expect(
+      view.result.current.pullStates.get(verificationKey(item, item.pulls[1]!))
+        ?.status,
+    ).toBe("existing");
+    expect(
+      view.result.current.pullStates.get(verificationKey(item, item.pulls[2]!))
+        ?.status,
+    ).toBe("membership-changed");
+    expect(api.streamBatch).toHaveBeenCalledTimes(2);
+    expect(api.stream).not.toHaveBeenCalled();
+  });
+
+  it("fails every active member atomically when the batch stream fails and preserves settled members", async () => {
+    const item = batchRelease();
+    api.streamBatch.mockImplementation(async function* (): AsyncGenerator<
+      ReleaseVerificationEvent,
+      void,
+      undefined
+    > {
+      yield batchStart(item);
+      yield batchVerification(item, 0, "queued");
+      yield batchVerification(item, 0, "running", {
+        ...{
+          headSha: item.pulls[0]!.headSha,
+          pullNumber: item.pulls[0]!.number,
+          pullUrl: item.pulls[0]!.url,
+          releaseId: item.id,
+          repository: item.repository,
+          tag: item.tag,
+        },
+        runId: "run-1",
+        type: "start",
+      });
+      yield batchVerification(item, 0, "complete", {
+        exitCode: 0,
+        type: "complete",
+      });
+      yield batchVerification(item, 1, "queued");
+      yield batchVerification(item, 1, "existing", undefined);
+      yield batchVerification(item, 2, "queued");
+      yield batchVerification(item, 2, "running");
+      throw new Error("Batch connection dropped.");
+    });
+    const view = renderHook(() => useReleaseVerificationBatches([item]));
+
+    await act(async () => {
+      await view.result.current.start(item);
+    });
+
+    const batch = view.result.current.states.get(releaseVerificationKey(item));
+    const first = view.result.current.pullStates.get(
+      verificationKey(item, item.pulls[0]!),
+    );
+    const second = view.result.current.pullStates.get(
+      verificationKey(item, item.pulls[1]!),
+    );
+    const third = view.result.current.pullStates.get(
+      verificationKey(item, item.pulls[2]!),
+    );
+    expect(batch).toMatchObject({
+      errors: 1,
+      settled: 3,
+      status: "failed",
+      total: 3,
+    });
+    expect(first?.status).toBe("completed");
+    expect(second?.status).toBe("existing");
+    expect(third).toMatchObject({
+      cancelling: false,
+      status: "failed",
+    });
+    expect(third?.output).toContain(
+      "[error] Release verification failed: Batch connection dropped.",
+    );
+    expect(isVerificationActive(third)).toBe(false);
+    expect(api.streamBatch).toHaveBeenCalledTimes(1);
+    expect(api.stream).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await view.result.current.start(item);
+    });
+    expect(api.streamBatch).toHaveBeenCalledTimes(2);
+    expect(api.stream).not.toHaveBeenCalled();
+  });
+
+  it("cancels every starting member before the server assigns a batch identity", async () => {
+    const item = batchRelease();
+    api.streamBatch.mockImplementation(async function* (
+      _request: unknown,
+      signal: AbortSignal,
+    ): AsyncGenerator<ReleaseVerificationEvent, void, undefined> {
+      await waitForAbort(signal);
+    });
+    const view = renderHook(() => useReleaseVerificationBatches([item]));
+
+    act(() => {
+      void view.result.current.start(item);
+    });
+    await waitFor(() =>
+      expect(
+        view.result.current.states.get(releaseVerificationKey(item))?.status,
+      ).toBe("starting"),
+    );
+    await act(async () => {
+      await view.result.current.cancel(item);
+    });
+
+    expect(api.cancelBatch).not.toHaveBeenCalled();
+    expect(api.cancel).not.toHaveBeenCalled();
+    expect(
+      view.result.current.states.get(releaseVerificationKey(item)),
+    ).toMatchObject({ settled: 3, status: "cancelled" });
+    for (const pull of item.pulls) {
+      const state = view.result.current.pullStates.get(
+        verificationKey(item, pull),
+      );
+      expect(state).toMatchObject({ cancelling: false, status: "cancelled" });
+      expect(state?.output).toContain(
+        "[diagnostic] Release verification cancelled before it started.",
+      );
+      expect(isVerificationActive(state)).toBe(false);
+    }
+  });
+
+  it("uses the batch cancellation endpoint and settles every running member after cancellation succeeds", async () => {
+    const item = batchRelease();
+    api.cancelBatch.mockResolvedValue(undefined);
+    api.streamBatch.mockImplementation(async function* (
+      _request: unknown,
+      signal: AbortSignal,
+    ): AsyncGenerator<ReleaseVerificationEvent, void, undefined> {
+      yield batchStart(item);
+      for (let index = 0; index < item.pulls.length; index += 1) {
+        yield batchVerification(item, index, "queued");
+        yield batchVerification(item, index, "running");
+      }
+      await waitForAbort(signal);
+    });
+    const view = renderHook(() => useReleaseVerificationBatches([item]));
+
+    act(() => {
+      void view.result.current.start(item);
+    });
+    await waitFor(() =>
+      expect(
+        view.result.current.states.get(releaseVerificationKey(item))?.status,
+      ).toBe("running"),
+    );
+    await act(async () => {
+      await view.result.current.cancel(item);
+    });
+
+    expect(api.cancelBatch).toHaveBeenCalledWith(
+      "batch-1",
+      expect.any(AbortSignal),
+    );
+    expect(api.cancel).not.toHaveBeenCalled();
+    expect(
+      view.result.current.states.get(releaseVerificationKey(item)),
+    ).toMatchObject({ settled: 3, status: "cancelled" });
+    for (const pull of item.pulls) {
+      const state = view.result.current.pullStates.get(
+        verificationKey(item, pull),
+      );
+      expect(state?.status).toBe("cancelled");
+      expect(state?.output).toContain(
+        "[diagnostic] Release verification cancelled.",
+      );
+      expect(isVerificationActive(state)).toBe(false);
+    }
+  });
+
+  it("settles every active member when the server terminates the batch as cancelled", async () => {
+    const item = batchRelease();
+    api.streamBatch.mockImplementation(async function* (): AsyncGenerator<
+      ReleaseVerificationEvent,
+      void,
+      undefined
+    > {
+      yield batchStart(item);
+      for (let index = 0; index < item.pulls.length; index += 1) {
+        yield batchVerification(item, index, "queued");
+        yield batchVerification(item, index, "running");
+      }
+      yield {
+        batchId: "batch-1",
+        message: "The server stopped this release verification.",
+        type: "cancelled",
+      };
+    });
+    const view = renderHook(() => useReleaseVerificationBatches([item]));
+
+    await act(async () => {
+      await view.result.current.start(item);
+    });
+
+    expect(
+      view.result.current.states.get(releaseVerificationKey(item)),
+    ).toMatchObject({ settled: 3, status: "cancelled" });
+    for (const pull of item.pulls) {
+      const state = view.result.current.pullStates.get(
+        verificationKey(item, pull),
+      );
+      expect(state?.status).toBe("cancelled");
+      expect(state?.output).toContain(
+        "[diagnostic] The server stopped this release verification.",
+      );
+      expect(isVerificationActive(state)).toBe(false);
+    }
+  });
+
+  it("accepts the real notes-fallback release shape and rejects only incomplete identities", () => {
+    const item = batchRelease();
+
+    expect(canVerifyEntireRelease(item)).toBe(true);
+    expect(canVerifyEntireRelease({ ...item, id: "" })).toBe(false);
+    expect(canVerifyEntireRelease({ ...item, repository: "" })).toBe(false);
+    expect(canVerifyEntireRelease({ ...item, tag: "" })).toBe(false);
+    expect(canVerifyEntireRelease({ ...item, pulls: [] })).toBe(false);
+    expect(canVerifyEntireRelease({ ...item, source: "unavailable" })).toBe(
+      false,
+    );
+  });
+});
+
+describe("reconcileRecentReleases", () => {
+  const response = (
+    releases: RecentRelease[],
+    partial: boolean,
+    generatedAt = partial
+      ? "2026-07-17T11:00:00.000Z"
+      : "2026-07-17T10:00:00.000Z",
+  ): RecentReleasesResponse => ({
+    generatedAt,
+    partial,
+    releases,
+    warnings: partial ? ["Some releases were omitted."] : [],
+  });
+
+  it("merges release identities and pull memberships only for a partial catalog", () => {
+    const first = release("release-1", 1);
+    const second = release("release-2", 2);
+    const extraPull = {
+      ...first.pulls[0]!,
+      headSha: "cccccccccccccccccccccccccccccccccccccccc",
+      number: 3,
+      title: "Released pull 3",
+      url: "https://github.com/appwrite/cloud/pull/3",
+    };
+    const previous = response(
+      [{ ...first, pulls: [first.pulls[0]!, extraPull] }, second],
+      false,
+    );
+    const incomingRelease = { ...first, pulls: [first.pulls[0]!] };
+    const partial = response([incomingRelease], true);
+
+    const merged = reconcileRecentReleases(previous, partial);
+
+    expect(merged.releases).toHaveLength(2);
+    expect(merged.releases[0]!.pulls.map((pull) => pull.url)).toEqual([
+      first.pulls[0]!.url,
+      extraPull.url,
+    ]);
+    expect(merged.releases[0]).toMatchObject({
+      complete: false,
+      warning: expect.stringContaining("partial refresh omitted"),
+    });
+    expect(merged.releases[1]).toMatchObject({
+      complete: false,
+      id: second.id,
+      warning: expect.stringContaining("omitted from the partial refresh"),
+    });
+
+    const authoritative = response([incomingRelease], false);
+    expect(reconcileRecentReleases(merged, authoritative)).toBe(authoritative);
+  });
+
+  it("keeps the exact one-week boundary and removes older incoming releases", () => {
+    const generated = new Date(2026, 6, 21, 12, 0, 0);
+    const boundary = new Date(generated.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const inside = {
+      ...release("release-boundary", 1),
+      publishedAt: boundary.toISOString(),
+    };
+    const outside = {
+      ...release("release-outside", 2),
+      publishedAt: new Date(boundary.getTime() - 1).toISOString(),
+    };
+    const incoming = response(
+      [inside, outside],
+      false,
+      generated.toISOString(),
+    );
+
+    const reconciled = reconcileRecentReleases(null, incoming);
+
+    expect(reconciled.releases).toEqual([inside]);
+  });
+
+  it("prunes old incoming and retained releases while preserving in-window pulls during a partial refresh", () => {
+    const generated = new Date(2026, 6, 21, 12, 0, 0);
+    const withinWindow = new Date(2026, 6, 20, 9, 0, 0).toISOString();
+    const outsideWindow = new Date(2026, 6, 14, 11, 59, 59).toISOString();
+    const current = {
+      ...release("release-current", 1),
+      publishedAt: withinWindow,
+    };
+    const retainedPull = {
+      ...current.pulls[0]!,
+      headSha: "cccccccccccccccccccccccccccccccccccccccc",
+      number: 3,
+      title: "Retained pull",
+      url: "https://github.com/appwrite/cloud/pull/3",
+    };
+    const old = {
+      ...release("release-old", 2),
+      publishedAt: outsideWindow,
+    };
+    const previous = response(
+      [{ ...current, pulls: [current.pulls[0]!, retainedPull] }, old],
+      false,
+      new Date(2026, 6, 21, 11, 0, 0).toISOString(),
+    );
+    const incoming = response(
+      [current, old],
+      true,
+      generated.toISOString(),
+    );
+
+    const reconciled = reconcileRecentReleases(previous, incoming);
+
+    expect(reconciled.releases).toHaveLength(1);
+    expect(reconciled.releases[0]!.id).toBe(current.id);
+    expect(reconciled.releases[0]!.pulls.map((pull) => pull.url)).toEqual([
+      current.pulls[0]!.url,
+      retainedPull.url,
+    ]);
+  });
+
+  it("places a newer retained release before an older incoming release after a partial refresh", () => {
+    const retained = {
+      ...release("release-retained", 1),
+      publishedAt: "2026-07-17T10:00:00.000Z",
+    };
+    const incomingRelease = {
+      ...release("release-incoming", 2),
+      publishedAt: "2026-07-16T10:00:00.000Z",
+    };
+    const previous = response([retained], false);
+    const incoming = response([incomingRelease], true);
+
+    const reconciled = reconcileRecentReleases(previous, incoming);
+
+    expect(reconciled.releases.map(({ id }) => id)).toEqual([
+      retained.id,
+      incomingRelease.id,
+    ]);
+  });
+});

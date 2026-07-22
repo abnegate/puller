@@ -1,6 +1,6 @@
 import { GithubError } from './github.mjs'
 
-const DEFAULT_TTL = 5 * 60 * 1_000
+export const DEFAULT_TTL = 10_000
 
 export class SnapshotError extends Error {
   constructor(message, options) {
@@ -32,38 +32,88 @@ function initialError(error) {
 export function createSnapshotCache({ load, now = Date.now, ttl = DEFAULT_TTL }) {
   let lastGood = null
   let loadedAt = 0
-  let inflight = null
+  let loadInflight = null
+  let refreshInflight = null
+  let freshInflight = null
 
-  async function refresh() {
+  function store(snapshot) {
+    loadedAt = now()
+    lastGood = {
+      ...snapshot,
+      generatedAt: new Date(loadedAt).toISOString(),
+      stale: false,
+    }
+    return lastGood
+  }
+
+  function markStale(error) {
+    if (lastGood === null) return null
+
+    loadedAt = now()
+    lastGood = {
+      ...lastGood,
+      stale: true,
+      warnings: [
+        ...lastGood.warnings.filter(
+          (warning) => !warning.startsWith('Showing the last successful snapshot'),
+        ),
+        warningFor(error),
+      ],
+    }
+    return lastGood
+  }
+
+  function startLoad() {
+    if (loadInflight) return loadInflight
+
+    let running
     try {
-      const snapshot = await load()
-      loadedAt = now()
-      lastGood = {
-        ...snapshot,
-        generatedAt: new Date(loadedAt).toISOString(),
-        stale: false,
-      }
-      return lastGood
+      running = Promise.resolve(load()).then(store)
     } catch (error) {
-      if (lastGood) {
-        loadedAt = now()
-        lastGood = {
-          ...lastGood,
-          stale: true,
-          warnings: [
-            ...lastGood.warnings.filter(
-              (warning) => !warning.startsWith('Showing the last successful snapshot'),
-            ),
-            warningFor(error),
-          ],
-        }
-        return lastGood
+      running = Promise.reject(error)
+    }
+    running = running.catch((error) => {
+      markStale(error)
+      throw error
+    })
+    loadInflight = running.finally(() => {
+      loadInflight = null
+    })
+    return loadInflight
+  }
+
+  function loadFresh() {
+    if (freshInflight) return freshInflight
+
+    const running = startLoad().catch((error) => {
+      throw initialError(error)
+    })
+    let shared
+    shared = running.finally(() => {
+      if (freshInflight === shared) {
+        freshInflight = null
       }
+    })
+    freshInflight = shared
+    return shared
+  }
+
+  function refresh() {
+    if (refreshInflight) return refreshInflight
+
+    const running = startLoad().catch((error) => {
+      if (lastGood) return lastGood
 
       throw initialError(error)
-    } finally {
-      inflight = null
-    }
+    })
+    let shared
+    shared = running.finally(() => {
+      if (refreshInflight === shared) {
+        refreshInflight = null
+      }
+    })
+    refreshInflight = shared
+    return shared
   }
 
   return {
@@ -72,12 +122,24 @@ export function createSnapshotCache({ load, now = Date.now, ttl = DEFAULT_TTL })
         return Promise.resolve(lastGood)
       }
 
-      if (inflight) {
-        return inflight
+      if (refreshInflight) {
+        return refreshInflight
       }
 
-      inflight = refresh()
-      return inflight
+      return refresh()
+    },
+    getFresh: loadFresh,
+    loadFresh,
+    /**
+     * Returns the last snapshot and its TTL state without starting a load.
+     * Consumers may use this only to deny or prune; fresh authorization must come from GitHub.
+     */
+    peek() {
+      if (lastGood === null) return null
+      return {
+        ...lastGood,
+        expired: now() - loadedAt >= ttl,
+      }
     },
   }
 }

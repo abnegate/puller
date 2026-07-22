@@ -1,6 +1,13 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { cancelClaudeRun, resetActionTokenForTests, streamClaudeRun } from './fixes';
+import {
+  cancelClaudeRun,
+  ClaudeRunHttpError,
+  resetActionTokenForTests,
+  streamClaudeRun,
+  type AutoTrigger,
+  type ClaudeRunRequest,
+} from "./fixes";
 
 const encoder = new TextEncoder();
 
@@ -15,22 +22,22 @@ const streamResponse = (chunks: string[]): Response =>
       },
     }),
     {
-      headers: { 'Content-Type': 'application/x-ndjson' },
+      headers: { "Content-Type": "application/x-ndjson" },
       status: 200,
     },
   );
 
-const tokenResponse = (token = 'action-token'): Response =>
+const tokenResponse = (token = "action-token"): Response =>
   new Response(JSON.stringify({ token }), {
-    headers: { 'Content-Type': 'application/json' },
+    headers: { "Content-Type": "application/json" },
     status: 200,
   });
 
 const request = {
-  expectedHeadRefOid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-  message: 'Resolve the open review feedback.',
+  expectedHeadRefOid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  message: "Resolve the open review feedback.",
   number: 102,
-  repository: 'appwrite/cloud',
+  repository: "appwrite/cloud",
 };
 
 afterEach(() => {
@@ -38,8 +45,8 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe('streamClaudeRun', () => {
-  it('decodes fragmented, coalesced, and final unterminated NDJSON incrementally', async () => {
+describe("streamClaudeRun", () => {
+  it("decodes fragmented, coalesced, and final unterminated NDJSON incrementally", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(tokenResponse())
@@ -51,7 +58,7 @@ describe('streamClaudeRun', () => {
           ',"status":"done"}\n{"type":"complete","exitCode":0}',
         ]),
       );
-    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal("fetch", fetchMock);
 
     const events = [];
     for await (const event of streamClaudeRun(request)) {
@@ -59,27 +66,285 @@ describe('streamClaudeRun', () => {
     }
 
     expect(events).toEqual([
-      { number: 102, repository: 'appwrite/cloud', runId: 'run-1', type: 'start' },
-      { text: 'first', type: 'text' },
-      { name: 'Edit', status: 'done', type: 'tool' },
-      { exitCode: 0, type: 'complete' },
+      {
+        number: 102,
+        repository: "appwrite/cloud",
+        runId: "run-1",
+        type: "start",
+      },
+      { text: "first", type: "text" },
+      { name: "Edit", status: "done", type: "tool" },
+      { exitCode: 0, type: "complete" },
     ]);
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
-      '/api/claude/runs',
+      "/api/claude/runs",
       expect.objectContaining({
         body: JSON.stringify(request),
         headers: expect.objectContaining({
-          Accept: 'application/x-ndjson',
-          'Content-Type': 'application/json',
-          'X-Action-Token': 'action-token',
+          Accept: "application/x-ndjson",
+          "Content-Type": "application/json",
+          "X-Action-Token": "action-token",
         }),
-        method: 'POST',
+        method: "POST",
       }),
     );
   });
 
-  it('caches the token across runs', async () => {
+  it.each([1, 2, 3, 4] as const)(
+    "sends automatic trigger identities with parallelism %i",
+    async (parallelism) => {
+      const triggers: AutoTrigger[] = [
+        {
+          id: "comment-1",
+          kind: "issue_comment",
+          updatedAt: "2026-07-22T00:00:00.000Z",
+        },
+        {
+          id: "review-1",
+          kind: "review_comment",
+          threadId: "thread-1",
+          updatedAt: "2026-07-22T00:01:00.000Z",
+        },
+        {
+          detailsUrl: "https://github.com/appwrite/cloud/actions/runs/1",
+          headRefOid: request.expectedHeadRefOid,
+          id: "check-1",
+          kind: "failed_check",
+        },
+        {
+          commentId: "greptile-1",
+          confidence: 4,
+          kind: "greptile",
+          reviewedSha: request.expectedHeadRefOid,
+          updatedAt: "2026-07-22T00:02:00.000Z",
+        },
+      ];
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce(tokenResponse())
+        .mockResolvedValueOnce(
+          streamResponse([
+            '{"type":"start","runId":"auto-1","repository":"appwrite/cloud","number":102}\n',
+            '{"type":"complete","exitCode":0}\n',
+          ]),
+        );
+      vi.stubGlobal("fetch", fetchMock);
+
+      for await (const _event of streamClaudeRun({
+        ...request,
+        parallelism,
+        source: "auto",
+        triggers,
+      })) {
+        // Consume the automatic run stream.
+      }
+
+      expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({
+        ...request,
+        parallelism,
+        source: "auto",
+        triggers,
+      });
+    },
+  );
+
+  it("validates and serializes review feedback as an exact one-shot run payload", async () => {
+    const review = {
+      ...request,
+      expectedBaseRefOid: "B".repeat(40),
+      expectedHeadRefOid: "A".repeat(40),
+      feedback: {
+        body: "Handle this race without weakening the assertion.",
+        line: 44,
+        path: "src/Worker.php",
+        side: "RIGHT",
+        startLine: 41,
+        startSide: "RIGHT",
+      },
+      message: "",
+      source: "review",
+    } satisfies ClaudeRunRequest;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(tokenResponse())
+      .mockResolvedValueOnce(
+        streamResponse([
+          '{"type":"start","runId":"review-1","repository":"appwrite/cloud","number":102}\n',
+          '{"type":"complete","exitCode":0}\n',
+        ]),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    for await (const _event of streamClaudeRun(review)) {
+      // Consume the review run stream.
+    }
+
+    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({
+      expectedBaseRefOid: "b".repeat(40),
+      expectedHeadRefOid: "a".repeat(40),
+      feedback: {
+        body: "Handle this race without weakening the assertion.",
+        line: 44,
+        path: "src/Worker.php",
+        side: "RIGHT",
+        startLine: 41,
+        startSide: "RIGHT",
+      },
+      message: "",
+      number: 102,
+      repository: "appwrite/cloud",
+      source: "review",
+    });
+  });
+
+  it.each([
+    ["an invalid base SHA", { expectedBaseRefOid: "not-a-sha" }],
+    ["an invalid head SHA", { expectedHeadRefOid: "not-a-sha" }],
+    ["a blank body", { feedback: { body: "   " } }],
+    ["a body containing NUL", { feedback: { body: "unsafe\0body" } }],
+    ["a blank path", { feedback: { path: "   " } }],
+    ["a path containing NUL", { feedback: { path: "src\0/file.ts" } }],
+    ["an unknown side", { feedback: { side: "BOTH" } }],
+    ["a non-positive line", { feedback: { line: 0 } }],
+    ["a fractional line", { feedback: { line: 4.5 } }],
+    ["an unpaired start line", { feedback: { startLine: 3 } }],
+    ["an unpaired start side", { feedback: { startSide: "RIGHT" } }],
+    [
+      "a reversed range",
+      { feedback: { line: 4, startLine: 5, startSide: "RIGHT" } },
+    ],
+    [
+      "a range crossing diff sides",
+      { feedback: { startLine: 3, startSide: "LEFT" } },
+    ],
+    ["an unknown feedback field", { feedback: { context: "extra" } }],
+    ["an unknown request field", { parallelism: 2 }],
+  ])(
+    "rejects review feedback with %s before authorization",
+    async (_label, change) => {
+      const feedback = {
+        body: "Address this feedback.",
+        line: 4,
+        path: "src/Worker.php",
+        side: "RIGHT",
+        ...("feedback" in change ? change.feedback : {}),
+      };
+      const invalid = {
+        ...request,
+        expectedBaseRefOid: "b".repeat(40),
+        feedback,
+        message: "",
+        source: "review",
+        ...change,
+        ...("feedback" in change ? { feedback } : {}),
+      } as unknown as ClaudeRunRequest;
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+
+      const consume = async () => {
+        for await (const _event of streamClaudeRun(invalid)) {
+          // Validation rejects before the action token is requested.
+        }
+      };
+
+      await expect(consume()).rejects.toThrow(
+        "The review fix request is invalid.",
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("preserves the HTTP status and service error code before streaming starts", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(tokenResponse())
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              code: "auto_trigger_stale",
+              error: "The automatic evidence is stale.",
+            }),
+            { status: 409 },
+          ),
+        ),
+    );
+
+    const consume = async () => {
+      for await (const _event of streamClaudeRun(request)) {
+        // The response is rejected before the first stream event.
+      }
+    };
+
+    await expect(consume()).rejects.toEqual(
+      expect.objectContaining<Partial<ClaudeRunHttpError>>({
+        code: "auto_trigger_stale",
+        message: "The automatic evidence is stale.",
+        name: "ClaudeRunHttpError",
+        status: 409,
+      }),
+    );
+  });
+
+  it("accepts the server-shaped cancellation event as a successful terminal event", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(tokenResponse())
+      .mockResolvedValueOnce(
+        streamResponse([
+          '{"type":"start","runId":"run-1","repository":"appwrite/cloud","number":102}\n',
+          '{"type":"cancelled","message":"Run cancelled."}\n',
+        ]),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const events = [];
+    for await (const event of streamClaudeRun(request)) {
+      events.push(event);
+    }
+
+    expect(events.at(-1)).toEqual({
+      message: "Run cancelled.",
+      type: "cancelled",
+    });
+  });
+
+  it.each([
+    ["a numeric cancellation message", '{"type":"cancelled","message":42}\n'],
+    ["a null cancellation message", '{"type":"cancelled","message":null}\n'],
+    ["an empty cancellation message", '{"type":"cancelled","message":""}\n'],
+    [
+      "an unknown terminal event",
+      '{"type":"canceled","message":"Run cancelled."}\n',
+    ],
+  ])("rejects %s", async (_label, terminal) => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(tokenResponse())
+        .mockResolvedValueOnce(
+          streamResponse([
+            '{"type":"start","runId":"run-1","repository":"appwrite/cloud","number":102}\n',
+            terminal,
+          ]),
+        ),
+    );
+
+    const consume = async () => {
+      for await (const _event of streamClaudeRun(request)) {
+        // Consume until validation fails.
+      }
+    };
+
+    await expect(consume()).rejects.toThrow(
+      "Claude returned an invalid stream event.",
+    );
+  });
+
+  it("caches the token across runs", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(tokenResponse())
@@ -95,7 +360,7 @@ describe('streamClaudeRun', () => {
           '{"type":"complete","exitCode":0}\n',
         ]),
       );
-    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal("fetch", fetchMock);
 
     for await (const _event of streamClaudeRun(request)) {
       // Consume the first stream.
@@ -105,55 +370,60 @@ describe('streamClaudeRun', () => {
     }
 
     expect(fetchMock).toHaveBeenCalledTimes(3);
-    expect(fetchMock.mock.calls.filter(([url]) => url === '/api/actions/token')).toHaveLength(1);
+    expect(
+      fetchMock.mock.calls.filter(([url]) => url === "/api/actions/token"),
+    ).toHaveLength(1);
   });
 
-  it('refreshes an expired token once before a stream has started', async () => {
+  it("refreshes an expired token once before a stream has started", async () => {
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(tokenResponse('old-token'))
+      .mockResolvedValueOnce(tokenResponse("old-token"))
       .mockResolvedValueOnce(new Response(null, { status: 401 }))
-      .mockResolvedValueOnce(tokenResponse('new-token'))
+      .mockResolvedValueOnce(tokenResponse("new-token"))
       .mockResolvedValueOnce(
         streamResponse([
           '{"type":"start","runId":"run-2","repository":"appwrite/cloud","number":102}\n',
           '{"type":"complete","exitCode":0}\n',
         ]),
       );
-    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal("fetch", fetchMock);
 
     const events = [];
     for await (const event of streamClaudeRun(request)) {
       events.push(event);
     }
 
-    expect(events.at(-1)).toEqual({ exitCode: 0, type: 'complete' });
+    expect(events.at(-1)).toEqual({ exitCode: 0, type: "complete" });
     expect(fetchMock).toHaveBeenCalledTimes(4);
     expect(fetchMock.mock.calls[3]?.[1]).toEqual(
       expect.objectContaining({
-        headers: expect.objectContaining({ 'X-Action-Token': 'new-token' }),
+        headers: expect.objectContaining({ "X-Action-Token": "new-token" }),
       }),
     );
   });
 
   it.each([
-    ['a non-start first event', '{"type":"text","text":"wrong"}\n'],
+    ["a non-start first event", '{"type":"text","text":"wrong"}\n'],
     [
-      'an event with extra properties',
+      "an event with extra properties",
       '{"type":"start","runId":"run-1","repository":"appwrite/cloud","number":102,"extra":true}\n',
     ],
     [
-      'a start event for another pull request',
+      "a start event for another pull request",
       '{"type":"start","runId":"run-1","repository":"appwrite/cloud","number":999}\n',
     ],
     [
-      'malformed JSON',
+      "malformed JSON",
       '{"type":"start","runId":"run-1","repository":"appwrite/cloud","number":102}\nnot-json',
     ],
-  ])('rejects %s', async (_label, body) => {
+  ])("rejects %s", async (_label, body) => {
     vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValueOnce(tokenResponse()).mockResolvedValueOnce(streamResponse([body])),
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(tokenResponse())
+        .mockResolvedValueOnce(streamResponse([body])),
     );
 
     const consume = async () => {
@@ -162,26 +432,31 @@ describe('streamClaudeRun', () => {
       }
     };
 
-    await expect(consume()).rejects.toThrow(/different|invalid|malformed|without a start/);
+    await expect(consume()).rejects.toThrow(
+      /different|invalid|malformed|without a start/,
+    );
   });
 
   it.each([
     [
-      'a stream without a terminal event',
+      "a stream without a terminal event",
       '{"type":"start","runId":"run-1","repository":"appwrite/cloud","number":102}\n',
       /before reporting completion/,
     ],
     [
-      'data after a terminal event',
+      "data after a terminal event",
       '{"type":"start","runId":"run-1","repository":"appwrite/cloud","number":102}\n' +
         '{"type":"complete","exitCode":0}\n' +
         '{"type":"text","text":"late"}\n',
       /after a terminal event/,
     ],
-  ])('rejects %s', async (_label, body, error) => {
+  ])("rejects %s", async (_label, body, error) => {
     vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValueOnce(tokenResponse()).mockResolvedValueOnce(streamResponse([body])),
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(tokenResponse())
+        .mockResolvedValueOnce(streamResponse([body])),
     );
 
     const consume = async () => {
@@ -193,7 +468,7 @@ describe('streamClaudeRun', () => {
     await expect(consume()).rejects.toThrow(error);
   });
 
-  it('forwards AbortSignal to token and run requests', async () => {
+  it("accepts a legacy bare cancellation and forwards AbortSignal to both requests", async () => {
     const controller = new AbortController();
     const fetchMock = vi
       .fn()
@@ -204,12 +479,14 @@ describe('streamClaudeRun', () => {
           '{"type":"cancelled"}\n',
         ]),
       );
-    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal("fetch", fetchMock);
 
-    for await (const _event of streamClaudeRun(request, controller.signal)) {
-      // Consume the stream.
+    const events = [];
+    for await (const event of streamClaudeRun(request, controller.signal)) {
+      events.push(event);
     }
 
+    expect(events.at(-1)).toEqual({ type: "cancelled" });
     expect(fetchMock.mock.calls[0]?.[1]).toEqual(
       expect.objectContaining({ signal: controller.signal }),
     );
@@ -219,22 +496,22 @@ describe('streamClaudeRun', () => {
   });
 });
 
-describe('cancelClaudeRun', () => {
-  it('uses the cached action token and URL-encodes the run id', async () => {
+describe("cancelClaudeRun", () => {
+  it("uses the cached action token and URL-encodes the run id", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(tokenResponse())
       .mockResolvedValueOnce(new Response(null, { status: 204 }));
-    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal("fetch", fetchMock);
 
-    await cancelClaudeRun('run/with spaces');
+    await cancelClaudeRun("run/with spaces");
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
-      '/api/claude/runs/run%2Fwith%20spaces',
+      "/api/claude/runs/run%2Fwith%20spaces",
       expect.objectContaining({
-        headers: expect.objectContaining({ 'X-Action-Token': 'action-token' }),
-        method: 'DELETE',
+        headers: expect.objectContaining({ "X-Action-Token": "action-token" }),
+        method: "DELETE",
       }),
     );
   });

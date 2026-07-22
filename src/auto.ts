@@ -1,0 +1,1300 @@
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+
+import type { AutoParallelism, AutoTrigger } from "./fixes";
+import { isRunActive, type PullRuns, type RunStartOutcome } from "./runs";
+import { isTaskActive, type TaskState } from "./tasks";
+import type { CICheck, PullReadiness } from "./types";
+
+export const AUTO_SETTINGS_STORAGE_KEY = "puller-auto-settings";
+export const AUTO_EVIDENCE_STORAGE_PREFIX = "puller-auto-evidence:";
+export const AUTO_LOCK_PREFIX = "puller:auto-dispatcher:";
+
+const SETTINGS_VERSION = 2;
+const LEGACY_SETTINGS_VERSION = 1;
+const EVIDENCE_VERSION = 1;
+const RETRY_BASE_DELAY = 1_000;
+const RETRY_MAX_DELAY = 16_000;
+const RETRY_MAX_EXPONENT = Math.ceil(
+  Math.log2(RETRY_MAX_DELAY / RETRY_BASE_DELAY),
+);
+const START_GUARD_DELAY = 30_000;
+const AUTO_TRIGGER_LIMIT = 64;
+const GREPTILE_LOGIN = "greptile-apps";
+
+type AutoSettings = {
+  enabled: boolean;
+  epoch: string | null;
+  parallelism: AutoParallelism;
+  version: typeof SETTINGS_VERSION;
+};
+
+type CheckObservation = {
+  failed: boolean;
+  failureSequence: number;
+};
+
+type PullObservation = {
+  baseline: {
+    checks: boolean;
+    comments: boolean;
+    greptile: boolean;
+    threads: boolean;
+  };
+  checks: Record<string, CheckObservation>;
+  greptile: string | null;
+  headRefOid: string;
+  issues: Record<string, string>;
+  origin: "baseline" | "new";
+  reviews: Record<string, string>;
+};
+
+type AutoIncident = {
+  identity: string;
+  trigger: AutoTrigger;
+};
+
+type RetryObservation = {
+  attempt: number;
+  identities: string[];
+  notBefore: number;
+};
+
+type AutoEvidence = {
+  attempted: Record<string, string[]>;
+  baseline: {
+    complete: boolean;
+    pulls: string[];
+  };
+  epoch: string;
+  observed: Record<string, PullObservation>;
+  pending: Record<string, AutoIncident[]>;
+  retry: Record<string, RetryObservation>;
+  updatedAt: string;
+  version: typeof EVIDENCE_VERSION;
+  viewer: string;
+};
+
+export type AutoStatus =
+  | "disabled"
+  | "error"
+  | "paused"
+  | "queued"
+  | "running"
+  | "standby"
+  | "unavailable"
+  | "watching";
+
+export type AutoController = {
+  available: boolean;
+  description: string;
+  enabled: boolean;
+  error: string | null;
+  leader: boolean;
+  parallelism: AutoParallelism;
+  paused: boolean;
+  queued: number;
+  setEnabled: (enabled: boolean) => void;
+  setParallelism: (parallelism: AutoParallelism) => void;
+  status: AutoStatus;
+};
+
+export type AutoInput = {
+  authoritative: boolean;
+  pulls: readonly PullReadiness[];
+  runs: Pick<PullRuns, "start" | "states">;
+  tasks: readonly TaskState[];
+  viewerLogin: string | null;
+};
+
+type EngineInput = AutoInput & {
+  epoch: string;
+  parallelism: AutoParallelism;
+  viewer: string;
+};
+
+type EngineSummary = {
+  active: number;
+  error: string | null;
+  paused: boolean;
+  queued: number;
+};
+
+type Leader = {
+  claims: Set<string>;
+  evidence: AutoEvidence;
+  generation: number;
+  retryAt: number | null;
+  retryTimer: number | null;
+};
+
+const EMPTY_SUMMARY: EngineSummary = {
+  active: 0,
+  error: null,
+  paused: false,
+  queued: 0,
+};
+
+const emptySettings = (): AutoSettings => ({
+  enabled: false,
+  epoch: null,
+  parallelism: 1,
+  version: SETTINGS_VERSION,
+});
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const isStringRecord = (value: unknown): value is Record<string, string> =>
+  isRecord(value) &&
+  Object.values(value).every((item) => typeof item === "string");
+
+const isCheckRecord = (
+  value: unknown,
+): value is Record<string, CheckObservation> =>
+  isRecord(value) &&
+  Object.values(value).every(
+    (item) =>
+      isRecord(item) &&
+      typeof item.failed === "boolean" &&
+      typeof item.failureSequence === "number" &&
+      Number.isSafeInteger(item.failureSequence) &&
+      item.failureSequence >= 0,
+  );
+
+const isAutoParallelism = (value: unknown): value is AutoParallelism =>
+  value === 1 || value === 2 || value === 3 || value === 4;
+
+const validEnabledEpoch = (
+  enabled: unknown,
+  epoch: unknown,
+): enabled is boolean =>
+  typeof enabled === "boolean" &&
+  (epoch === null || typeof epoch === "string") &&
+  (!enabled || (typeof epoch === "string" && epoch.length > 0));
+
+const parseSettings = (value: string | null): AutoSettings => {
+  if (value === null) return emptySettings();
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (
+      isRecord(parsed) &&
+      parsed.version === SETTINGS_VERSION &&
+      validEnabledEpoch(parsed.enabled, parsed.epoch) &&
+      isAutoParallelism(parsed.parallelism)
+    ) {
+      return parsed as AutoSettings;
+    }
+    if (
+      isRecord(parsed) &&
+      parsed.version === LEGACY_SETTINGS_VERSION &&
+      validEnabledEpoch(parsed.enabled, parsed.epoch)
+    ) {
+      return {
+        enabled: parsed.enabled,
+        epoch: parsed.epoch as string | null,
+        parallelism: 1,
+        version: SETTINGS_VERSION,
+      };
+    }
+  } catch {
+    // A malformed setting is safely treated as disabled.
+  }
+  return emptySettings();
+};
+
+const readSettings = (): AutoSettings => {
+  if (typeof window === "undefined") return emptySettings();
+  let value: string | null;
+  try {
+    value = window.localStorage.getItem(AUTO_SETTINGS_STORAGE_KEY);
+  } catch {
+    return emptySettings();
+  }
+
+  const settings = parseSettings(value);
+  if (value !== null) {
+    try {
+      const parsed: unknown = JSON.parse(value);
+      if (
+        isRecord(parsed) &&
+        parsed.version === LEGACY_SETTINGS_VERSION &&
+        validEnabledEpoch(parsed.enabled, parsed.epoch)
+      ) {
+        try {
+          window.localStorage.setItem(
+            AUTO_SETTINGS_STORAGE_KEY,
+            JSON.stringify(settings),
+          );
+        } catch {
+          // The migrated settings remain valid for the current page.
+        }
+      }
+    } catch {
+      // parseSettings already converted malformed settings to the safe default.
+    }
+  }
+  return settings;
+};
+
+const normalizeViewer = (viewer: string): string => viewer.trim().toLowerCase();
+
+export const getAutoEvidenceStorageKey = (viewer: string): string =>
+  `${AUTO_EVIDENCE_STORAGE_PREFIX}${normalizeViewer(viewer)}`;
+
+export const getAutoLockName = (viewer: string): string =>
+  `${AUTO_LOCK_PREFIX}${normalizeViewer(viewer)}`;
+
+const newEvidence = (viewer: string, epoch: string): AutoEvidence => ({
+  attempted: {},
+  baseline: { complete: false, pulls: [] },
+  epoch,
+  observed: {},
+  pending: {},
+  retry: {},
+  updatedAt: new Date().toISOString(),
+  version: EVIDENCE_VERSION,
+  viewer,
+});
+
+const isAutoTrigger = (value: unknown): value is AutoTrigger => {
+  if (!isRecord(value) || typeof value.kind !== "string") return false;
+  if (value.kind === "issue_comment") {
+    return typeof value.id === "string" && typeof value.updatedAt === "string";
+  }
+  if (value.kind === "review_comment") {
+    return (
+      typeof value.id === "string" &&
+      typeof value.threadId === "string" &&
+      typeof value.updatedAt === "string"
+    );
+  }
+  if (value.kind === "failed_check") {
+    return (
+      typeof value.id === "string" &&
+      (value.detailsUrl === null || typeof value.detailsUrl === "string") &&
+      typeof value.headRefOid === "string"
+    );
+  }
+  if (value.kind === "greptile") {
+    return (
+      typeof value.commentId === "string" &&
+      typeof value.updatedAt === "string" &&
+      typeof value.reviewedSha === "string" &&
+      typeof value.confidence === "number"
+    );
+  }
+  return false;
+};
+
+const parseEvidence = (
+  value: string | null,
+  viewer: string,
+  epoch: string,
+): AutoEvidence => {
+  if (value === null) return newEvidence(viewer, epoch);
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (
+      !isRecord(parsed) ||
+      parsed.version !== EVIDENCE_VERSION ||
+      parsed.viewer !== viewer ||
+      parsed.epoch !== epoch ||
+      typeof parsed.updatedAt !== "string" ||
+      !isRecord(parsed.baseline) ||
+      typeof parsed.baseline.complete !== "boolean" ||
+      !Array.isArray(parsed.baseline.pulls) ||
+      !parsed.baseline.pulls.every((item) => typeof item === "string") ||
+      !isRecord(parsed.observed) ||
+      !isRecord(parsed.pending) ||
+      !isRecord(parsed.attempted) ||
+      !isRecord(parsed.retry)
+    ) {
+      return newEvidence(viewer, epoch);
+    }
+
+    const observed = Object.values(parsed.observed).every(
+      (item) =>
+        isRecord(item) &&
+        (item.origin === "baseline" || item.origin === "new") &&
+        typeof item.headRefOid === "string" &&
+        isRecord(item.baseline) &&
+        typeof item.baseline.checks === "boolean" &&
+        typeof item.baseline.comments === "boolean" &&
+        typeof item.baseline.greptile === "boolean" &&
+        typeof item.baseline.threads === "boolean" &&
+        isCheckRecord(item.checks) &&
+        isStringRecord(item.issues) &&
+        isStringRecord(item.reviews) &&
+        (item.greptile === null || typeof item.greptile === "string"),
+    );
+    const pending = Object.values(parsed.pending).every(
+      (items) =>
+        Array.isArray(items) &&
+        items.every(
+          (item) =>
+            isRecord(item) &&
+            typeof item.identity === "string" &&
+            isAutoTrigger(item.trigger),
+        ),
+    );
+    const attempted = Object.values(parsed.attempted).every(
+      (items) =>
+        Array.isArray(items) &&
+        items.every((item) => typeof item === "string"),
+    );
+    const retry = Object.values(parsed.retry).every(
+      (item) =>
+        isRecord(item) &&
+        typeof item.attempt === "number" &&
+        Number.isSafeInteger(item.attempt) &&
+        item.attempt >= 0 &&
+        Array.isArray(item.identities) &&
+        item.identities.every((identity) => typeof identity === "string") &&
+        typeof item.notBefore === "number" &&
+        Number.isFinite(item.notBefore),
+    );
+
+    return observed && pending && attempted && retry
+      ? (parsed as AutoEvidence)
+      : newEvidence(viewer, epoch);
+  } catch {
+    return newEvidence(viewer, epoch);
+  }
+};
+
+const readEvidence = (viewer: string, epoch: string): AutoEvidence => {
+  try {
+    return parseEvidence(
+      window.localStorage.getItem(getAutoEvidenceStorageKey(viewer)),
+      viewer,
+      epoch,
+    );
+  } catch {
+    return newEvidence(viewer, epoch);
+  }
+};
+
+const cloneEvidence = (evidence: AutoEvidence): AutoEvidence =>
+  structuredClone(evidence);
+
+const evidenceContent = (evidence: AutoEvidence): string =>
+  JSON.stringify({ ...evidence, updatedAt: "" });
+
+const pendingCount = (evidence: AutoEvidence): number =>
+  Object.values(evidence.pending).reduce(
+    (count, incidents) => count + incidents.length,
+    0,
+  );
+
+const identity = (parts: readonly (number | string | null)[]): string =>
+  JSON.stringify(parts);
+
+const issueIncident = (
+  id: string,
+  updatedAt: string,
+): AutoIncident => ({
+  identity: identity(["issue", id, updatedAt]),
+  trigger: { id, kind: "issue_comment", updatedAt },
+});
+
+const isGreptileComment = (
+  comment: PullReadiness["issueComments"][number],
+): boolean => comment.author?.toLowerCase() === GREPTILE_LOGIN;
+
+const reviewIncident = (
+  threadId: string,
+  id: string,
+  updatedAt: string,
+): AutoIncident => ({
+  identity: identity(["review", threadId, id, updatedAt]),
+  trigger: { id, kind: "review_comment", threadId, updatedAt },
+});
+
+const greptileIncident = (pull: PullReadiness): AutoIncident | null => {
+  const { greptile } = pull;
+  if (
+    !pull.checks.commentsComplete ||
+    greptile.current !== true ||
+    greptile.commentId === null ||
+    greptile.updatedAt === null ||
+    greptile.reviewedSha === null ||
+    greptile.reviewedSha.toLowerCase() !== pull.headRefOid.toLowerCase() ||
+    greptile.confidence === null ||
+    greptile.confidence >= 5
+  ) {
+    return null;
+  }
+  return {
+    identity: identity([
+      "greptile",
+      greptile.commentId,
+      greptile.updatedAt,
+      greptile.reviewedSha.toLowerCase(),
+      greptile.confidence,
+    ]),
+    trigger: {
+      commentId: greptile.commentId,
+      confidence: greptile.confidence,
+      kind: "greptile",
+      reviewedSha: greptile.reviewedSha,
+      updatedAt: greptile.updatedAt,
+    },
+  };
+};
+
+const checkLineage = (headRefOid: string, check: CICheck): string =>
+  identity([
+    headRefOid.toLowerCase(),
+    check.id,
+    check.detailsUrl,
+  ]);
+
+const replacePending = (
+  pending: readonly AutoIncident[],
+  kind: AutoTrigger["kind"],
+  current: readonly AutoIncident[],
+  attempted: ReadonlySet<string>,
+): AutoIncident[] => [
+  ...pending.filter((incident) => incident.trigger.kind !== kind),
+  ...current.filter((incident) => !attempted.has(incident.identity)),
+];
+
+const observePull = (
+  evidence: AutoEvidence,
+  pull: PullReadiness,
+  baseline: boolean,
+): void => {
+  const key = pull.url;
+  const previous = evidence.observed[key];
+  const observed: PullObservation = previous ?? {
+    baseline: {
+      checks: false,
+      comments: false,
+      greptile: false,
+      threads: false,
+    },
+    checks: {},
+    greptile: null,
+    headRefOid: pull.headRefOid,
+    issues: {},
+    origin: baseline ? "baseline" : "new",
+    reviews: {},
+  };
+  const attempted = new Set(evidence.attempted[key] ?? []);
+  let pending = evidence.pending[key] ?? [];
+  const baselining = (dimension: keyof PullObservation["baseline"]): boolean =>
+    observed.origin === "baseline" && !observed.baseline[dimension];
+  const finish = (
+    dimension: keyof PullObservation["baseline"],
+    incidents: readonly AutoIncident[],
+  ): void => {
+    if (baselining(dimension)) {
+      for (const incident of incidents) attempted.add(incident.identity);
+    }
+    observed.baseline[dimension] = true;
+  };
+
+  if (pull.checks.commentsComplete) {
+    const issues = pull.issueComments
+      .filter((comment) => !isGreptileComment(comment))
+      .map((comment) => issueIncident(comment.id, comment.updatedAt));
+    finish("comments", issues);
+    pending = replacePending(pending, "issue_comment", issues, attempted);
+    observed.issues = Object.fromEntries(
+      pull.issueComments
+        .filter((comment) => !isGreptileComment(comment))
+        .map((comment) => [comment.id, comment.updatedAt]),
+    );
+
+    const greptile = greptileIncident(pull);
+    const greptileIncidents = greptile === null ? [] : [greptile];
+    finish("greptile", greptileIncidents);
+    pending = replacePending(
+      pending,
+      "greptile",
+      greptileIncidents,
+      attempted,
+    );
+    observed.greptile = greptile?.identity ?? null;
+  }
+
+  if (pull.checks.threadsComplete) {
+    const reviews = (pull.unresolvedThreads ?? []).flatMap((thread) =>
+      thread.comments
+        .filter((comment) => !isGreptileComment(comment))
+        .map((comment) =>
+          reviewIncident(thread.id, comment.id, comment.updatedAt),
+        ),
+    );
+    finish("threads", reviews);
+    pending = replacePending(pending, "review_comment", reviews, attempted);
+    observed.reviews = Object.fromEntries(
+      (pull.unresolvedThreads ?? []).flatMap((thread) =>
+        thread.comments
+          .filter((comment) => !isGreptileComment(comment))
+          .map((comment) => [
+            identity([thread.id, comment.id]),
+            comment.updatedAt,
+          ]),
+      ),
+    );
+  }
+
+  if (pull.ci.complete === true) {
+    const checks = { ...observed.checks };
+    const present = new Set<string>();
+    const failures: AutoIncident[] = [];
+    for (const check of pull.ci.checks ?? []) {
+      const lineage = checkLineage(pull.headRefOid, check);
+      present.add(lineage);
+      const before = checks[lineage] ?? {
+        failed: false,
+        failureSequence: 0,
+      };
+      const failed = check.state === "failure";
+      const failureSequence =
+        failed && !before.failed
+          ? before.failureSequence + 1
+          : before.failureSequence;
+      checks[lineage] = { failed, failureSequence };
+      if (failed) {
+        failures.push({
+          identity: identity(["check", lineage, failureSequence]),
+          trigger: {
+            detailsUrl: check.detailsUrl,
+            headRefOid: pull.headRefOid,
+            id: check.id,
+            kind: "failed_check",
+          },
+        });
+      }
+    }
+    for (const [lineage, check] of Object.entries(checks)) {
+      if (!present.has(lineage) && check.failed) {
+        checks[lineage] = { ...check, failed: false };
+      }
+    }
+    finish("checks", failures);
+    pending = replacePending(pending, "failed_check", failures, attempted);
+    observed.checks = checks;
+  }
+
+  observed.headRefOid = pull.headRefOid;
+  evidence.observed[key] = observed;
+  evidence.attempted[key] = [...attempted].sort();
+  if (pending.length === 0) delete evidence.pending[key];
+  else {
+    evidence.pending[key] = pending.sort((left, right) =>
+      left.identity.localeCompare(right.identity),
+    );
+  }
+
+  const retry = evidence.retry[key];
+  if (
+    retry &&
+    retry.identities.join("\n") !==
+      (evidence.pending[key] ?? [])
+        .slice(0, AUTO_TRIGGER_LIMIT)
+        .map((incident) => incident.identity)
+        .join("\n")
+  ) {
+    delete evidence.retry[key];
+  }
+};
+
+const reconcileEvidence = (
+  evidence: AutoEvidence,
+  pulls: readonly PullReadiness[],
+  authoritative: boolean,
+): AutoEvidence => {
+  if (!evidence.baseline.complete && !authoritative) return evidence;
+  const next = cloneEvidence(evidence);
+  const initial = !next.baseline.complete;
+  if (initial) {
+    next.baseline.complete = true;
+    next.baseline.pulls = pulls.map((pull) => pull.url).sort();
+  }
+
+  for (const pull of pulls) {
+    observePull(next, pull, initial);
+  }
+
+  if (authoritative) {
+    const present = new Set(pulls.map((pull) => pull.url));
+    for (const key of Object.keys(next.observed)) {
+      if (present.has(key)) continue;
+      delete next.observed[key];
+      delete next.pending[key];
+      delete next.attempted[key];
+      delete next.retry[key];
+    }
+    next.baseline.pulls = next.baseline.pulls.filter((key) => present.has(key));
+  }
+  return next;
+};
+
+const retryDelay = (attempt: number): number =>
+  RETRY_BASE_DELAY *
+  2 ** Math.min(Math.max(0, attempt - 1), RETRY_MAX_EXPONENT);
+
+const pullOrder = (
+  pulls: readonly PullReadiness[],
+): readonly PullReadiness[] =>
+  [...pulls].sort(
+    (left, right) =>
+      left.rank - right.rank || left.url.localeCompare(right.url),
+  );
+
+const sameTaskPull = (state: TaskState, pull: PullReadiness): boolean =>
+  isTaskActive(state.task) &&
+  state.task.repository.toLowerCase() === pull.repository.toLowerCase() &&
+  state.task.pullRequest?.number === pull.number;
+
+const isPullBusy = (input: EngineInput, pull: PullReadiness): boolean =>
+  isRunActive(input.runs.states.get(pull.url)) ||
+  input.tasks.some((state) => sameTaskPull(state, pull));
+
+const activeAutoKeys = (leader: Leader, input: EngineInput): Set<string> => {
+  const keys = new Set(leader.claims);
+  for (const [key, state] of input.runs.states) {
+    if (state.source === "auto" && isRunActive(state)) keys.add(key);
+  }
+  return keys;
+};
+
+const markAttempted = (
+  evidence: AutoEvidence,
+  key: string,
+  identities: readonly string[],
+): void => {
+  const attempted = new Set(evidence.attempted[key] ?? []);
+  for (const incident of identities) attempted.add(incident);
+  evidence.attempted[key] = [...attempted].sort();
+  const marked = new Set(identities);
+  const pending = (evidence.pending[key] ?? []).filter(
+    (incident) => !marked.has(incident.identity),
+  );
+  if (pending.length === 0) delete evidence.pending[key];
+  else evidence.pending[key] = pending;
+  delete evidence.retry[key];
+};
+
+const summarizeEvidence = (evidence: AutoEvidence): EngineSummary => ({
+  ...EMPTY_SUMMARY,
+  queued: pendingCount(evidence),
+});
+
+const writeEvidence = (evidence: AutoEvidence): void => {
+  window.localStorage.setItem(
+    getAutoEvidenceStorageKey(evidence.viewer),
+    JSON.stringify(evidence),
+  );
+};
+
+const describe = (
+  available: boolean,
+  enabled: boolean,
+  visible: boolean,
+  leader: boolean,
+  summary: EngineSummary,
+): { description: string; paused: boolean; status: AutoStatus } => {
+  if (!available) {
+    return {
+      description: "Auto is unavailable because this browser does not support Web Locks.",
+      paused: true,
+      status: "unavailable",
+    };
+  }
+  if (!enabled) {
+    return { description: "Auto is off.", paused: false, status: "disabled" };
+  }
+  if (!visible) {
+    return {
+      description: "Auto is paused while this tab is hidden.",
+      paused: true,
+      status: "paused",
+    };
+  }
+  if (!leader) {
+    return {
+      description: "Auto is watching in another tab.",
+      paused: false,
+      status: "standby",
+    };
+  }
+  if (summary.error) {
+    return { description: summary.error, paused: summary.paused, status: "error" };
+  }
+  if (summary.active > 0) {
+    return {
+      description:
+        summary.active === 1
+          ? "Auto is fixing a pull request."
+          : `Auto is fixing ${summary.active} pull requests.`,
+      paused: false,
+      status: "running",
+    };
+  }
+  if (summary.paused) {
+    return {
+      description: `${summary.queued} Auto ${summary.queued === 1 ? "issue is" : "issues are"} waiting for an active task or retry.`,
+      paused: true,
+      status: "paused",
+    };
+  }
+  if (summary.queued > 0) {
+    return {
+      description: `${summary.queued} Auto ${summary.queued === 1 ? "issue is" : "issues are"} queued.`,
+      paused: false,
+      status: "queued",
+    };
+  }
+  return {
+    description: "Auto is watching for new pull request blockers.",
+    paused: false,
+    status: "watching",
+  };
+};
+
+const newEpoch = (): string => {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+};
+
+const webLocksAvailable = (): boolean =>
+  typeof navigator !== "undefined" &&
+  "locks" in navigator &&
+  navigator.locks !== undefined &&
+  typeof navigator.locks.request === "function";
+
+export function useAuto({
+  authoritative,
+  pulls,
+  runs,
+  tasks,
+  viewerLogin,
+}: AutoInput): AutoController {
+  const [settings, setSettings] = useState<AutoSettings>(readSettings);
+  const [visible, setVisible] = useState(
+    () => typeof document === "undefined" || document.visibilityState === "visible",
+  );
+  const [leader, setLeader] = useState(false);
+  const [summary, setSummary] = useState<EngineSummary>(EMPTY_SUMMARY);
+  const available = webLocksAvailable();
+  const normalizedViewer = viewerLogin ? normalizeViewer(viewerLogin) : null;
+  const inputRef = useRef<EngineInput | null>(null);
+  const leaderRef = useRef<Leader | null>(null);
+  const processingRef = useRef<number | null>(null);
+  const rerunRef = useRef(false);
+  const generationRef = useRef(0);
+  const mountedRef = useRef(true);
+  const processRef = useRef<() => void>(() => undefined);
+
+  inputRef.current =
+    normalizedViewer && settings.epoch
+      ? {
+          authoritative,
+          epoch: settings.epoch,
+          parallelism: settings.parallelism,
+          pulls,
+          runs,
+          tasks,
+          viewer: normalizedViewer,
+          viewerLogin,
+        }
+      : null;
+
+  const publish = useCallback((next: EngineSummary): void => {
+    if (!mountedRef.current) return;
+    setSummary((current) =>
+      current.active === next.active &&
+      current.error === next.error &&
+      current.paused === next.paused &&
+      current.queued === next.queued
+        ? current
+        : next,
+    );
+  }, []);
+
+  const commit = useCallback(
+    (
+      current: Leader,
+      next: AutoEvidence,
+      change: Partial<EngineSummary> | false = {},
+    ): boolean => {
+      if (leaderRef.current !== current) return false;
+      const changed = evidenceContent(current.evidence) !== evidenceContent(next);
+      if (changed) {
+        next.updatedAt = new Date().toISOString();
+        current.evidence = next;
+        try {
+          writeEvidence(next);
+        } catch (error) {
+          const input = inputRef.current;
+          publish({
+            ...summarizeEvidence(next),
+            active:
+              input && input.epoch === next.epoch
+                ? activeAutoKeys(current, input).size
+                : current.claims.size,
+            error:
+              error instanceof Error
+                ? `Auto evidence could not be saved: ${error.message}`
+                : "Auto evidence could not be saved.",
+            paused: true,
+            ...(change === false ? {} : change),
+          });
+          return false;
+        }
+      } else {
+        current.evidence = next;
+      }
+      if (change !== false) {
+        const input = inputRef.current;
+        publish({
+          ...summarizeEvidence(next),
+          active:
+            input && input.epoch === next.epoch
+              ? activeAutoKeys(current, input).size
+              : current.claims.size,
+          ...change,
+        });
+      }
+      return true;
+    },
+    [publish],
+  );
+
+  const scheduleRetry = useCallback((current: Leader, notBefore: number): void => {
+    if (current.retryAt !== null && current.retryAt <= notBefore) return;
+    if (current.retryTimer !== null) window.clearTimeout(current.retryTimer);
+    current.retryAt = notBefore;
+    current.retryTimer = window.setTimeout(() => {
+      current.retryAt = null;
+      current.retryTimer = null;
+      processRef.current();
+    }, Math.max(0, notBefore - Date.now()));
+  }, []);
+
+  const launch = useCallback(
+    (
+      current: Leader,
+      input: EngineInput,
+      pull: PullReadiness,
+      incidents: readonly AutoIncident[],
+    ): void => {
+      const key = pull.url;
+      const identities = incidents.map((incident) => incident.identity);
+
+      void (async () => {
+        let outcome: RunStartOutcome;
+        try {
+          outcome = await input.runs.start(pull, {
+            message: "",
+            parallelism: input.parallelism,
+            source: "auto",
+            triggers: incidents.map((incident) => incident.trigger),
+          });
+        } catch (error) {
+          outcome = {
+            code: "transport",
+            kind: "retryable",
+            message:
+              error instanceof Error
+                ? error.message
+                : "The automatic run could not be started.",
+            source: "auto",
+          };
+        }
+
+        if (
+          leaderRef.current !== current ||
+          current.generation !== generationRef.current
+        ) {
+          return;
+        }
+
+        const next = cloneEvidence(current.evidence);
+        if (outcome.kind === "accepted") {
+          markAttempted(next, key, identities);
+          if (!commit(current, next)) return;
+
+          const settle = (): void => {
+            if (
+              leaderRef.current !== current ||
+              current.generation !== generationRef.current
+            ) {
+              return;
+            }
+            current.claims.delete(key);
+            commit(current, current.evidence);
+            processRef.current();
+          };
+          void outcome.completion.then(settle, settle);
+          processRef.current();
+          return;
+        }
+
+        current.claims.delete(key);
+        if (outcome.kind === "accepted-equivalent") {
+          markAttempted(next, key, identities);
+          if (commit(current, next)) processRef.current();
+          return;
+        }
+
+        if (outcome.kind === "retryable") {
+          const previous = current.evidence.retry[key];
+          const attempt = Math.min(
+            (previous?.attempt ?? 0) + 1,
+            RETRY_MAX_EXPONENT + 1,
+          );
+          const notBefore = Date.now() + retryDelay(attempt);
+          next.retry[key] = { attempt, identities, notBefore };
+          if (commit(current, next, { error: null, paused: true })) {
+            scheduleRetry(current, notBefore);
+            processRef.current();
+          }
+          return;
+        }
+
+        if (outcome.kind === "prune") {
+          delete next.observed[key];
+          delete next.pending[key];
+          delete next.attempted[key];
+          delete next.retry[key];
+          next.baseline.pulls = next.baseline.pulls.filter(
+            (pullKey) => pullKey !== key,
+          );
+        } else {
+          markAttempted(next, key, identities);
+        }
+        if (
+          commit(current, next, {
+            error:
+              outcome.kind === "failed"
+                ? `Auto could not start for ${pull.repository} #${pull.number}: ${outcome.message}`
+                : null,
+            paused: false,
+          })
+        ) {
+          processRef.current();
+        }
+      })();
+    },
+    [commit, scheduleRetry],
+  );
+
+  const process = useCallback((): void => {
+    const current = leaderRef.current;
+    const input = inputRef.current;
+    if (!current || !input || current.generation !== generationRef.current) return;
+    if (processingRef.current === current.generation) {
+      rerunRef.current = true;
+      return;
+    }
+    processingRef.current = current.generation;
+    try {
+      do {
+        rerunRef.current = false;
+        const active = leaderRef.current;
+        const latest = inputRef.current;
+        if (
+          active !== current ||
+          latest === null ||
+          current.generation !== generationRef.current
+        ) {
+          return;
+        }
+
+        const reconciled = reconcileEvidence(
+          current.evidence,
+          latest.pulls,
+          latest.authoritative,
+        );
+        if (!commit(current, reconciled, false)) return;
+        if (!reconciled.baseline.complete) {
+          commit(current, reconciled);
+          return;
+        }
+
+        const now = Date.now();
+        const work = activeAutoKeys(current, latest);
+        let slots = Math.max(0, latest.parallelism - work.size);
+        let retryAt: number | null = null;
+        let waiting = false;
+        const guarded = cloneEvidence(reconciled);
+        const launches: Array<{
+          incidents: AutoIncident[];
+          pull: PullReadiness;
+        }> = [];
+
+        for (const pull of pullOrder(latest.pulls)) {
+          const pending = reconciled.pending[pull.url] ?? [];
+          if (pending.length === 0) continue;
+          if (work.has(pull.url) || isPullBusy(latest, pull)) {
+            waiting = true;
+            continue;
+          }
+          const retry = reconciled.retry[pull.url];
+          if (retry && retry.notBefore > now) {
+            retryAt =
+              retryAt === null
+                ? retry.notBefore
+                : Math.min(retryAt, retry.notBefore);
+            waiting = true;
+            continue;
+          }
+          if (slots === 0) {
+            waiting = true;
+            continue;
+          }
+
+          const incidents = pending.slice(0, AUTO_TRIGGER_LIMIT);
+          const identities = incidents.map((incident) => incident.identity);
+          current.claims.add(pull.url);
+          work.add(pull.url);
+          slots -= 1;
+          guarded.retry[pull.url] = {
+            attempt: guarded.retry[pull.url]?.attempt ?? 0,
+            identities,
+            notBefore: now + START_GUARD_DELAY,
+          };
+          launches.push({ incidents, pull });
+        }
+
+        if (!commit(current, guarded, { paused: waiting })) {
+          for (const item of launches) current.claims.delete(item.pull.url);
+          return;
+        }
+        if (retryAt !== null) scheduleRetry(current, retryAt);
+        for (const item of launches) {
+          launch(current, latest, item.pull, item.incidents);
+        }
+      } while (rerunRef.current);
+    } finally {
+      if (processingRef.current === current.generation) {
+        processingRef.current = null;
+        if (rerunRef.current) processRef.current();
+      }
+    }
+  }, [commit, launch, scheduleRetry]);
+
+  processRef.current = process;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleVisibility = (): void => {
+      setVisible(document.visibilityState === "visible");
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => document.removeEventListener("visibilitychange", handleVisibility);
+  }, []);
+
+  useEffect(() => {
+    const handleStorage = (event: StorageEvent): void => {
+      if (event.storageArea !== null && event.storageArea !== window.localStorage) return;
+      if (event.key === AUTO_SETTINGS_STORAGE_KEY) {
+        setSettings(parseSettings(event.newValue));
+        return;
+      }
+      if (
+        normalizedViewer &&
+        settings.epoch &&
+        event.key === getAutoEvidenceStorageKey(normalizedViewer) &&
+        leaderRef.current === null
+      ) {
+        const evidence = parseEvidence(
+          event.newValue,
+          normalizedViewer,
+          settings.epoch,
+        );
+        setSummary(summarizeEvidence(evidence));
+      }
+    };
+    window.addEventListener("storage", handleStorage);
+    return () => window.removeEventListener("storage", handleStorage);
+  }, [normalizedViewer, settings.epoch]);
+
+  useEffect(() => {
+    if (
+      normalizedViewer === null ||
+      settings.epoch === null ||
+      leaderRef.current !== null
+    ) {
+      return;
+    }
+    setSummary(
+      summarizeEvidence(readEvidence(normalizedViewer, settings.epoch)),
+    );
+  }, [normalizedViewer, settings.epoch]);
+
+  useEffect(() => {
+    processRef.current();
+  }, [authoritative, pulls, runs.states, settings.parallelism, tasks]);
+
+  useEffect(() => {
+    if (
+      !available ||
+      !settings.enabled ||
+      settings.epoch === null ||
+      normalizedViewer === null ||
+      !visible
+    ) {
+      setLeader(false);
+      if (!settings.enabled) setSummary(EMPTY_SUMMARY);
+      return;
+    }
+
+    const generation = ++generationRef.current;
+    const controller = new AbortController();
+    let cancelled = false;
+    let release: (() => void) | null = null;
+
+    void navigator.locks
+      .request(
+        getAutoLockName(normalizedViewer),
+        { mode: "exclusive", signal: controller.signal },
+        async () => {
+          if (cancelled || controller.signal.aborted) return;
+          const acquired: Leader = {
+            claims: new Set(),
+            evidence: readEvidence(normalizedViewer, settings.epoch!),
+            generation,
+            retryAt: null,
+            retryTimer: null,
+          };
+          leaderRef.current = acquired;
+          setLeader(true);
+          setSummary(summarizeEvidence(acquired.evidence));
+          processRef.current();
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          if (acquired.retryTimer !== null) window.clearTimeout(acquired.retryTimer);
+          acquired.retryAt = null;
+          if (leaderRef.current === acquired) leaderRef.current = null;
+          if (mountedRef.current) setLeader(false);
+        },
+      )
+      .catch((error: unknown) => {
+        if (
+          !cancelled &&
+          !(error instanceof DOMException && error.name === "AbortError")
+        ) {
+          setSummary({
+            ...EMPTY_SUMMARY,
+            error:
+              error instanceof Error
+                ? `Auto lock failed: ${error.message}`
+                : "Auto lock failed.",
+            paused: true,
+          });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+      release?.();
+      const current = leaderRef.current;
+      if (current?.generation === generation) {
+        if (current.retryTimer !== null) window.clearTimeout(current.retryTimer);
+        current.retryAt = null;
+        leaderRef.current = null;
+      }
+      generationRef.current += 1;
+      if (processingRef.current === generation) processingRef.current = null;
+      rerunRef.current = false;
+      setLeader(false);
+    };
+  }, [available, normalizedViewer, settings.enabled, settings.epoch, visible]);
+
+  const setEnabled = useCallback((enabled: boolean): void => {
+    setSettings((current) => {
+      if (current.enabled === enabled) return current;
+      const next: AutoSettings = {
+        enabled,
+        epoch: enabled ? newEpoch() : current.epoch,
+        parallelism: current.parallelism,
+        version: SETTINGS_VERSION,
+      };
+      try {
+        window.localStorage.setItem(
+          AUTO_SETTINGS_STORAGE_KEY,
+          JSON.stringify(next),
+        );
+      } catch {
+        // The current page can still use the setting; the status reports evidence errors.
+      }
+      return next;
+    });
+  }, []);
+
+  const setParallelism = useCallback((parallelism: AutoParallelism): void => {
+    if (!isAutoParallelism(parallelism)) return;
+    setSettings((current) => {
+      if (current.parallelism === parallelism) return current;
+      const next: AutoSettings = { ...current, parallelism };
+      try {
+        window.localStorage.setItem(
+          AUTO_SETTINGS_STORAGE_KEY,
+          JSON.stringify(next),
+        );
+      } catch {
+        // The current page can still use the selected parallelism.
+      }
+      return next;
+    });
+  }, []);
+
+  const state = describe(
+    available,
+    settings.enabled,
+    visible,
+    leader,
+    summary,
+  );
+
+  return useMemo(
+    () => ({
+      available,
+      description: state.description,
+      enabled: settings.enabled,
+      error: summary.error,
+      leader,
+      parallelism: settings.parallelism,
+      paused: state.paused,
+      queued: summary.queued,
+      setEnabled,
+      setParallelism,
+      status: state.status,
+    }),
+    [
+      available,
+      leader,
+      setEnabled,
+      setParallelism,
+      settings.enabled,
+      settings.parallelism,
+      state.description,
+      state.paused,
+      state.status,
+      summary.error,
+      summary.queued,
+    ],
+  );
+}

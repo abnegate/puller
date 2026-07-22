@@ -1,14 +1,38 @@
 <!doctype html>
-<html class="dark" lang="en">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="dark" />
+    <meta name="color-scheme" content="light dark" />
     <meta
       name="description"
       content="A live readiness board for your open authored GitHub pull requests."
     />
-    <meta name="theme-color" content="#09090b" />
+    <meta name="theme-color" content="#ffffff" />
+    <script>
+      (() => {
+        const key = 'puller-theme';
+        let selected = 'system';
+        try {
+          const stored = localStorage.getItem(key);
+          if (stored === 'light' || stored === 'dark' || stored === 'system') selected = stored;
+        } catch {
+          // System preference remains the safe default when storage is unavailable.
+        }
+        const resolved =
+          selected === 'system'
+            ? typeof matchMedia === 'function' && matchMedia('(prefers-color-scheme: dark)').matches
+              ? 'dark'
+              : 'light'
+            : selected;
+        document.documentElement.classList.add(resolved);
+        document.documentElement.dataset.theme = resolved;
+        document.documentElement.style.colorScheme = resolved;
+        document
+          .querySelector('meta[name="theme-color"]')
+          ?.setAttribute('content', resolved === 'dark' ? '#18181b' : '#ffffff');
+      })();
+    </script>
     <title>Authored pull readiness</title>
   </head>
   <body>

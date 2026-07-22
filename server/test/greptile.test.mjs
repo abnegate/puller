@@ -13,6 +13,8 @@ function comment(overrides = {}) {
   return {
     author: GREPTILE_LOGIN,
     body: `Confidence Score: 5/5\nLast reviewed commit: ${SHA}`,
+    createdAt: '2026-07-17T00:00:00Z',
+    id: 'comment-1',
     updatedAt: '2026-07-17T00:00:00Z',
     url: 'https://github.com/example/repo/pull/1#issuecomment-1',
     ...overrides,
@@ -28,19 +30,30 @@ describe('Greptile summary parsing', () => {
       comment(),
     ])
 
-    expect(result).toMatchObject({ confidence: 5, reviewedSha: SHA })
+    expect(result).toMatchObject({
+      commentId: 'comment-1',
+      confidence: 5,
+      reviewedSha: SHA,
+      updatedAt: '2026-07-17T00:00:00Z',
+    })
   })
 
-  it('selects the latest updated summary', () => {
+  it('selects the latest created summary', () => {
     const result = selectGreptileSummary([
       comment({ body: `Confidence Score: 2/5\nLast reviewed commit: ${SHA}` }),
       comment({
         body: `Confidence Score: 4/5\nLast reviewed commit: ${SHA}`,
+        createdAt: '2026-07-17T01:00:00Z',
+        id: 'comment-2',
         updatedAt: '2026-07-17T01:00:00Z',
       }),
     ])
 
-    expect(result?.confidence).toBe(4)
+    expect(result).toMatchObject({
+      commentId: 'comment-2',
+      confidence: 4,
+      updatedAt: '2026-07-17T01:00:00Z',
+    })
   })
 
   it('never combines confidence and SHA from different comments', () => {
@@ -48,6 +61,7 @@ describe('Greptile summary parsing', () => {
       comment({ body: 'Confidence Score: 5/5' }),
       comment({
         body: `Last reviewed commit: ${SHA}`,
+        createdAt: '2026-07-17T01:00:00Z',
         updatedAt: '2026-07-17T01:00:00Z',
       }),
     ])
@@ -60,11 +74,28 @@ describe('Greptile summary parsing', () => {
       comment(),
       comment({
         body: 'Confidence Score: excellent/5\nLast reviewed commit: abc1234',
+        createdAt: '2026-07-17T01:00:00Z',
         updatedAt: '2026-07-17T01:00:00Z',
       }),
     ])
 
     expect(result).toMatchObject({ confidence: null, reviewedSha: null })
+  })
+
+  it('does not let an edit make an older historical summary active', () => {
+    const result = selectGreptileSummary([
+      comment({
+        body: `Confidence Score: 2/5\nLast reviewed commit: ${SHA}`,
+        updatedAt: '2026-07-17T02:00:00Z',
+      }),
+      comment({
+        body: `Confidence Score: 5/5\nLast reviewed commit: ${SHA}`,
+        createdAt: '2026-07-17T01:00:00Z',
+        updatedAt: '2026-07-17T01:00:00Z',
+      }),
+    ])
+
+    expect(result).toMatchObject({ confidence: 5, updatedAt: '2026-07-17T01:00:00Z' })
   })
 
   it('parses Markdown and HTML summary forms', () => {

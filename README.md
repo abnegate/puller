@@ -1,33 +1,26 @@
-# Authored pull request readiness
+# Puller
 
-A local React dashboard for the GitHub search:
+A local React dashboard for your open authored pull requests:
 
 ```text
 is:pr author:@me state:open archived:false sort:updated-desc
 ```
 
-It keeps the search order and divides the result into **Ready** and **Not ready**. A pull request is Ready only when every review thread is resolved, its current-head CI rollup is successful or no CI checks are reported, the latest Greptile summary has confidence `5/5`, and that same summary's full reviewed commit SHA matches the pull request head. Pending, failing, incomplete, or otherwise unknown CI state keeps a pull request Not ready.
+Puller keeps GitHub's result order and divides pull requests into **Ready**, **In progress**, and **Not ready**. It also shows authored pull requests grouped under the recent GitHub releases that contain them.
 
 ## Requirements
 
 - Node.js 22.12 or newer
-- pnpm 11.9.0 (the version pinned by `packageManager`)
-- [GitHub CLI](https://cli.github.com/) authenticated with access to every repository you want shown
-- Claude Code 2.1.212, authenticated locally
+- pnpm 11.9.0
+- [GitHub CLI](https://cli.github.com/) authenticated for the repositories you want to inspect
+- Claude Code authenticated locally if you want to use **Fix** or **Verify**
+- Local clones or worktrees for repositories where Claude will run
 
-Check authentication before starting:
+Check the command-line tools before starting:
 
 ```bash
 gh auth status
 claude --version
-claude auth status --text
-```
-
-If necessary, authenticate with:
-
-```bash
-gh auth login
-claude auth login
 ```
 
 ## Run locally
@@ -37,62 +30,86 @@ pnpm install
 pnpm dev
 ```
 
-Open <http://127.0.0.1:5173>. The development command runs one Node process containing both the API and Vite middleware.
+Open <http://127.0.0.1:5173>. The Node server hosts the API and Vite middleware on the same origin.
 
-To run the production build locally:
+For a production build served locally:
 
 ```bash
 pnpm build
 pnpm start
 ```
 
-`pnpm start` serves both `/api/pulls` and the built React application from the same origin. It reports an actionable error if `dist/` has not been built.
+The interface follows the system light or dark preference by default and lets you override it. The pull list refreshes silently every 10 seconds while the page is visible; the existing snapshot stays rendered during background requests, so rows can move between sections without a loading flash.
 
-## Fixing a pull request
+The header reports four stable counts: **Open** includes every current authored pull request (including hidden rows), **Ready** and **Blocked** use the full unfiltered pull set, and **Active** counts distinct local Task, Fix, and conflict-repair runs rather than CI-only work. Sections stay sticky while scrolling, paginate after 20 items, and briefly show an up/down marker when a trusted snapshot moves a pull toward or away from Ready. Favourite pulls sort first; hidden pulls remain counted and can be restored from the header.
 
-Each Not ready row has its own instructions field, **Fix** button, and live terminal. Fix performs a fresh, complete GitHub readiness check, including current-head CI, finds the matching local worktree, and starts one non-interactive Claude Code process there. Assistant text, tool starts, and diagnostics stream to the terminal as newline-delimited events. **Cancel**, closing the browser connection, or stopping the server terminates the spawned process group. Clicking a Ready row opens the Greptile review comment for the current head in a new tab.
+## Readiness and pull request actions
 
-The initial run for a pull request requires exactly one clean trusted worktree whose GitHub `origin` matches the pull repository and whose checked-out commit exactly matches the fresh remote head. Once selected, that worktree remains associated with the pull request for the lifetime of the server so follow-up runs can continue Claude's local edits. A changed remote pull-request head clears the association and requires another clean exact-head match.
+A pull request is **Ready** only when all of these are true for its current head commit:
 
-Only one Fix run may own a canonical worktree at a time, even when two different pull requests resolve through different path aliases to that same directory. The reservation lasts until the Claude process exits after completion, failure, cancellation, disconnect, or server shutdown.
+- every review thread is resolved and GitHub's thread/comment data is complete;
+- Greptile reports confidence `5/5`, links its review comment, and names the exact current head SHA;
+- every CI check is complete and passing, neutral, or skipped, or GitHub reports no checks.
 
-By default, worktrees are discovered read-only under `~/Local` and `~/.codex/worktrees`; normal `.git` directories and `.git`-file worktrees are supported. Override the trusted roots with the platform-delimited `ACTION_WORKSPACE_ROOTS` variable (`:` on macOS/Linux and `;` on Windows):
+Pending CI or an active local Claude Fix run appears under **In progress**. Its row shows passed checks out of the total. Failed, incomplete, stale, or otherwise blocked pull requests appear under **Not ready**; expand a row to inspect failed checks, unresolved review comments, and the Greptile summary.
+
+Ready rows can expand a lazily loaded, head-pinned unified diff with horizontally scrollable filenames on the left and content changes on the right. Marking a file viewed collapses its changes and updates the viewed-file count; those marks stay local while the page remains open, are keyed to the exact pull request head, and never change GitHub. GitHub is revalidated before the diff is returned, so a changed or closed pull request is rejected instead of showing mismatched content. Clicking the row's review link opens the current Greptile review in a new tab.
+
+Click a diff line to give Claude one-shot fix instructions, or shift-click a second line on the same side and hunk to select a range. The server pins the selection to the displayed base and head commits, reauthorizes the authored pull request, and proves the exact local branch before Claude applies the change, validates it, creates a descendant commit, and normal-pushes it to the existing pull request branch. Puller reports completion only after local and GitHub post-push verification; if that proof fails, it warns that the push may have succeeded and requires a refresh before retrying.
+
+**Merge** always asks for confirmation. The server then performs a fresh, complete GitHub check of authorship, open state, exact head SHA, review state, Greptile confidence, and CI before invoking an admin merge commit with a head-match guard. A stale browser row cannot authorize a merge. Puller never merges automatically; GitHub changes only after you press and confirm **Merge**.
+
+## Fix with Claude Code
+
+Each non-ready row has Fix instructions and streamed terminal output. Starting a Fix moves the row to **In progress** while preserving its prompt and output across background refreshes. Cancel, browser disconnect, or server shutdown terminates the spawned process group.
+
+**Auto** watches the canonical open-pull snapshot for new or edited issue comments, new unresolved review comments, new CI failure sequences, and a current-head Greptile review below `5/5`. Enabling it first records a baseline, so existing blockers are not dispatched as new work. Later matching evidence starts a context-rich Auto fix and moves that pull request to **In progress**; hidden pull requests remain watched.
+
+Auto settings and observed evidence persist in local browser storage. Exactly one visible tab becomes the dispatcher through the browser's Web Locks API; other tabs remain in standby, and a hidden leader releases the lock. Auto runs one fix at a time, waits while a manual fix, conflict repair, or matching New Task is active, and retries temporary start failures with bounded backoff. It pauses when the page is hidden or evidence is not complete and current, and it is unavailable in browsers without Web Locks. Turning Auto off and on creates a fresh baseline.
+
+Before Claude starts, the server refreshes GitHub and selects exactly one clean trusted worktree whose GitHub origin and checked-out commit match the pull request. By default it searches `~/Local` and `~/.codex/worktrees`. Override those roots with the platform-delimited `ACTION_WORKSPACE_ROOTS` value:
 
 ```bash
 ACTION_WORKSPACE_ROOTS="/path/to/repos:/path/to/worktrees" pnpm dev
 ```
 
-The Fix action uses the command-line surface verified with Claude Code 2.1.212: one shell-free `claude --print` process with streaming JSON, `--permission-mode auto`, and no session persistence. Auto mode classifies routine and potentially destructive tool calls for unattended execution without bypassing Claude Code's permission system. The server supplies the verified pull URL, head, and blockers; browser input cannot select a filesystem path or alter command arguments. The prompt forbids fetching, checkout/reset, creating worktrees, pushing, merging, and opening pull requests. A Fix run can consume Claude usage and can edit the selected worktree, so review its terminal output and local changes.
+Fix can edit the selected worktree and consume Claude usage. Claude starts in safe mode with user, project, and local settings disabled, an empty strict MCP configuration, and hooks, plugins, skills, custom commands, and browser integration unavailable. Worktree-scoped file tools and a fixed allowlist of local test commands are approved; other write-capable shell commands are denied non-interactively. Every Git command—including fetch, pull, push, merge, rebase, checkout, switch, reset, clean, and worktree operations—plus GitHub CLI, publishing, and network commands has an explicit deny rule. Bash and its child processes run in a fail-closed sandbox that blocks outbound network access, Unix sockets, `.git` writes, and unsandboxed retries while allowing worktree edits and writes to one run-specific temporary directory. The child receives only a narrow runtime environment; tokens, API keys, arbitrary server variables, and `SSH_AUTH_SOCK` are not inherited and are also denied inside sandboxed commands. Puller therefore uses Claude Code's normal local/keychain authentication rather than forwarding environment-based credentials. Inspect its streamed output and local changes afterward.
 
-## Tests
+## New tasks
 
-```bash
-pnpm test
-pnpm build
-```
+The compact **New task** row searches the same favourite-aware repository catalog and lets you choose a remote base branch. Puller creates an isolated worktree and opens a pull request at the beginning of the task so the row is linked immediately, then starts one-shot Claude Code with `--dangerously-skip-permissions` and streams its terminal output under **In progress**. This is intentionally powerful local execution; use it only with repositories and prompts you trust.
 
-## Refresh and cache behavior
+## Releases and verification
 
-`GET /api/pulls` loads a snapshot and caches it for five minutes. `GET /api/pulls?refresh=1` bypasses freshness for a manual refresh. Concurrent requests share one in-flight GitHub query. If a refresh fails after a successful load, the API retains the last-good snapshot, marks it `stale`, and adds a warning without changing its original timestamp.
+**Release** opens a repository selector and suggests the next stable patch tag from that repository's GitHub tags, preserving the existing `v` prefix. The viewer-scoped repository catalog is discovered once after GitHub authentication succeeds and cached for the server session; later dialog opens refresh only tag recommendations. The dialog shows separate repository-catalog and tag-check timestamps, keeps the current selection visible during background refreshes, and preserves it when the cached repository still exists. After confirmation, the server rechecks the repository allowlist, latest tag, proposed next patch, and tag nonexistence before running GitHub's generated-release-notes flow. It also asks GitHub to fail when there are no commits. Puller never creates a release until you submit and confirm the dialog.
 
-The GraphQL service paginates the outer search and only continues nested review-thread or issue-comment connections that GitHub truncated. GitHub caps search results at 1,000; a capped response is marked `partial` and includes a visible warning.
+Repository discovery for the release selector and release-action authorization includes repositories found in your open authored pull requests and in authored pull requests merged during the last 90 days. **Recently released** displays only releases published during the last week and groups them by the viewer's local calendar date. Displayed membership intersects authored merges with canonical pull request links in GitHub's release notes. **Verify** then rechecks exact membership against the adjacent release tags before Claude runs. Incomplete evidence is surfaced instead of being treated as verified membership.
+
+**Verify** starts a separate Claude run for one released pull request. The server first revalidates the exact release, pull number, pull URL, merged head SHA, and release commit, then creates an immutable archive snapshot from that exact commit already present in a trusted local clone. Snapshot creation disables hooks, filters, replacement objects, and user/system Git configuration; it performs no checkout, worktree creation, or fetch. Claude runs in safe mode with only `Read`, `Glob`, and `Grep`; it cannot edit files, run shell commands, use network tools, or claim tests were executed. Its response streams into the row and can be cancelled. Fix and Verify share a global limit of two Claude runs.
+
+Successful verification stores only validated, reusable repository recipes (for example known files, searches, manifests, and tools), never output or source contents. Memory defaults to `~/.puller/verification-memory`; set an absolute `PULLER_VERIFICATION_MEMORY_ROOT` to relocate it. Future verifications receive these bounded hints and revalidate every referenced path against the immutable snapshot before use.
 
 ## Network and security
 
-The server binds to `127.0.0.1` by default. A non-loopback address is rejected unless external access is explicitly enabled:
+The server binds to `127.0.0.1` by default. Binding elsewhere requires an explicit opt-in:
 
 ```bash
 HOST=0.0.0.0 ALLOW_EXTERNAL=1 pnpm start
 ```
 
-Fix execution remains disabled on a non-loopback binding unless it receives a second explicit opt-in. Use a concrete hostname or address that matches the browser origin:
+All mutations and Claude execution remain disabled on a non-loopback binding unless you add a second opt-in:
 
 ```bash
 HOST=workstation.example.test ALLOW_EXTERNAL=1 ALLOW_EXTERNAL_EXECUTION=1 pnpm start
 ```
 
-External execution grants anyone who can load that exact origin the ability to start local edits, so keep the default loopback binding unless that access is intentional and otherwise protected.
+External execution lets anyone who can load that exact origin request local edits or GitHub mutations, so keep the loopback default unless the network and origin are intentionally protected.
 
-The browser cannot supply the search query, GitHub CLI arguments, executable name, command-line options, or workspace path. Action requests require the exact configured Host and Origin plus an unguessable per-process token obtained from that same origin. The server invokes both `gh` and Claude Code without a shell, limits concurrent runs and streamed output, emits no CORS headers, and marks API responses `Cache-Control: no-store`. Every response also carries `Content-Security-Policy: frame-ancestors 'none'` and `X-Frame-Options: DENY`.
+Mutation requests require the exact configured Host and Origin plus an unguessable per-process action token obtained from that same trusted origin. The browser cannot choose executable names, CLI arguments, search queries, or filesystem paths. The server invokes `gh` and Claude without a shell, validates canonical repository identities, bounds request and stream sizes, emits no CORS headers, and applies no-store, anti-sniffing, and anti-framing headers. Stream output is redacted for recognizable local paths and token formats as defense in depth.
 
-Assistant text is held behind a bounded 512-character carry before streaming so the server can redact the selected workspace path and recognizable token-like secrets even when Claude splits them across adjacent deltas. A terminal event flushes the safe remainder; tool and diagnostic events are otherwise streamed immediately. Redaction is defense in depth rather than a guarantee for arbitrary unknown secret formats, so avoid asking Claude to print credentials.
+## Verification
+
+```bash
+pnpm test
+pnpm build
+```

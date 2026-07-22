@@ -36,7 +36,7 @@ export function parseReviewedSha(body) {
 }
 
 function timestamp(comment) {
-  const value = Date.parse(comment.updatedAt ?? '')
+  const value = Date.parse(comment.createdAt ?? '')
   return Number.isNaN(value) ? Number.NEGATIVE_INFINITY : value
 }
 
@@ -57,6 +57,8 @@ export function selectGreptileSummary(comments) {
   )
 
   return {
+    commentId: latest.id ?? null,
+    createdAt: latest.createdAt ?? null,
     confidence: parseConfidence(latest.body),
     reviewedSha: parseReviewedSha(latest.body),
     commentUrl: latest.url ?? null,
