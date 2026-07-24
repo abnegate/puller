@@ -1,15 +1,15 @@
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { isAgent } from "./agent";
 import type { AutoParallelism, AutoTrigger } from "./fixes";
-import { isRunActive, type PullRuns, type RunStartOutcome } from "./runs";
+import {
+  groupPulls,
+  isRunActive,
+  type PullRuns,
+  type RunStartOutcome,
+} from "./runs";
 import { isTaskActive, type TaskState } from "./tasks";
-import type { CICheck, PullReadiness } from "./types";
+import type { Agent, CICheck, PullReadiness } from "./types";
 
 export const AUTO_SETTINGS_STORAGE_KEY = "puller-auto-settings";
 export const AUTO_EVIDENCE_STORAGE_PREFIX = "puller-auto-evidence:";
@@ -17,7 +17,8 @@ export const AUTO_LOCK_PREFIX = "puller:auto-dispatcher:";
 
 const SETTINGS_VERSION = 2;
 const LEGACY_SETTINGS_VERSION = 1;
-const EVIDENCE_VERSION = 1;
+const EVIDENCE_VERSION = 3;
+const LEGACY_EVIDENCE_VERSIONS = new Set([1, 2]);
 const RETRY_BASE_DELAY = 1_000;
 const RETRY_MAX_DELAY = 16_000;
 const RETRY_MAX_EXPONENT = Math.ceil(
@@ -39,6 +40,8 @@ type CheckObservation = {
   failureSequence: number;
 };
 
+type PullPhase = "blocked" | "progress" | "ready";
+
 type PullObservation = {
   baseline: {
     checks: boolean;
@@ -51,15 +54,18 @@ type PullObservation = {
   headRefOid: string;
   issues: Record<string, string>;
   origin: "baseline" | "new";
+  phase: PullPhase | null;
   reviews: Record<string, string>;
 };
 
 type AutoIncident = {
+  agent: Agent;
   identity: string;
   trigger: AutoTrigger;
 };
 
 type RetryObservation = {
+  agent: Agent;
   attempt: number;
   identities: string[];
   notBefore: number;
@@ -105,6 +111,7 @@ export type AutoController = {
 };
 
 export type AutoInput = {
+  agent: Agent;
   authoritative: boolean;
   pulls: readonly PullReadiness[];
   runs: Pick<PullRuns, "start" | "states">;
@@ -169,6 +176,9 @@ const isCheckRecord = (
 
 const isAutoParallelism = (value: unknown): value is AutoParallelism =>
   value === 1 || value === 2 || value === 3 || value === 4;
+
+const isPullPhase = (value: unknown): value is PullPhase =>
+  value === "blocked" || value === "progress" || value === "ready";
 
 const validEnabledEpoch = (
   enabled: unknown,
@@ -300,9 +310,15 @@ const parseEvidence = (
   if (value === null) return newEvidence(viewer, epoch);
   try {
     const parsed: unknown = JSON.parse(value);
+    const version =
+      isRecord(parsed) && typeof parsed.version === "number"
+        ? parsed.version
+        : null;
+    const legacy = version !== null && LEGACY_EVIDENCE_VERSIONS.has(version);
+    const legacyAgent = version === 1;
     if (
       !isRecord(parsed) ||
-      parsed.version !== EVIDENCE_VERSION ||
+      (version !== EVIDENCE_VERSION && !legacy) ||
       parsed.viewer !== viewer ||
       parsed.epoch !== epoch ||
       typeof parsed.updatedAt !== "string" ||
@@ -331,7 +347,8 @@ const parseEvidence = (
         isCheckRecord(item.checks) &&
         isStringRecord(item.issues) &&
         isStringRecord(item.reviews) &&
-        (item.greptile === null || typeof item.greptile === "string"),
+        (item.greptile === null || typeof item.greptile === "string") &&
+        (legacy || item.phase === null || isPullPhase(item.phase)),
     );
     const pending = Object.values(parsed.pending).every(
       (items) =>
@@ -339,18 +356,19 @@ const parseEvidence = (
         items.every(
           (item) =>
             isRecord(item) &&
+            (legacyAgent ? item.agent === undefined : isAgent(item.agent)) &&
             typeof item.identity === "string" &&
             isAutoTrigger(item.trigger),
         ),
     );
     const attempted = Object.values(parsed.attempted).every(
       (items) =>
-        Array.isArray(items) &&
-        items.every((item) => typeof item === "string"),
+        Array.isArray(items) && items.every((item) => typeof item === "string"),
     );
     const retry = Object.values(parsed.retry).every(
       (item) =>
         isRecord(item) &&
+        (legacyAgent ? item.agent === undefined : isAgent(item.agent)) &&
         typeof item.attempt === "number" &&
         Number.isSafeInteger(item.attempt) &&
         item.attempt >= 0 &&
@@ -360,21 +378,133 @@ const parseEvidence = (
         Number.isFinite(item.notBefore),
     );
 
-    return observed && pending && attempted && retry
-      ? (parsed as AutoEvidence)
-      : newEvidence(viewer, epoch);
+    if (!observed || !pending || !attempted || !retry) {
+      return newEvidence(viewer, epoch);
+    }
+    if (!legacy) return parsed as AutoEvidence;
+
+    return {
+      ...(parsed as Omit<
+        AutoEvidence,
+        "observed" | "pending" | "retry" | "version"
+      >),
+      observed: Object.fromEntries(
+        Object.entries(parsed.observed).map(([key, item]) => [
+          key,
+          {
+            ...(item as Omit<PullObservation, "phase">),
+            phase: null,
+          },
+        ]),
+      ),
+      pending: Object.fromEntries(
+        Object.entries(parsed.pending).map(([key, items]) => [
+          key,
+          (items as Array<AutoIncident | Omit<AutoIncident, "agent">>).map(
+            (item) => ({
+              ...item,
+              agent:
+                "agent" in item && isAgent(item.agent)
+                  ? item.agent
+                  : ("claude" as const),
+            }),
+          ),
+        ]),
+      ),
+      retry: Object.fromEntries(
+        Object.entries(parsed.retry).map(([key, item]) => {
+          const retry = item as
+            | RetryObservation
+            | Omit<RetryObservation, "agent">;
+          return [
+            key,
+            {
+              ...retry,
+              agent:
+                "agent" in retry && isAgent(retry.agent)
+                  ? retry.agent
+                  : ("claude" as const),
+            },
+          ];
+        }),
+      ),
+      version: EVIDENCE_VERSION,
+    };
   } catch {
     return newEvidence(viewer, epoch);
   }
 };
 
-const readEvidence = (viewer: string, epoch: string): AutoEvidence => {
-  try {
-    return parseEvidence(
-      window.localStorage.getItem(getAutoEvidenceStorageKey(viewer)),
-      viewer,
-      epoch,
+const seedActiveAutoEvidence = (
+  evidence: AutoEvidence,
+  previous: AutoEvidence,
+  input: EngineInput,
+): AutoEvidence => {
+  const next = structuredClone(evidence);
+  for (const [key, state] of input.runs.states) {
+    if (state.source !== "auto" || !isRunActive(state)) continue;
+    const observed = previous.observed[key];
+    if (!observed) continue;
+
+    next.observed[key] = {
+      ...structuredClone(observed),
+      phase: "progress",
+    };
+    const attempted = new Set(previous.attempted[key] ?? []);
+    for (const identity of previous.retry[key]?.identities ?? []) {
+      attempted.add(identity);
+    }
+    next.attempted[key] = [...attempted].sort();
+    const pending = (previous.pending[key] ?? []).filter(
+      (incident) => !attempted.has(incident.identity),
     );
+    if (pending.length > 0) {
+      next.pending[key] = structuredClone(pending);
+    }
+  }
+  return next;
+};
+
+const readEvidence = (
+  viewer: string,
+  epoch: string,
+  input?: EngineInput,
+): AutoEvidence => {
+  try {
+    const key = getAutoEvidenceStorageKey(viewer);
+    const raw = window.localStorage.getItem(key);
+    if (raw === null) return newEvidence(viewer, epoch);
+
+    let stored: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (!isRecord(parsed)) return newEvidence(viewer, epoch);
+      stored = parsed;
+    } catch {
+      return newEvidence(viewer, epoch);
+    }
+
+    const storedEpoch = typeof stored.epoch === "string" ? stored.epoch : null;
+    const previous =
+      storedEpoch === null ? null : parseEvidence(raw, viewer, storedEpoch);
+    let evidence =
+      storedEpoch === epoch && previous !== null
+        ? previous
+        : newEvidence(viewer, epoch);
+    if (storedEpoch !== epoch && previous !== null && input) {
+      evidence = seedActiveAutoEvidence(evidence, previous, input);
+    }
+
+    if (raw !== null) {
+      if (
+        storedEpoch === epoch &&
+        typeof stored.version === "number" &&
+        LEGACY_EVIDENCE_VERSIONS.has(stored.version)
+      ) {
+        window.localStorage.setItem(key, JSON.stringify(evidence));
+      }
+    }
+    return evidence;
   } catch {
     return newEvidence(viewer, epoch);
   }
@@ -396,9 +526,11 @@ const identity = (parts: readonly (number | string | null)[]): string =>
   JSON.stringify(parts);
 
 const issueIncident = (
+  agent: Agent,
   id: string,
   updatedAt: string,
 ): AutoIncident => ({
+  agent,
   identity: identity(["issue", id, updatedAt]),
   trigger: { id, kind: "issue_comment", updatedAt },
 });
@@ -408,15 +540,20 @@ const isGreptileComment = (
 ): boolean => comment.author?.toLowerCase() === GREPTILE_LOGIN;
 
 const reviewIncident = (
+  agent: Agent,
   threadId: string,
   id: string,
   updatedAt: string,
 ): AutoIncident => ({
+  agent,
   identity: identity(["review", threadId, id, updatedAt]),
   trigger: { id, kind: "review_comment", threadId, updatedAt },
 });
 
-const greptileIncident = (pull: PullReadiness): AutoIncident | null => {
+const greptileIncident = (
+  agent: Agent,
+  pull: PullReadiness,
+): AutoIncident | null => {
   const { greptile } = pull;
   if (
     !pull.checks.commentsComplete ||
@@ -431,6 +568,7 @@ const greptileIncident = (pull: PullReadiness): AutoIncident | null => {
     return null;
   }
   return {
+    agent,
     identity: identity([
       "greptile",
       greptile.commentId,
@@ -449,11 +587,7 @@ const greptileIncident = (pull: PullReadiness): AutoIncident | null => {
 };
 
 const checkLineage = (headRefOid: string, check: CICheck): string =>
-  identity([
-    headRefOid.toLowerCase(),
-    check.id,
-    check.detailsUrl,
-  ]);
+  identity([headRefOid.toLowerCase(), check.id, check.detailsUrl]);
 
 const replacePending = (
   pending: readonly AutoIncident[],
@@ -462,13 +596,21 @@ const replacePending = (
   attempted: ReadonlySet<string>,
 ): AutoIncident[] => [
   ...pending.filter((incident) => incident.trigger.kind !== kind),
-  ...current.filter((incident) => !attempted.has(incident.identity)),
+  ...current
+    .filter((incident) => !attempted.has(incident.identity))
+    .map(
+      (incident) =>
+        pending.find((item) => item.identity === incident.identity) ?? incident,
+    ),
 ];
 
 const observePull = (
   evidence: AutoEvidence,
   pull: PullReadiness,
   baseline: boolean,
+  agent: Agent,
+  phaseBaseline = false,
+  admit = true,
 ): void => {
   const key = pull.url;
   const previous = evidence.observed[key];
@@ -484,18 +626,24 @@ const observePull = (
     headRefOid: pull.headRefOid,
     issues: {},
     origin: baseline ? "baseline" : "new",
+    phase: null,
     reviews: {},
   };
   const attempted = new Set(evidence.attempted[key] ?? []);
   let pending = evidence.pending[key] ?? [];
+  const alreadyPending = new Set(pending.map((incident) => incident.identity));
   const baselining = (dimension: keyof PullObservation["baseline"]): boolean =>
     observed.origin === "baseline" && !observed.baseline[dimension];
   const finish = (
     dimension: keyof PullObservation["baseline"],
     incidents: readonly AutoIncident[],
   ): void => {
-    if (baselining(dimension)) {
-      for (const incident of incidents) attempted.add(incident.identity);
+    if (baselining(dimension) || phaseBaseline) {
+      for (const incident of incidents) {
+        if (!alreadyPending.has(incident.identity)) {
+          attempted.add(incident.identity);
+        }
+      }
     }
     observed.baseline[dimension] = true;
   };
@@ -503,22 +651,27 @@ const observePull = (
   if (pull.checks.commentsComplete) {
     const issues = pull.issueComments
       .filter((comment) => !isGreptileComment(comment))
-      .map((comment) => issueIncident(comment.id, comment.updatedAt));
+      .map((comment) => issueIncident(agent, comment.id, comment.updatedAt));
     finish("comments", issues);
-    pending = replacePending(pending, "issue_comment", issues, attempted);
+    pending = replacePending(
+      pending,
+      "issue_comment",
+      admit ? issues : [],
+      attempted,
+    );
     observed.issues = Object.fromEntries(
       pull.issueComments
         .filter((comment) => !isGreptileComment(comment))
         .map((comment) => [comment.id, comment.updatedAt]),
     );
 
-    const greptile = greptileIncident(pull);
+    const greptile = greptileIncident(agent, pull);
     const greptileIncidents = greptile === null ? [] : [greptile];
     finish("greptile", greptileIncidents);
     pending = replacePending(
       pending,
       "greptile",
-      greptileIncidents,
+      admit ? greptileIncidents : [],
       attempted,
     );
     observed.greptile = greptile?.identity ?? null;
@@ -529,11 +682,16 @@ const observePull = (
       thread.comments
         .filter((comment) => !isGreptileComment(comment))
         .map((comment) =>
-          reviewIncident(thread.id, comment.id, comment.updatedAt),
+          reviewIncident(agent, thread.id, comment.id, comment.updatedAt),
         ),
     );
     finish("threads", reviews);
-    pending = replacePending(pending, "review_comment", reviews, attempted);
+    pending = replacePending(
+      pending,
+      "review_comment",
+      admit ? reviews : [],
+      attempted,
+    );
     observed.reviews = Object.fromEntries(
       (pull.unresolvedThreads ?? []).flatMap((thread) =>
         thread.comments
@@ -565,6 +723,7 @@ const observePull = (
       checks[lineage] = { failed, failureSequence };
       if (failed) {
         failures.push({
+          agent,
           identity: identity(["check", lineage, failureSequence]),
           trigger: {
             detailsUrl: check.detailsUrl,
@@ -581,7 +740,12 @@ const observePull = (
       }
     }
     finish("checks", failures);
-    pending = replacePending(pending, "failed_check", failures, attempted);
+    pending = replacePending(
+      pending,
+      "failed_check",
+      admit ? failures : [],
+      attempted,
+    );
     observed.checks = checks;
   }
 
@@ -596,46 +760,119 @@ const observePull = (
   }
 
   const retry = evidence.retry[key];
+  const pendingByIdentity = new Map(
+    (evidence.pending[key] ?? []).map((incident) => [
+      incident.identity,
+      incident,
+    ]),
+  );
   if (
     retry &&
-    retry.identities.join("\n") !==
-      (evidence.pending[key] ?? [])
-        .slice(0, AUTO_TRIGGER_LIMIT)
-        .map((incident) => incident.identity)
-        .join("\n")
+    retry.identities.some(
+      (item) => pendingByIdentity.get(item)?.agent !== retry.agent,
+    )
   ) {
     delete evidence.retry[key];
   }
 };
 
+const evidenceComplete = (pull: PullReadiness): boolean =>
+  pull.ci.complete === true &&
+  pull.checks.commentsComplete &&
+  pull.checks.threadsComplete;
+
+const phaseOf = (input: EngineInput, pull: PullReadiness): PullPhase => {
+  if (input.tasks.some((state) => sameTaskPull(state, pull))) {
+    return "progress";
+  }
+
+  const groups = groupPulls([pull], input.runs.states);
+  if (groups.progress.length > 0) return "progress";
+  if (groups.ready.length > 0) return "ready";
+  return "blocked";
+};
+
+const progressObservation = (
+  pull: PullReadiness,
+  origin: PullObservation["origin"],
+): PullObservation => ({
+  baseline: {
+    checks: false,
+    comments: false,
+    greptile: false,
+    threads: false,
+  },
+  checks: {},
+  greptile: null,
+  headRefOid: pull.headRefOid,
+  issues: {},
+  origin,
+  phase: "progress",
+  reviews: {},
+});
+
 const reconcileEvidence = (
   evidence: AutoEvidence,
-  pulls: readonly PullReadiness[],
-  authoritative: boolean,
+  input: EngineInput,
 ): AutoEvidence => {
-  if (!evidence.baseline.complete && !authoritative) return evidence;
+  if (!input.authoritative) return evidence;
   const next = cloneEvidence(evidence);
   const initial = !next.baseline.complete;
   if (initial) {
     next.baseline.complete = true;
-    next.baseline.pulls = pulls.map((pull) => pull.url).sort();
+    next.baseline.pulls = input.pulls.map((pull) => pull.url).sort();
   }
 
-  for (const pull of pulls) {
-    observePull(next, pull, initial);
-  }
+  for (const pull of input.pulls) {
+    const phase = phaseOf(input, pull);
+    const observed = next.observed[pull.url];
 
-  if (authoritative) {
-    const present = new Set(pulls.map((pull) => pull.url));
-    for (const key of Object.keys(next.observed)) {
-      if (present.has(key)) continue;
-      delete next.observed[key];
-      delete next.pending[key];
-      delete next.attempted[key];
-      delete next.retry[key];
+    if (phase === "progress") {
+      if (observed) {
+        if (observed.phase === null) continue;
+        observed.phase = phase;
+      } else {
+        next.observed[pull.url] = progressObservation(pull, "new");
+      }
+      continue;
     }
-    next.baseline.pulls = next.baseline.pulls.filter((key) => present.has(key));
+
+    if (!evidenceComplete(pull)) {
+      continue;
+    }
+
+    if (!observed) {
+      observePull(
+        next,
+        pull,
+        initial,
+        input.agent,
+        initial,
+        phase === "blocked",
+      );
+      next.observed[pull.url]!.phase = phase;
+      continue;
+    }
+
+    if (observed.phase === null) {
+      observePull(next, pull, initial, input.agent, true, phase === "blocked");
+      next.observed[pull.url]!.phase = phase;
+      continue;
+    }
+
+    observePull(next, pull, initial, input.agent, false, phase === "blocked");
+    next.observed[pull.url]!.phase = phase;
   }
+
+  const present = new Set(input.pulls.map((pull) => pull.url));
+  for (const key of Object.keys(next.observed)) {
+    if (present.has(key)) continue;
+    delete next.observed[key];
+    delete next.pending[key];
+    delete next.attempted[key];
+    delete next.retry[key];
+  }
+  next.baseline.pulls = next.baseline.pulls.filter((key) => present.has(key));
   return next;
 };
 
@@ -643,13 +880,32 @@ const retryDelay = (attempt: number): number =>
   RETRY_BASE_DELAY *
   2 ** Math.min(Math.max(0, attempt - 1), RETRY_MAX_EXPONENT);
 
-const pullOrder = (
-  pulls: readonly PullReadiness[],
-): readonly PullReadiness[] =>
+const pullOrder = (pulls: readonly PullReadiness[]): readonly PullReadiness[] =>
   [...pulls].sort(
     (left, right) =>
       left.rank - right.rank || left.url.localeCompare(right.url),
   );
+
+const dispatchIncidents = (
+  pending: readonly AutoIncident[],
+  retry?: RetryObservation,
+): AutoIncident[] => {
+  if (retry) {
+    const byIdentity = new Map(
+      pending.map((incident) => [incident.identity, incident]),
+    );
+    const retried = retry.identities.flatMap((item) => {
+      const incident = byIdentity.get(item);
+      return incident?.agent === retry.agent ? [incident] : [];
+    });
+    if (retried.length === retry.identities.length) return retried;
+  }
+  const agent = pending[0]?.agent;
+  if (agent === undefined) return [];
+  return pending
+    .filter((incident) => incident.agent === agent)
+    .slice(0, AUTO_TRIGGER_LIMIT);
+};
 
 const sameTaskPull = (state: TaskState, pull: PullReadiness): boolean =>
   isTaskActive(state.task) &&
@@ -706,7 +962,8 @@ const describe = (
 ): { description: string; paused: boolean; status: AutoStatus } => {
   if (!available) {
     return {
-      description: "Auto is unavailable because this browser does not support Web Locks.",
+      description:
+        "Auto is unavailable because this browser does not support Web Locks.",
       paused: true,
       status: "unavailable",
     };
@@ -729,7 +986,11 @@ const describe = (
     };
   }
   if (summary.error) {
-    return { description: summary.error, paused: summary.paused, status: "error" };
+    return {
+      description: summary.error,
+      paused: summary.paused,
+      status: "error",
+    };
   }
   if (summary.active > 0) {
     return {
@@ -776,6 +1037,7 @@ const webLocksAvailable = (): boolean =>
   typeof navigator.locks.request === "function";
 
 export function useAuto({
+  agent,
   authoritative,
   pulls,
   runs,
@@ -784,7 +1046,8 @@ export function useAuto({
 }: AutoInput): AutoController {
   const [settings, setSettings] = useState<AutoSettings>(readSettings);
   const [visible, setVisible] = useState(
-    () => typeof document === "undefined" || document.visibilityState === "visible",
+    () =>
+      typeof document === "undefined" || document.visibilityState === "visible",
   );
   const [leader, setLeader] = useState(false);
   const [summary, setSummary] = useState<EngineSummary>(EMPTY_SUMMARY);
@@ -801,6 +1064,7 @@ export function useAuto({
   inputRef.current =
     normalizedViewer && settings.epoch
       ? {
+          agent,
           authoritative,
           epoch: settings.epoch,
           parallelism: settings.parallelism,
@@ -831,7 +1095,8 @@ export function useAuto({
       change: Partial<EngineSummary> | false = {},
     ): boolean => {
       if (leaderRef.current !== current) return false;
-      const changed = evidenceContent(current.evidence) !== evidenceContent(next);
+      const changed =
+        evidenceContent(current.evidence) !== evidenceContent(next);
       if (changed) {
         next.updatedAt = new Date().toISOString();
         current.evidence = next;
@@ -873,16 +1138,22 @@ export function useAuto({
     [publish],
   );
 
-  const scheduleRetry = useCallback((current: Leader, notBefore: number): void => {
-    if (current.retryAt !== null && current.retryAt <= notBefore) return;
-    if (current.retryTimer !== null) window.clearTimeout(current.retryTimer);
-    current.retryAt = notBefore;
-    current.retryTimer = window.setTimeout(() => {
-      current.retryAt = null;
-      current.retryTimer = null;
-      processRef.current();
-    }, Math.max(0, notBefore - Date.now()));
-  }, []);
+  const scheduleRetry = useCallback(
+    (current: Leader, notBefore: number): void => {
+      if (current.retryAt !== null && current.retryAt <= notBefore) return;
+      if (current.retryTimer !== null) window.clearTimeout(current.retryTimer);
+      current.retryAt = notBefore;
+      current.retryTimer = window.setTimeout(
+        () => {
+          current.retryAt = null;
+          current.retryTimer = null;
+          processRef.current();
+        },
+        Math.max(0, notBefore - Date.now()),
+      );
+    },
+    [],
+  );
 
   const launch = useCallback(
     (
@@ -898,6 +1169,7 @@ export function useAuto({
         let outcome: RunStartOutcome;
         try {
           outcome = await input.runs.start(pull, {
+            agent: incidents[0]!.agent,
             message: "",
             parallelism: input.parallelism,
             source: "auto",
@@ -957,7 +1229,12 @@ export function useAuto({
             RETRY_MAX_EXPONENT + 1,
           );
           const notBefore = Date.now() + retryDelay(attempt);
-          next.retry[key] = { attempt, identities, notBefore };
+          next.retry[key] = {
+            agent: incidents[0]!.agent,
+            attempt,
+            identities,
+            notBefore,
+          };
           if (commit(current, next, { error: null, paused: true })) {
             scheduleRetry(current, notBefore);
             processRef.current();
@@ -995,7 +1272,8 @@ export function useAuto({
   const process = useCallback((): void => {
     const current = leaderRef.current;
     const input = inputRef.current;
-    if (!current || !input || current.generation !== generationRef.current) return;
+    if (!current || !input || current.generation !== generationRef.current)
+      return;
     if (processingRef.current === current.generation) {
       rerunRef.current = true;
       return;
@@ -1014,11 +1292,12 @@ export function useAuto({
           return;
         }
 
-        const reconciled = reconcileEvidence(
-          current.evidence,
-          latest.pulls,
-          latest.authoritative,
-        );
+        if (!latest.authoritative) {
+          commit(current, current.evidence, { paused: true });
+          return;
+        }
+
+        const reconciled = reconcileEvidence(current.evidence, latest);
         if (!commit(current, reconciled, false)) return;
         if (!reconciled.baseline.complete) {
           commit(current, reconciled);
@@ -1039,6 +1318,10 @@ export function useAuto({
         for (const pull of pullOrder(latest.pulls)) {
           const pending = reconciled.pending[pull.url] ?? [];
           if (pending.length === 0) continue;
+          if (!evidenceComplete(pull) || phaseOf(latest, pull) !== "blocked") {
+            waiting = true;
+            continue;
+          }
           if (work.has(pull.url) || isPullBusy(latest, pull)) {
             waiting = true;
             continue;
@@ -1057,12 +1340,14 @@ export function useAuto({
             continue;
           }
 
-          const incidents = pending.slice(0, AUTO_TRIGGER_LIMIT);
+          const incidents = dispatchIncidents(pending, retry);
+          if (incidents.length === 0) continue;
           const identities = incidents.map((incident) => incident.identity);
           current.claims.add(pull.url);
           work.add(pull.url);
           slots -= 1;
           guarded.retry[pull.url] = {
+            agent: incidents[0]!.agent,
             attempt: guarded.retry[pull.url]?.attempt ?? 0,
             identities,
             notBefore: now + START_GUARD_DELAY,
@@ -1101,12 +1386,17 @@ export function useAuto({
       setVisible(document.visibilityState === "visible");
     };
     document.addEventListener("visibilitychange", handleVisibility);
-    return () => document.removeEventListener("visibilitychange", handleVisibility);
+    return () =>
+      document.removeEventListener("visibilitychange", handleVisibility);
   }, []);
 
   useEffect(() => {
     const handleStorage = (event: StorageEvent): void => {
-      if (event.storageArea !== null && event.storageArea !== window.localStorage) return;
+      if (
+        event.storageArea !== null &&
+        event.storageArea !== window.localStorage
+      )
+        return;
       if (event.key === AUTO_SETTINGS_STORAGE_KEY) {
         setSettings(parseSettings(event.newValue));
         return;
@@ -1144,7 +1434,7 @@ export function useAuto({
 
   useEffect(() => {
     processRef.current();
-  }, [authoritative, pulls, runs.states, settings.parallelism, tasks]);
+  }, [agent, authoritative, pulls, runs.states, settings.parallelism, tasks]);
 
   useEffect(() => {
     if (
@@ -1170,9 +1460,14 @@ export function useAuto({
         { mode: "exclusive", signal: controller.signal },
         async () => {
           if (cancelled || controller.signal.aborted) return;
+          const input = inputRef.current;
           const acquired: Leader = {
             claims: new Set(),
-            evidence: readEvidence(normalizedViewer, settings.epoch!),
+            evidence: readEvidence(
+              normalizedViewer,
+              settings.epoch!,
+              input ?? undefined,
+            ),
             generation,
             retryAt: null,
             retryTimer: null,
@@ -1184,7 +1479,8 @@ export function useAuto({
           await new Promise<void>((resolve) => {
             release = resolve;
           });
-          if (acquired.retryTimer !== null) window.clearTimeout(acquired.retryTimer);
+          if (acquired.retryTimer !== null)
+            window.clearTimeout(acquired.retryTimer);
           acquired.retryAt = null;
           if (leaderRef.current === acquired) leaderRef.current = null;
           if (mountedRef.current) setLeader(false);
@@ -1212,7 +1508,8 @@ export function useAuto({
       release?.();
       const current = leaderRef.current;
       if (current?.generation === generation) {
-        if (current.retryTimer !== null) window.clearTimeout(current.retryTimer);
+        if (current.retryTimer !== null)
+          window.clearTimeout(current.retryTimer);
         current.retryAt = null;
         leaderRef.current = null;
       }
@@ -1261,13 +1558,7 @@ export function useAuto({
     });
   }, []);
 
-  const state = describe(
-    available,
-    settings.enabled,
-    visible,
-    leader,
-    summary,
-  );
+  const state = describe(available, settings.enabled, visible, leader, summary);
 
   return useMemo(
     () => ({

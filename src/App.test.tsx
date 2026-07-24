@@ -15,14 +15,24 @@ import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App, { countActiveLocalWork } from "./App";
-import { getPullDiff, getPulls, getRecentReleases } from "./api";
+import {
+  createRelease,
+  getPullDiff,
+  getPulls,
+  getRecentReleases,
+  getReleaseOptions,
+  getReleasePipelines,
+} from "./api";
 import type { ClaudeRunEvent, ClaudeRunRequest } from "./fixes";
-import type { RunState } from "./runs";
+import { RELEASE_PANEL_STORAGE_KEY } from "./release-panel";
+import { resetReleaseOptionsCacheForTests } from "./release-options";
+import { createMemoryRunTranscriptStore } from "./run-transcripts";
+import { IDLE_RUN_STATE, type RunState } from "./runs";
 import type { TaskState } from "./tasks";
 import {
   createDegradedPullDiff,
   createPendingPull,
-  createPullsResponse,
+  createPullsResponse as createPullsResponseFixture,
 } from "./test/fixtures";
 import type {
   PullDiff,
@@ -30,8 +40,11 @@ import type {
   PullsResponse,
   RecentRelease,
   RecentReleasesResponse,
+  ReleasePipelinesResponse,
   Task,
   TaskEvent,
+  VerificationRunEvent,
+  VerificationRunRequest,
 } from "./types";
 
 const fixes = vi.hoisted(() => ({
@@ -45,6 +58,7 @@ const actions = vi.hoisted(() => ({
   merge: vi.fn(),
   streamReleaseVerification: vi.fn(),
   streamRepair: vi.fn(),
+  streamVerification: vi.fn(),
 }));
 
 const taskActions = vi.hoisted(() => ({
@@ -55,12 +69,14 @@ const taskActions = vi.hoisted(() => ({
   stream: vi.fn(),
 }));
 
-vi.mock("./api", () => ({
+vi.mock("./api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./api")>()),
   createRelease: vi.fn(),
   getCheckLog: vi.fn(),
   getPullDiff: vi.fn(),
   getPulls: vi.fn(),
   getRecentReleases: vi.fn(),
+  getReleasePipelines: vi.fn(),
   getReleaseOptions: vi.fn(),
   getTaskOptions: taskActions.options,
   getTasks: taskActions.list,
@@ -71,7 +87,7 @@ vi.mock("./api", () => ({
   cancelRepair: actions.cancelRepair,
   streamReleaseVerification: actions.streamReleaseVerification,
   streamRepair: actions.streamRepair,
-  streamVerification: vi.fn(),
+  streamVerification: actions.streamVerification,
   startTask: taskActions.start,
   TaskStartError: class TaskStartError extends Error {},
   cancelTask: taskActions.cancel,
@@ -79,14 +95,23 @@ vi.mock("./api", () => ({
 }));
 
 vi.mock("./fixes", () => ({
-  cancelClaudeRun: fixes.cancel,
-  streamClaudeRun: fixes.stream,
+  cancelAgentRun: fixes.cancel,
+  ClaudeRunHttpError: class ClaudeRunHttpError extends Error {},
+  streamAgentRun: fixes.stream,
 }));
 
 const REFRESH_INTERVAL = 10_000;
+const RELEASE_REFRESH_INTERVAL = 5 * 60_000;
+const createPullsResponse = (): PullsResponse => ({
+  ...createPullsResponseFixture(),
+  generatedAt: new Date().toISOString(),
+});
+const createReleaseMock = vi.mocked(createRelease);
 const getPullDiffMock = vi.mocked(getPullDiff);
 const getPullsMock = vi.mocked(getPulls);
 const getRecentReleasesMock = vi.mocked(getRecentReleases);
+const getReleasePipelinesMock = vi.mocked(getReleasePipelines);
+const getReleaseOptionsMock = vi.mocked(getReleaseOptions);
 const originalVisibility = Object.getOwnPropertyDescriptor(
   document,
   "visibilityState",
@@ -95,6 +120,10 @@ const originalLocks = Object.getOwnPropertyDescriptor(navigator, "locks");
 const originalLocalStorage = Object.getOwnPropertyDescriptor(
   window,
   "localStorage",
+);
+const originalResizeObserver = Object.getOwnPropertyDescriptor(
+  window,
+  "ResizeObserver",
 );
 
 type LockCallback = (lock: Lock) => unknown | Promise<unknown>;
@@ -172,6 +201,11 @@ const flushPromises = async () => {
   });
 };
 
+const usePullTimers = () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date(createPullsResponse().generatedAt));
+};
+
 const emptyReleases = (): RecentReleasesResponse => ({
   generatedAt: "2026-07-17T10:43:11.000Z",
   partial: false,
@@ -183,6 +217,11 @@ const createRecentRelease = (id: string, numbers: number[]): RecentRelease => ({
   complete: true,
   id,
   name: `Release ${id}`,
+  pipeline: {
+    checkedAt: "2026-07-21T08:00:00.000Z",
+    lookup: "complete",
+    runs: [],
+  },
   publishedAt: "2026-07-21T07:00:00.000Z",
   pulls: numbers.map((number) => ({
     headSha: `${number}`.padStart(40, "a").slice(-40),
@@ -199,6 +238,23 @@ const createRecentRelease = (id: string, numbers: number[]): RecentRelease => ({
   url: `https://github.com/appwrite/cloud/releases/tag/${id}`,
   warning: null,
 });
+
+const createReleaseHistory = (count: number): RecentRelease[] =>
+  Array.from({ length: count }, (_, index) => {
+    const number = index + 1;
+    const release = createRecentRelease(`history-${number}`, [number]);
+
+    return {
+      ...release,
+      name: `Release ${number}`,
+      pulls: release.pulls.map((pull) => ({
+        ...pull,
+        title: `Released pull ${number}`,
+      })),
+      tag: `v1.0.${number}`,
+      url: `https://github.com/appwrite/cloud/releases/tag/v1.0.${number}`,
+    };
+  });
 
 const releaseResponse = (
   releases: RecentRelease[],
@@ -284,6 +340,7 @@ const responseWith = (
   notReady: PullReadiness[],
 ): PullsResponse => ({
   ...createPullsResponse(),
+  generatedAt: new Date().toISOString(),
   counts: {
     notReady: notReady.length,
     ready: ready.length,
@@ -295,6 +352,7 @@ const responseWith = (
 
 const withNewComment = (pull: PullReadiness): PullReadiness => ({
   ...pull,
+  blockers: ["1 unresolved comment"],
   issueComments: [
     ...pull.issueComments,
     {
@@ -306,9 +364,11 @@ const withNewComment = (pull: PullReadiness): PullReadiness => ({
       url: `${pull.url}#issuecomment-new-auto-comment`,
     },
   ],
+  ready: false,
 });
 
 const restoredTask = (pull?: PullReadiness): Task => ({
+  agent: "claude",
   base: "main",
   branch: "puller/new-task-12345678",
   createdAt: "2026-07-22T00:00:00.000Z",
@@ -422,6 +482,7 @@ const mockGatedRun = (
 
 afterEach(() => {
   cleanup();
+  resetReleaseOptionsCacheForTests();
   vi.useRealTimers();
   vi.resetAllMocks();
 
@@ -433,10 +494,25 @@ afterEach(() => {
   if (originalLocalStorage) {
     Object.defineProperty(window, "localStorage", originalLocalStorage);
   }
+  if (originalResizeObserver) {
+    Object.defineProperty(window, "ResizeObserver", originalResizeObserver);
+  } else {
+    delete (window as unknown as { ResizeObserver?: typeof ResizeObserver })
+      .ResizeObserver;
+  }
 });
 
 beforeEach(() => {
+  resetReleaseOptionsCacheForTests();
   Element.prototype.scrollIntoView = vi.fn();
+  Object.defineProperty(window, "ResizeObserver", {
+    configurable: true,
+    value: class {
+      disconnect() {}
+      observe() {}
+      unobserve() {}
+    },
+  });
   const values = new Map<string, string>();
   const storage: Storage = {
     clear: () => values.clear(),
@@ -453,6 +529,18 @@ beforeEach(() => {
     value: storage,
   });
   getRecentReleasesMock.mockResolvedValue(emptyReleases());
+  getReleasePipelinesMock.mockResolvedValue({
+    generatedAt: "2026-07-21T08:00:00.000Z",
+    releases: [],
+  } satisfies ReleasePipelinesResponse);
+  getReleaseOptionsMock.mockResolvedValue({
+    generatedAt: "2026-07-22T00:00:00.000Z",
+    repositories: [],
+    repositoriesUpdatedAt: "2026-07-22T00:00:00.000Z",
+    tagsUpdatedAt: "2026-07-22T00:00:00.000Z",
+    viewerLogin: "jake",
+    warnings: [],
+  });
   fixes.cancel.mockResolvedValue(undefined);
   taskActions.options.mockResolvedValue({
     repositories: [],
@@ -467,12 +555,16 @@ describe("App", () => {
     const ciOnly = createPendingPull(301);
     const run: RunState = {
       actionId: "run-one",
+      agent: "claude",
       cancelling: false,
       headRefOid: pull.headRefOid,
+      history: [],
       kind: "fix",
       message: "",
       output: "",
       repairState: null,
+      reviewAttemptToken: null,
+      reviewRetry: null,
       source: "manual",
       status: "running",
     };
@@ -500,11 +592,24 @@ describe("App", () => {
     ).toBe(2);
   });
 
+  it("does not count review preparation as an active Claude instance", () => {
+    const pull = createPullsResponse().ready[0]!;
+    const preparing: RunState = {
+      ...IDLE_RUN_STATE,
+      source: "review",
+      status: "preparing",
+    };
+
+    expect(
+      countActiveLocalWork([pull], new Map([[pull.url, preparing]]), []),
+    ).toBe(0);
+  });
+
   it("renders the compact shadcn header with exact snapshot controls and metadata", async () => {
     const response = createPullsResponse();
     getPullsMock.mockResolvedValue(response);
 
-    render(<App />);
+    render(<App runTranscriptStore={createMemoryRunTranscriptStore()} />);
 
     const title = await screen.findByRole("heading", {
       level: 1,
@@ -564,6 +669,33 @@ describe("App", () => {
     expect(refresh).not.toHaveClass("rounded-md");
     expect(refresh).toHaveAttribute("data-slot", "button");
     expect(refresh.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("does not load release options until the dialog opens for an authenticated viewer", async () => {
+    const response = createPullsResponse();
+    getPullsMock
+      .mockResolvedValueOnce({ ...response, partial: true })
+      .mockResolvedValueOnce(response);
+
+    render(<App />);
+
+    await screen.findByText("Some pull requests could not be fully evaluated.");
+    expect(getReleaseOptionsMock).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(getPullsMock).toHaveBeenCalledTimes(2));
+    await flushPromises();
+    expect(getReleaseOptionsMock).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Release" }));
+
+    await waitFor(() =>
+      expect(getReleaseOptionsMock).toHaveBeenCalledWith(
+        false,
+        expect.any(AbortSignal),
+      ),
+    );
+    expect(getReleaseOptionsMock).toHaveBeenCalledTimes(1);
   });
 
   it("keeps Auto unavailable or disabled until a trustworthy snapshot loads, then baselines without dispatching", async () => {
@@ -688,11 +820,11 @@ describe("App", () => {
       expect.any(AbortSignal),
     );
     expect(
-      (await screen.findAllByText("Auto fix running")).length,
+      (await screen.findAllByText("Claude auto fix running")).length,
     ).toBeGreaterThan(0);
     expect(
       within(getSection("In progress")).getByRole("log", {
-        name: `Auto fix output for ${ready.repository} pull request ${ready.number}`,
+        name: `Claude auto fix output for ${ready.repository} pull request ${ready.number}`,
       }),
     ).toHaveTextContent("Fixing the new blocker.");
 
@@ -740,12 +872,26 @@ describe("App", () => {
     await act(async () => gate.resolve(undefined));
   });
 
-  it("exposes a queued Auto issue as an accessible paused status while a manual fix is active", async () => {
+  it("defers a new blocker until a manual fix leaves progress, then starts exactly one Auto fix", async () => {
     installWebLocks();
     const blocked = createPullsResponse().notReady[0]!;
     const changed = withNewComment(blocked);
-    const gate = createDeferred<void>();
-    mockGatedRun(gate.promise, "manual-run");
+    const manualGate = createDeferred<void>();
+    const autoGate = createDeferred<void>();
+    let run = 0;
+    fixes.stream.mockImplementation(async function* (
+      request: ClaudeRunRequest,
+    ): AsyncGenerator<ClaudeRunEvent, void, undefined> {
+      run += 1;
+      yield {
+        number: request.number,
+        repository: request.repository,
+        runId: run === 1 ? "manual-run" : "auto-run",
+        type: "start",
+      };
+      await (run === 1 ? manualGate.promise : autoGate.promise);
+      yield { exitCode: 0, type: "complete" };
+    });
     getPullsMock
       .mockResolvedValueOnce(responseWith([], [blocked]))
       .mockResolvedValueOnce(responseWith([], [changed]));
@@ -768,18 +914,35 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
 
     await waitFor(() =>
-      expect(auto).toHaveAttribute("data-auto-status", "paused"),
+      expect(auto).toHaveAttribute("data-auto-status", "watching"),
     );
     expect(auto.querySelector("[data-auto-indicator]")).toHaveClass(
-      "bg-amber-500",
+      "bg-emerald-500",
     );
     expect(
       document.getElementById(auto.getAttribute("aria-describedby")!),
-    ).toHaveTextContent("1 Auto issue is waiting for an active task or retry.");
+    ).toHaveTextContent("Auto is watching for new pull request blockers.");
     expect(fixes.stream).toHaveBeenCalledOnce();
     expect(fixes.stream.mock.calls[0]![0]).toMatchObject({ source: "manual" });
 
-    await act(async () => gate.resolve(undefined));
+    await act(async () => manualGate.resolve(undefined));
+    await waitFor(() => expect(fixes.stream).toHaveBeenCalledTimes(2));
+    expect(fixes.stream.mock.calls[1]![0]).toMatchObject({
+      number: blocked.number,
+      source: "auto",
+      triggers: [
+        expect.objectContaining({
+          id: "new-auto-comment",
+          kind: "issue_comment",
+        }),
+      ],
+    });
+    expect(
+      within(getSection("In progress")).getByText(changed.title),
+    ).toBeInTheDocument();
+    await act(async () => Promise.resolve());
+    expect(fixes.stream).toHaveBeenCalledTimes(2);
+    await act(async () => autoGate.resolve(undefined));
   });
 
   it("renders exclusive groups in fixed order with global ranks and accurate counts", async () => {
@@ -1284,11 +1447,149 @@ describe("App", () => {
       "grid",
       "lg:grid-cols-[minmax(0,1.7fr)_minmax(22rem,0.8fr)]",
     );
+    expect(columns).toHaveAttribute("data-release-panel-expanded", "true");
     expect(columns).toContainElement(pulls);
     expect(columns).toContainElement(releases);
+    expect(releases).toHaveAttribute("id", "recent-releases-panel");
+    expect(releases).toHaveAttribute("aria-hidden", "false");
+    expect(releases).not.toHaveAttribute("inert");
+    expect(releases).toHaveAttribute("data-state", "expanded");
+    const toggle = screen.getByRole("button", {
+      name: "Hide recent releases",
+    });
+    expect(toggle).toHaveAttribute("aria-controls", "recent-releases-panel");
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(toggle).toHaveAttribute("title", "Hide recent releases");
+    expect(toggle).toHaveAttribute("data-release-panel-toggle");
+    expect(
+      screen
+        .getByRole("button", { name: /^Theme:/ })
+        .compareDocumentPosition(toggle),
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(
+      toggle.compareDocumentPosition(
+        screen.getByRole("button", { name: "Refresh" }),
+      ),
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
     expect(
       container.querySelector('[data-release-date="2026-07-21"]'),
     ).toBeInTheDocument();
+  });
+
+  it("collapses the mounted release rail and preserves its page, disclosure, and active verification", async () => {
+    const releases = createReleaseHistory(21);
+    const gate = createDeferred<void>();
+    getPullsMock.mockResolvedValue(createPullsResponse());
+    getRecentReleasesMock.mockResolvedValue(releaseResponse(releases));
+    actions.streamVerification.mockImplementation(async function* (
+      request: VerificationRunRequest,
+    ): AsyncGenerator<VerificationRunEvent, void, undefined> {
+      yield { ...request, runId: "persistent-verification", type: "start" };
+      yield { text: "Verification remains active.\n", type: "text" };
+      await gate.promise;
+      yield { exitCode: 0, type: "complete" };
+    });
+    const view = render(<App />);
+
+    await screen.findByRole("heading", { name: "Recently released" });
+    fireEvent.click(screen.getByRole("button", { name: "Next releases page" }));
+    expect(screen.getByText("Page 2 of 2")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Show 1 pull request in v1.0.21",
+      }),
+    );
+    const pullList = screen.getByRole("list", {
+      name: "Pull requests in Release 21",
+    });
+    fireEvent.click(within(pullList).getByRole("button", { name: "Verify" }));
+    expect(
+      await within(pullList).findByRole("log", {
+        name: "Claude verification output for appwrite/cloud #21",
+      }),
+    ).toHaveTextContent("Verification remains active.");
+
+    const panel = view.container.querySelector<HTMLElement>(
+      "#recent-releases-panel",
+    )!;
+    fireEvent.click(
+      screen.getByRole("button", { name: "Hide recent releases" }),
+    );
+
+    expect(
+      screen.getByRole("button", { name: "Show recent releases" }),
+    ).toHaveAttribute("aria-expanded", "false");
+    expect(
+      view.container.querySelector("[data-dashboard-columns]"),
+    ).toHaveAttribute("data-release-panel-expanded", "false");
+    expect(panel).toHaveAttribute("aria-hidden", "true");
+    expect(panel).toHaveAttribute("inert");
+    expect(panel).toHaveAttribute("data-state", "collapsed");
+    expect(
+      within(panel).getByRole("log", {
+        hidden: true,
+        name: "Claude verification output for appwrite/cloud #21",
+      }),
+    ).toHaveTextContent("Verification remains active.");
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show recent releases" }),
+    );
+
+    expect(view.container.querySelector("#recent-releases-panel")).toBe(panel);
+    expect(screen.getByText("Page 2 of 2")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: "Hide 1 pull request in v1.0.21",
+      }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.getByRole("log", {
+        name: "Claude verification output for appwrite/cloud #21",
+      }),
+    ).toHaveTextContent("Verification remains active.");
+    expect(
+      within(pullList).getByRole("button", { name: "Verifying…" }),
+    ).toBeDisabled();
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => gate.resolve(undefined));
+  });
+
+  it("hydrates and cross-tab synchronizes the release rail preference", async () => {
+    window.localStorage.setItem(
+      RELEASE_PANEL_STORAGE_KEY,
+      JSON.stringify({ expanded: false, version: 1 }),
+    );
+    getPullsMock.mockResolvedValue(createPullsResponse());
+    getRecentReleasesMock.mockResolvedValue(
+      releaseResponse([createRecentRelease("one", [41])]),
+    );
+    const view = render(<App />);
+
+    const collapsed = await screen.findByRole("button", {
+      name: "Show recent releases",
+    });
+    expect(collapsed).toHaveAttribute("aria-expanded", "false");
+    expect(
+      view.container.querySelector("#recent-releases-panel"),
+    ).toHaveAttribute("inert");
+
+    fireEvent(
+      window,
+      new StorageEvent("storage", {
+        key: RELEASE_PANEL_STORAGE_KEY,
+        newValue: JSON.stringify({ expanded: true, version: 1 }),
+      }),
+    );
+
+    expect(
+      await screen.findByRole("button", { name: "Hide recent releases" }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(
+      view.container.querySelector("#recent-releases-panel"),
+    ).not.toHaveAttribute("inert");
   });
 
   it("removes an exactly merged pull before the background refresh resolves", async () => {
@@ -1316,12 +1617,107 @@ describe("App", () => {
       ).not.toBeInTheDocument(),
     );
     expect(getPullsMock).toHaveBeenCalledTimes(2);
+    expect(getPullsMock).toHaveBeenNthCalledWith(
+      2,
+      true,
+      expect.any(AbortSignal),
+    );
 
     refresh.resolve(response);
     await flushPromises();
     expect(
       screen.queryByText(response.ready[0]!.title),
     ).not.toBeInTheDocument();
+  });
+
+  it("cleans merged row continuity once while Strict Mode replays state updates", async () => {
+    const merged = createPullsResponse().ready[0]!;
+    const replacement: PullReadiness = {
+      ...merged,
+      headRefOid: "dddddddddddddddddddddddddddddddddddddddd",
+      title: "Replacement head after merged continuity cleanup",
+    };
+    getPullsMock
+      .mockResolvedValueOnce(responseWith([merged], []))
+      .mockResolvedValueOnce(responseWith([], []))
+      .mockResolvedValueOnce(responseWith([replacement], []));
+    getPullDiffMock.mockResolvedValue(diffFor(merged));
+    actions.merge.mockResolvedValue({
+      mergeCommitOid: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      merged: true,
+      number: merged.number,
+      repository: merged.repository,
+      url: merged.url,
+    });
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    );
+
+    await screen.findByText(merged.title);
+    fireEvent.click(screen.getByRole("button", { name: "Files changed" }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Files changed" }),
+      ).toHaveAttribute("aria-expanded", "true"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Merge" }));
+    fireEvent.click(screen.getByRole("button", { name: "Admin merge" }));
+    await waitFor(() => expect(getPullsMock).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.queryByText(merged.title)).not.toBeInTheDocument(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(await screen.findByText(replacement.title)).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Files changed" }),
+    ).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("retains row continuity through partial omission and prunes it after authoritative removal", async () => {
+    const initial = createPullsResponse();
+    const pull = initial.notReady[0]!;
+    getPullsMock
+      .mockResolvedValueOnce(initial)
+      .mockResolvedValueOnce({
+        ...responseWith([], []),
+        partial: true,
+        warnings: ["The partial snapshot omitted open pull requests."],
+      })
+      .mockResolvedValueOnce(responseWith([], []))
+      .mockResolvedValueOnce(initial);
+    render(<App />);
+
+    await screen.findByText(pull.title);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show blocker details" }),
+    );
+    expect(
+      screen.getByRole("button", { name: "Hide blocker details" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(getPullsMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByText(pull.title)).toBeVisible());
+    expect(
+      screen.getByRole("button", { name: "Hide blocker details" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(getPullsMock).toHaveBeenCalledTimes(3));
+    await waitFor(() =>
+      expect(screen.queryByText(pull.title)).not.toBeInTheDocument(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(getPullsMock).toHaveBeenCalledTimes(4));
+    expect(await screen.findByText(pull.title)).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Show blocker details" }),
+    ).toBeInTheDocument();
   });
 
   it("keeps an exact merge tombstone for stale later snapshots while allowing a new head", async () => {
@@ -1557,12 +1953,7 @@ describe("App", () => {
       within(getSection("In progress")).getByRole("button", {
         name: "Files changed",
       }),
-    ).toHaveAttribute("aria-expanded", "false");
-    fireEvent.click(
-      within(getSection("In progress")).getByRole("button", {
-        name: "Files changed",
-      }),
-    );
+    ).toHaveAttribute("aria-expanded", "true");
     expect(
       await within(getSection("In progress")).findByRole("checkbox", {
         name: "Viewed public/logo.png",
@@ -1578,12 +1969,7 @@ describe("App", () => {
       within(getSection("Not ready")).getByRole("button", {
         name: "Files changed",
       }),
-    ).toHaveAttribute("aria-expanded", "false");
-    fireEvent.click(
-      within(getSection("Not ready")).getByRole("button", {
-        name: "Files changed",
-      }),
-    );
+    ).toHaveAttribute("aria-expanded", "true");
     expect(
       await within(getSection("Not ready")).findByRole("checkbox", {
         name: "Viewed public/logo.png",
@@ -1601,12 +1987,7 @@ describe("App", () => {
       within(getSection("Ready")).getByRole("button", {
         name: "Files changed",
       }),
-    ).toHaveAttribute("aria-expanded", "false");
-    fireEvent.click(
-      within(getSection("Ready")).getByRole("button", {
-        name: "Files changed",
-      }),
-    );
+    ).toHaveAttribute("aria-expanded", "true");
     expect(
       await within(getSection("Ready")).findByRole("checkbox", {
         name: "Viewed public/logo.png",
@@ -1617,7 +1998,7 @@ describe("App", () => {
     ).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
-    await waitFor(() => expect(getPullDiffMock).toHaveBeenCalledTimes(5));
+    await waitFor(() => expect(getPullDiffMock).toHaveBeenCalledTimes(2));
     expect(
       await within(getSection("Ready")).findByRole("checkbox", {
         name: "Viewed public/logo.png",
@@ -1926,7 +2307,7 @@ describe("App", () => {
     const getSignal = mockGatedRun(gate.promise);
     getPullsMock.mockResolvedValue(response);
 
-    render(<App />);
+    render(<App runTranscriptStore={createMemoryRunTranscriptStore()} />);
 
     await screen.findByRole("heading", { name: "Not ready" });
     const prompt = "Resolve every unresolved review thread.";
@@ -1964,17 +2345,36 @@ describe("App", () => {
     expect(
       await within(getSection("Not ready")).findByText(blocked.title),
     ).toBeInTheDocument();
+    const completedSection = getSection("Not ready");
+    expect(within(completedSection).queryByRole("log")).not.toBeInTheDocument();
     expect(
-      within(getSection("Not ready")).getByText("Completed"),
-    ).toBeInTheDocument();
-    expect(within(getSection("Not ready")).getByRole("log")).toHaveTextContent(
-      "Working on the pull request.",
-    );
-    expect(
-      within(getSection("Not ready")).getByRole("textbox", {
+      within(completedSection).getByRole("textbox", {
         name: `Fix instructions for ${blocked.repository} #${blocked.number}`,
       }),
-    ).toHaveValue(prompt);
+    ).toHaveValue("");
+    expect(
+      within(completedSection).getByRole("button", { name: "Run fix" }),
+    ).toBeEnabled();
+    const historyTrigger = within(completedSection).getByRole("button", {
+      name: /Previous fixes/,
+    });
+    expect(historyTrigger).toHaveAttribute("aria-expanded", "false");
+    expect(within(completedSection).queryByText("Completed")).toBeNull();
+
+    fireEvent.click(historyTrigger);
+
+    const history = within(completedSection).getByRole("region", {
+      name: `Previous fixes for ${blocked.repository} pull request ${blocked.number}`,
+    });
+    expect(within(history).getByText("Completed")).toBeInTheDocument();
+    expect(within(history).getByText(prompt)).toBeInTheDocument();
+    fireEvent.click(
+      within(history).getByRole("button", { name: /Show transcript/ }),
+    );
+    expect(
+      await within(history).findByText("Working on the pull request."),
+    ).toHaveAttribute("data-run-history-transcript");
+    expect(screen.getByLabelText("Active 0")).toBeInTheDocument();
   });
 
   it("moves a Ready pull into progress and streams diff feedback as a Review fix", async () => {
@@ -1988,7 +2388,7 @@ describe("App", () => {
     getPullsMock.mockResolvedValue(responseWith([ready], []));
     getPullDiffMock.mockResolvedValue(reviewDiffFor(ready));
 
-    render(<App />);
+    render(<App runTranscriptStore={createMemoryRunTranscriptStore()} />);
 
     await screen.findByRole("heading", { name: "Ready" });
     await within(getSection("Ready")).findByText(ready.title);
@@ -2018,6 +2418,7 @@ describe("App", () => {
     expect(await within(progress).findByText(ready.title)).toBeInTheDocument();
     expect(fixes.stream).toHaveBeenCalledWith(
       {
+        agent: "claude",
         expectedBaseRefOid: ready.baseRefOid,
         expectedHeadRefOid: ready.headRefOid,
         feedback: {
@@ -2034,17 +2435,182 @@ describe("App", () => {
       expect.any(AbortSignal),
     );
     expect(
-      within(progress).getAllByText(/Review fix (starting|running)/).length,
+      within(progress).getAllByText(/Claude review fix (starting|running)/)
+        .length,
     ).toBeGreaterThan(0);
     expect(
       within(progress).getByRole("log", {
-        name: `Review fix output for ${ready.repository} pull request ${ready.number}`,
+        name: `Claude review fix output for ${ready.repository} pull request ${ready.number}`,
       }),
     ).toHaveTextContent("Applying the selected diff feedback.");
     expect(within(getSection("Ready")).queryByText(ready.title)).toBeNull();
 
     await act(async () => gate.resolve(undefined));
+
+    const readySection = getSection("Ready");
+    expect(
+      await within(readySection).findByText(ready.title),
+    ).toBeInTheDocument();
+    expect(
+      within(readySection).getByRole("button", {
+        name: "Files changed",
+      }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(
+      within(readySection).getByRole("textbox", {
+        name: "Claude feedback on new line 2",
+      }),
+    ).toHaveValue("Keep the new readiness transition covered.");
+    expect(
+      within(readySection).getByRole("button", {
+        name: "Give Claude feedback on new line 2",
+      }),
+    ).toHaveAttribute("aria-pressed", "true");
+    const historyTrigger = within(readySection).getByRole("button", {
+      name: /Previous fixes/,
+    });
+    expect(historyTrigger).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByLabelText("Active 0")).toBeInTheDocument();
   });
+
+  it.each([
+    {
+      label: "Failed",
+      message:
+        "The review fix failed. Review the Claude output, then retry this feedback.",
+      status: "failed",
+      terminal: {
+        message: "The review worker failed.",
+        type: "error",
+      } satisfies ClaudeRunEvent,
+    },
+    {
+      label: "Cancelled",
+      message:
+        "The review fix was cancelled. Retry this feedback when you are ready.",
+      status: "cancelled",
+      terminal: { type: "cancelled" } satisfies ClaudeRunEvent,
+    },
+    {
+      label: "Limited",
+      message:
+        "The review fix reached its run limit. Review the Claude output, then retry this feedback.",
+      status: "limited",
+      terminal: {
+        message: "Review capacity reached.",
+        type: "limit",
+      } satisfies ClaudeRunEvent,
+    },
+  ] as const)(
+    "restores exact diff feedback after a $status run crosses Ready through In progress",
+    async ({ label, message, status, terminal }) => {
+      const ready = createPullsResponse().ready[0]!;
+      const gate = createDeferred<void>();
+      const draft = "  Keep this exact retry draft.\n  Preserve spacing.  ";
+      fixes.stream.mockImplementation(async function* (
+        request: ClaudeRunRequest,
+      ): AsyncGenerator<ClaudeRunEvent, void, undefined> {
+        yield {
+          number: request.number,
+          repository: request.repository,
+          runId: `review-${status}`,
+          type: "start",
+        };
+        yield { text: "Attempted the selected review fix.\n", type: "text" };
+        await gate.promise;
+        yield terminal;
+      });
+      getPullsMock.mockResolvedValue(responseWith([ready], []));
+      getPullDiffMock.mockResolvedValue(reviewDiffFor(ready));
+
+      render(<App runTranscriptStore={createMemoryRunTranscriptStore()} />);
+
+      await screen.findByRole("heading", { name: "Ready" });
+      await within(getSection("Ready")).findByText(ready.title);
+      fireEvent.click(
+        within(getSection("Ready")).getByRole("button", {
+          name: "Files changed",
+        }),
+      );
+      fireEvent.click(
+        await within(getSection("Ready")).findByRole("button", {
+          name: "Give Claude feedback on new line 1",
+        }),
+      );
+      fireEvent.click(
+        within(getSection("Ready")).getByRole("button", {
+          name: "Give Claude feedback on new line 2",
+        }),
+        { shiftKey: true },
+      );
+      fireEvent.change(
+        within(getSection("Ready")).getByRole("textbox", {
+          name: "Claude feedback on new lines 1–2",
+        }),
+        { target: { value: draft } },
+      );
+      fireEvent.click(
+        within(getSection("Ready")).getByRole("button", {
+          name: "Run review fix",
+        }),
+      );
+
+      expect(
+        await within(getSection("In progress")).findByText(ready.title),
+      ).toBeInTheDocument();
+      expect(
+        within(getSection("Ready")).queryByText(ready.title),
+      ).not.toBeInTheDocument();
+
+      await act(async () => gate.resolve(undefined));
+
+      const readySection = getSection("Ready");
+      expect(
+        await within(readySection).findByText(ready.title),
+      ).toBeInTheDocument();
+      expect(
+        within(readySection).getByRole("button", {
+          name: "Files changed",
+        }),
+      ).toHaveAttribute("aria-expanded", "true");
+      expect(
+        await within(readySection).findByRole("textbox", {
+          name: "Claude feedback on new lines 1–2",
+        }),
+      ).toHaveValue(draft);
+      expect(
+        within(readySection)
+          .getAllByRole("button", {
+            name: /Give Claude feedback on new line [12]/,
+          })
+          .filter((button) => button.getAttribute("aria-pressed") === "true"),
+      ).toHaveLength(2);
+      expect(within(readySection).getByRole("alert")).toHaveTextContent(
+        message,
+      );
+
+      fireEvent.click(
+        within(readySection).getByRole("button", {
+          name: "Previous fixes, 1 run",
+        }),
+      );
+      const history = within(readySection).getByRole("region", {
+        name: `Previous fixes for ${ready.repository} pull request ${ready.number}`,
+      });
+      expect(within(history).getByText(label)).toBeInTheDocument();
+      expect(
+        history.querySelector("[data-run-history-transcript]"),
+      ).not.toBeInTheDocument();
+      fireEvent.click(
+        within(history).getByRole("button", { name: /Show transcript/ }),
+      );
+      expect(
+        await within(history).findByText("Attempted the selected review fix.", {
+          exact: false,
+        }),
+      ).toHaveAttribute("data-run-history-transcript");
+    },
+  );
 
   it("keeps a CI-pending pull in progress after its local run completes", async () => {
     const pending = createPendingPull(1);
@@ -2062,7 +2628,7 @@ describe("App", () => {
       yield { exitCode: 0, type: "complete" };
     });
 
-    render(<App />);
+    render(<App runTranscriptStore={createMemoryRunTranscriptStore()} />);
 
     await screen.findByText(pending.title);
     expect(
@@ -2077,18 +2643,40 @@ describe("App", () => {
       }),
     );
 
+    const progress = getSection("In progress");
     expect(
-      await within(getSection("In progress")).findByText("Completed"),
-    ).toBeInTheDocument();
-    expect(
-      within(getSection("In progress")).getByText(pending.title),
+      await within(progress).findByText(pending.title),
     ).toBeInTheDocument();
     expect(
       within(getSection("Not ready")).queryByText(pending.title),
     ).not.toBeInTheDocument();
+    expect(within(progress).queryByRole("log")).not.toBeInTheDocument();
     expect(
-      within(getSection("In progress")).getByRole("log"),
-    ).toHaveTextContent("CI should remain pending.");
+      within(progress).getByRole("textbox", {
+        name: `Fix instructions for ${pending.repository} #${pending.number}`,
+      }),
+    ).toHaveValue("");
+    expect(
+      within(progress).getByRole("button", { name: "Run fix" }),
+    ).toBeEnabled();
+    const historyTrigger = within(progress).getByRole("button", {
+      name: /Previous fixes/,
+    });
+    expect(historyTrigger).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(historyTrigger);
+
+    const history = within(progress).getByRole("region", {
+      name: `Previous fixes for ${pending.repository} pull request ${pending.number}`,
+    });
+    expect(within(history).getByText("Completed")).toBeInTheDocument();
+    fireEvent.click(
+      within(history).getByRole("button", { name: /Show transcript/ }),
+    );
+    expect(
+      await within(history).findByText("CI should remain pending."),
+    ).toHaveAttribute("data-run-history-transcript");
+    expect(screen.getByLabelText("Active 0")).toBeInTheDocument();
   });
 
   it("keeps an active refreshed pull in progress and moves it to Ready on completion", async () => {
@@ -2109,7 +2697,7 @@ describe("App", () => {
       .mockResolvedValueOnce(responseWith([], [blocked]))
       .mockResolvedValueOnce(responseWith([ready], []));
 
-    render(<App />);
+    render(<App runTranscriptStore={createMemoryRunTranscriptStore()} />);
 
     await screen.findByText(blocked.title);
     fireEvent.change(within(getSection("Not ready")).getByRole("textbox"), {
@@ -2140,12 +2728,29 @@ describe("App", () => {
     expect(
       await within(getSection("Ready")).findByText(blocked.title),
     ).toBeInTheDocument();
-    expect(within(getSection("Ready")).getByRole("log")).toHaveTextContent(
-      "Working on the pull request.",
-    );
+    const readySection = getSection("Ready");
+    expect(within(readySection).queryByRole("log")).not.toBeInTheDocument();
     expect(
       within(getSection("In progress")).queryByText(blocked.title),
     ).not.toBeInTheDocument();
+    const historyTrigger = within(readySection).getByRole("button", {
+      name: /Previous fixes/,
+    });
+    expect(historyTrigger).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(historyTrigger);
+
+    const history = within(readySection).getByRole("region", {
+      name: `Previous fixes for ${blocked.repository} pull request ${blocked.number}`,
+    });
+    expect(within(history).getByText("Completed")).toBeInTheDocument();
+    fireEvent.click(
+      within(history).getByRole("button", { name: /Show transcript/ }),
+    );
+    expect(
+      await within(history).findByText("Working on the pull request."),
+    ).toHaveAttribute("data-run-history-transcript");
+    expect(screen.getByLabelText("Active 0")).toBeInTheDocument();
   });
 
   it("preserves an active run across a refreshed head SHA for the same pull URL", async () => {
@@ -2166,7 +2771,7 @@ describe("App", () => {
       .mockResolvedValueOnce(responseWith([], [blocked]))
       .mockResolvedValueOnce(responseWith([], [changed]));
 
-    render(<App />);
+    render(<App runTranscriptStore={createMemoryRunTranscriptStore()} />);
 
     await screen.findByText(blocked.title);
     const prompt = "Keep this run attached by pull URL.";
@@ -2202,9 +2807,31 @@ describe("App", () => {
     expect(
       await within(getSection("Not ready")).findByText(changed.title),
     ).toBeInTheDocument();
-    expect(within(getSection("Not ready")).getByRole("log")).toHaveTextContent(
-      "Head work persists.",
+    const completedSection = getSection("Not ready");
+    expect(within(completedSection).queryByRole("log")).not.toBeInTheDocument();
+    expect(
+      within(completedSection).getByRole("textbox", {
+        name: `Fix instructions for ${changed.repository} #${changed.number}`,
+      }),
+    ).toHaveValue("");
+    const historyTrigger = within(completedSection).getByRole("button", {
+      name: /Previous fixes/,
+    });
+    expect(historyTrigger).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(historyTrigger);
+
+    const history = within(completedSection).getByRole("region", {
+      name: `Previous fixes for ${changed.repository} pull request ${changed.number}`,
+    });
+    expect(within(history).getByText(prompt)).toBeInTheDocument();
+    fireEvent.click(
+      within(history).getByRole("button", { name: /Show transcript/ }),
     );
+    expect(
+      await within(history).findByText("Head work persists."),
+    ).toHaveAttribute("data-run-history-transcript");
+    expect(screen.getByLabelText("Active 0")).toBeInTheDocument();
   });
 
   it("aborts and purges a removed run without rendering a ghost when the pull returns", async () => {
@@ -2517,7 +3144,7 @@ describe("App", () => {
   });
 
   it("shows trusted readiness movement for one minute without changing pages", async () => {
-    vi.useFakeTimers();
+    usePullTimers();
     vi.setSystemTime(new Date("2026-07-22T04:00:00.000Z"));
     const source = createPullsResponse();
     const blocked = source.notReady[0]!;
@@ -2631,8 +3258,472 @@ describe("App", () => {
     expect(screen.getByText("Released pull 11")).toBeInTheDocument();
   });
 
+  it("refreshes terminal pipeline snapshots after membership and manual refreshes", async () => {
+    const item = createRecentRelease("one", [11]);
+    getPullsMock.mockResolvedValue(createPullsResponse());
+    getRecentReleasesMock.mockResolvedValue(releaseResponse([item]));
+    getReleasePipelinesMock.mockResolvedValue({
+      generatedAt: "2026-07-21T08:01:00.000Z",
+      releases: [
+        {
+          id: item.id,
+          pipeline: {
+            checkedAt: "2026-07-21T08:01:00.000Z",
+            lookup: "complete",
+            runs: [],
+          },
+          publishedAt: item.publishedAt,
+          repository: item.repository,
+          tag: item.tag,
+        },
+      ],
+    });
+
+    render(<App />);
+    await screen.findByText("Release one");
+    await waitFor(() =>
+      expect(getReleasePipelinesMock).toHaveBeenCalledWith(
+        expect.any(AbortSignal),
+        true,
+      ),
+    );
+    expect(getReleasePipelinesMock).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    await waitFor(() => expect(getRecentReleasesMock).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(getReleasePipelinesMock).toHaveBeenCalledTimes(2),
+    );
+    expect(
+      screen.queryByText(/Release pipelines could not be loaded/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("paints release membership before deferred pipeline enrichment settles", async () => {
+    const base = createRecentRelease("one", [11]);
+    const item: RecentRelease = {
+      ...base,
+      pipeline: {
+        checkedAt: "2026-07-21T08:00:00.000Z",
+        lookup: "pending",
+        runs: [],
+      },
+    };
+    const enrichment = createDeferred<ReleasePipelinesResponse>();
+    getPullsMock.mockResolvedValue(createPullsResponse());
+    getRecentReleasesMock.mockResolvedValue(releaseResponse([item]));
+    getReleasePipelinesMock.mockReturnValue(enrichment.promise);
+
+    render(<App />);
+
+    expect(await screen.findByText("Release one")).toBeVisible();
+    expect(screen.getByText("Waiting for pipeline")).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Refresh recent releases" }),
+    ).toBeEnabled();
+    expect(getReleasePipelinesMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      enrichment.resolve({
+        generatedAt: "2026-07-21T08:01:00.000Z",
+        releases: [
+          {
+            id: item.id,
+            pipeline: {
+              checkedAt: "2026-07-21T08:01:00.000Z",
+              lookup: "complete",
+              runs: [],
+            },
+            publishedAt: item.publishedAt,
+            repository: item.repository,
+            tag: item.tag,
+          },
+        ],
+      });
+      await enrichment.promise;
+    });
+    await waitFor(() =>
+      expect(screen.queryByText("Waiting for pipeline")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("issues one pipeline enrichment after a direct recent-release refresh", async () => {
+    const first = createRecentRelease("one", [11]);
+    const second = createRecentRelease("two", [21]);
+    getPullsMock.mockResolvedValue(createPullsResponse());
+    getRecentReleasesMock
+      .mockResolvedValueOnce(releaseResponse([first]))
+      .mockResolvedValueOnce(releaseResponse([second]));
+
+    render(<App />);
+    expect(await screen.findByText("Release one")).toBeVisible();
+    await waitFor(() =>
+      expect(getReleasePipelinesMock).toHaveBeenCalledTimes(1),
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Refresh recent releases" }),
+    );
+
+    expect(await screen.findByText("Release two")).toBeVisible();
+    await waitFor(() =>
+      expect(getReleasePipelinesMock).toHaveBeenCalledTimes(2),
+    );
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshes release membership and pipeline status after creating a release", async () => {
+    const item = createRecentRelease("one", [11]);
+    getPullsMock.mockResolvedValue(createPullsResponse());
+    getRecentReleasesMock
+      .mockResolvedValueOnce(emptyReleases())
+      .mockResolvedValue(releaseResponse([item]));
+    getReleaseOptionsMock.mockResolvedValue({
+      generatedAt: "2026-07-21T08:02:00.000Z",
+      repositories: [
+        {
+          latestTag: "v1.2.3",
+          nextTag: "v1.2.4",
+          previousTags: ["v1.2.3"],
+          repository: "appwrite/cloud",
+          repositoryUrl: "https://github.com/appwrite/cloud",
+        },
+      ],
+      repositoriesUpdatedAt: "2026-07-21T08:00:00.000Z",
+      tagsUpdatedAt: "2026-07-21T08:01:00.000Z",
+      viewerLogin: "jake",
+      warnings: [],
+    });
+    createReleaseMock.mockResolvedValue({
+      id: item.id,
+      name: item.name,
+      publishedAt: item.publishedAt,
+      repository: item.repository,
+      tag: item.tag,
+      url: item.url,
+    });
+
+    render(<App />);
+    await screen.findByText("Make readiness signals explicit");
+    expect(getReleaseOptionsMock).not.toHaveBeenCalled();
+    expect(getReleasePipelinesMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Release" }));
+    await waitFor(() =>
+      expect(screen.getByLabelText("Release tag")).toHaveValue("v1.2.4"),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Review release" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Publish release" }),
+    );
+
+    await waitFor(() => expect(createReleaseMock).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(getPullsMock).toHaveBeenNthCalledWith(
+        2,
+        true,
+        expect.any(AbortSignal),
+      ),
+    );
+    await waitFor(() => expect(getRecentReleasesMock).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(getReleasePipelinesMock).toHaveBeenCalledWith(
+        expect.any(AbortSignal),
+        true,
+      ),
+    );
+    expect(getReleasePipelinesMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes releases every five minutes without joining ten-second pull polling", async () => {
+    usePullTimers();
+    const first = createRecentRelease("one", [11]);
+    const second = createRecentRelease("two", [21]);
+    getPullsMock.mockImplementation(async () => createPullsResponse());
+    getRecentReleasesMock
+      .mockResolvedValueOnce(releaseResponse([first]))
+      .mockResolvedValueOnce(releaseResponse([second]));
+
+    render(<App />);
+    await flushPromises();
+    expect(screen.getByText("Release one")).toBeInTheDocument();
+    expect(getReleasePipelinesMock).toHaveBeenCalledTimes(1);
+    expect(getRecentReleasesMock).toHaveBeenNthCalledWith(
+      1,
+      false,
+      expect.any(AbortSignal),
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(REFRESH_INTERVAL);
+    });
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(
+        RELEASE_REFRESH_INTERVAL - REFRESH_INTERVAL - 1,
+      );
+    });
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(getRecentReleasesMock).toHaveBeenNthCalledWith(
+      2,
+      false,
+      expect.any(AbortSignal),
+    );
+    expect(screen.queryByText("Release one")).not.toBeInTheDocument();
+    expect(screen.getByText("Release two")).toBeInTheDocument();
+    expect(getReleasePipelinesMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps release cards and refresh controls visually idle during a background refresh", async () => {
+    usePullTimers();
+    const first = createRecentRelease("one", [11]);
+    const background = createDeferred<RecentReleasesResponse>();
+    getPullsMock.mockImplementation(async () => createPullsResponse());
+    getRecentReleasesMock
+      .mockResolvedValueOnce(releaseResponse([first]))
+      .mockReturnValueOnce(background.promise);
+
+    render(<App />);
+    await flushPromises();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RELEASE_REFRESH_INTERVAL);
+    });
+
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Release one")).toBeInTheDocument();
+    const refresh = screen.getByRole("button", {
+      name: "Refresh recent releases",
+    });
+    expect(refresh).toBeEnabled();
+    expect(refresh.querySelector("svg")).not.toHaveClass("animate-spin");
+    expect(
+      screen.queryByLabelText("Loading recent releases"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("schedules release refreshes from completion and never overlaps them", async () => {
+    usePullTimers();
+    const background = createDeferred<RecentReleasesResponse>();
+    getPullsMock.mockImplementation(async () => createPullsResponse());
+    getRecentReleasesMock
+      .mockResolvedValueOnce(
+        releaseResponse([createRecentRelease("one", [11])]),
+      )
+      .mockReturnValueOnce(background.promise)
+      .mockResolvedValueOnce(
+        releaseResponse([createRecentRelease("two", [21])]),
+      );
+
+    render(<App />);
+    await flushPromises();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RELEASE_REFRESH_INTERVAL);
+    });
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RELEASE_REFRESH_INTERVAL * 2);
+    });
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      background.resolve(releaseResponse([createRecentRelease("one", [11])]));
+      await background.promise;
+      await vi.advanceTimersByTimeAsync(RELEASE_REFRESH_INTERVAL - 1);
+    });
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("pauses release refreshes while hidden and refreshes on visibility only when due", async () => {
+    usePullTimers();
+    setVisibility("visible");
+    getPullsMock.mockImplementation(async () => createPullsResponse());
+    getRecentReleasesMock.mockResolvedValue(
+      releaseResponse([createRecentRelease("one", [11])]),
+    );
+
+    render(<App />);
+    await flushPromises();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    act(() => {
+      setVisibility("hidden");
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+      setVisibility("visible");
+      document.dispatchEvent(new Event("visibilitychange"));
+      await Promise.resolve();
+    });
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3 * 60_000 - 1);
+    });
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(2);
+
+    act(() => {
+      setVisibility("hidden");
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RELEASE_REFRESH_INTERVAL + 1);
+    });
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      setVisibility("visible");
+      document.dispatchEvent(new Event("visibilitychange"));
+      await Promise.resolve();
+    });
+    expect(getRecentReleasesMock).toHaveBeenNthCalledWith(
+      3,
+      false,
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("lets a visible forced refresh abort and supersede background release work", async () => {
+    usePullTimers();
+    const first = createRecentRelease("one", [11]);
+    const second = createRecentRelease("two", [21]);
+    const background = createDeferred<RecentReleasesResponse>();
+    const manual = createDeferred<RecentReleasesResponse>();
+    getPullsMock.mockImplementation(async () => createPullsResponse());
+    getRecentReleasesMock
+      .mockResolvedValueOnce(releaseResponse([first]))
+      .mockImplementationOnce((_refresh, _signal) => {
+        return background.promise;
+      })
+      .mockReturnValueOnce(manual.promise);
+
+    render(<App />);
+    await flushPromises();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RELEASE_REFRESH_INTERVAL);
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Refresh recent releases" }),
+    );
+
+    expect(getRecentReleasesMock.mock.calls[1]?.[1]?.aborted).toBe(true);
+    expect(getRecentReleasesMock).toHaveBeenNthCalledWith(
+      3,
+      true,
+      expect.any(AbortSignal),
+    );
+    const refreshing = screen.getByRole("button", {
+      name: "Refresh recent releases",
+    });
+    expect(refreshing).toBeDisabled();
+    expect(refreshing.querySelector("svg")).toHaveClass("animate-spin");
+    expect(screen.getByText("Release one")).toBeInTheDocument();
+
+    await act(async () => {
+      manual.resolve(releaseResponse([second]));
+      await manual.promise;
+    });
+    expect(screen.getByText("Release two")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Refresh recent releases" }),
+    ).toBeEnabled();
+
+    await act(async () => {
+      background.resolve(releaseResponse([first]));
+      await background.promise;
+    });
+    expect(screen.getByText("Release two")).toBeInTheDocument();
+    expect(screen.queryByText("Release one")).not.toBeInTheDocument();
+  });
+
+  it("keeps background release failures silent and retries from their completion deadline", async () => {
+    usePullTimers();
+    const first = createRecentRelease("one", [11]);
+    getPullsMock.mockImplementation(async () => createPullsResponse());
+    getRecentReleasesMock
+      .mockResolvedValueOnce(releaseResponse([first]))
+      .mockRejectedValueOnce(new Error("temporary release failure"))
+      .mockResolvedValueOnce(releaseResponse([first]));
+
+    render(<App />);
+    await flushPromises();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RELEASE_REFRESH_INTERVAL);
+    });
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Release one")).toBeInTheDocument();
+    expect(
+      screen.queryByText(/temporary release failure/),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Refresh recent releases" }),
+    ).toBeEnabled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RELEASE_REFRESH_INTERVAL - 1);
+    });
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("deduplicates release loading in StrictMode and aborts it without leaving a timer", async () => {
+    usePullTimers();
+    const pulls = createDeferred<ReturnType<typeof createPullsResponse>>();
+    const releases = createDeferred<RecentReleasesResponse>();
+    getPullsMock.mockReturnValue(pulls.promise);
+    getRecentReleasesMock.mockImplementation((_refresh, _signal) => {
+      return releases.promise;
+    });
+
+    const { unmount } = render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    );
+
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(1);
+    unmount();
+    await flushPromises();
+    expect(getRecentReleasesMock.mock.calls[0]?.[1]?.aborted).toBe(true);
+
+    await act(async () => {
+      pulls.resolve(createPullsResponse());
+      releases.resolve(emptyReleases());
+      await Promise.all([pulls.promise, releases.promise]);
+      await vi.advanceTimersByTimeAsync(RELEASE_REFRESH_INTERVAL);
+    });
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps ten-second polling visually silent while retaining the current rows", async () => {
-    vi.useFakeTimers();
+    usePullTimers();
     const background = createDeferred<ReturnType<typeof createPullsResponse>>();
     const passive = [
       "GitHub returned incomplete evidence for appwrite-labs/cloud#4908; the pull request was not updated.",
@@ -2654,6 +3745,11 @@ describe("App", () => {
     });
 
     expect(getPullsMock).toHaveBeenCalledTimes(2);
+    expect(getPullsMock).toHaveBeenNthCalledWith(
+      2,
+      false,
+      expect.any(AbortSignal),
+    );
     const refresh = screen.getByRole("button", { name: "Refresh" });
     expect(refresh).toBeEnabled();
     expect(refresh.querySelector("svg")).not.toHaveClass("animate-spin");
@@ -2697,9 +3793,16 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
   });
 
-  it("bypasses the cache manually and restarts the ten-second deadline on completion", async () => {
-    vi.useFakeTimers();
-    getPullsMock.mockResolvedValue(createPullsResponse());
+  it("bypasses the cache manually while scheduled follow-up uses the cache", async () => {
+    usePullTimers();
+    getPullsMock
+      .mockResolvedValueOnce(createPullsResponse())
+      .mockImplementation(() =>
+        Promise.resolve({
+          ...createPullsResponse(),
+          generatedAt: new Date().toISOString(),
+        }),
+      );
 
     render(<App />);
     await flushPromises();
@@ -2730,35 +3833,25 @@ describe("App", () => {
     });
     expect(getPullsMock).toHaveBeenNthCalledWith(
       3,
-      true,
+      false,
       expect.any(AbortSignal),
     );
   });
 
-  it("schedules from completion and never overlaps requests", async () => {
-    vi.useFakeTimers();
-    const first = createDeferred<ReturnType<typeof createPullsResponse>>();
-    const second = createDeferred<ReturnType<typeof createPullsResponse>>();
-    const third = createDeferred<ReturnType<typeof createPullsResponse>>();
+  it("schedules a 9.5-second-old fresh snapshot after half a second", async () => {
+    usePullTimers();
+    const response = {
+      ...createPullsResponse(),
+      generatedAt: new Date(Date.now() - 9_500).toISOString(),
+    };
     getPullsMock
-      .mockReturnValueOnce(first.promise)
-      .mockReturnValueOnce(second.promise)
-      .mockReturnValueOnce(third.promise);
+      .mockResolvedValueOnce(response)
+      .mockReturnValueOnce(new Promise(() => undefined));
 
     render(<App />);
-    expect(getPullsMock).toHaveBeenCalledTimes(1);
-
+    await flushPromises();
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(REFRESH_INTERVAL * 2);
-    });
-    expect(getPullsMock).toHaveBeenCalledTimes(1);
-
-    await act(async () => {
-      first.resolve(createPullsResponse());
-      await first.promise;
-    });
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(REFRESH_INTERVAL - 1);
+      await vi.advanceTimersByTimeAsync(499);
     });
     expect(getPullsMock).toHaveBeenCalledTimes(1);
 
@@ -2766,22 +3859,321 @@ describe("App", () => {
       await vi.advanceTimersByTimeAsync(1);
     });
     expect(getPullsMock).toHaveBeenCalledTimes(2);
+    expect(getPullsMock).toHaveBeenNthCalledWith(
+      2,
+      false,
+      expect.any(AbortSignal),
+    );
+  });
 
+  it("catches up overdue fresh snapshots without repeating zero-delay polls", async () => {
+    usePullTimers();
+    const response = {
+      ...createPullsResponse(),
+      generatedAt: new Date(Date.now() - REFRESH_INTERVAL - 1).toISOString(),
+    };
+    getPullsMock.mockResolvedValue(response);
+
+    render(<App />);
+    await flushPromises();
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(REFRESH_INTERVAL * 2);
+      await vi.advanceTimersByTimeAsync(0);
     });
     expect(getPullsMock).toHaveBeenCalledTimes(2);
 
     await act(async () => {
-      second.resolve(createPullsResponse());
-      await second.promise;
-      await vi.advanceTimersByTimeAsync(REFRESH_INTERVAL);
+      await vi.advanceTimersByTimeAsync(999);
+    });
+    expect(getPullsMock).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
     });
     expect(getPullsMock).toHaveBeenCalledTimes(3);
   });
 
+  it("backs off stale and failed snapshots without tight loops and resets after success", async () => {
+    usePullTimers();
+    const stale = {
+      ...createPullsResponse(),
+      generatedAt: "2020-01-01T00:00:00.000Z",
+      stale: true,
+    };
+    getPullsMock
+      .mockResolvedValueOnce(createPullsResponse())
+      .mockResolvedValueOnce(stale)
+      .mockRejectedValueOnce(new Error("temporary readiness failure"))
+      .mockResolvedValueOnce(stale)
+      .mockResolvedValueOnce(stale)
+      .mockResolvedValueOnce(stale)
+      .mockResolvedValueOnce(stale)
+      .mockImplementationOnce(() =>
+        Promise.resolve({
+          ...createPullsResponse(),
+          generatedAt: new Date().toISOString(),
+        }),
+      )
+      .mockReturnValueOnce(new Promise(() => undefined));
+
+    render(<App />);
+    await flushPromises();
+
+    for (const [index, delay] of [
+      REFRESH_INTERVAL,
+      10_000,
+      20_000,
+      40_000,
+      80_000,
+      120_000,
+      120_000,
+    ].entries()) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(delay - 1);
+      });
+      expect(getPullsMock).toHaveBeenCalledTimes(index + 1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(getPullsMock).toHaveBeenCalledTimes(index + 2);
+      expect(getPullsMock).toHaveBeenLastCalledWith(
+        false,
+        expect.any(AbortSignal),
+      );
+    }
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(REFRESH_INTERVAL - 1);
+    });
+    expect(getPullsMock).toHaveBeenCalledTimes(8);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(getPullsMock).toHaveBeenCalledTimes(9);
+  });
+
+  it("keeps the original pull deadline when focus returns early", async () => {
+    usePullTimers();
+    setVisibility("visible");
+    getPullsMock.mockResolvedValue(createPullsResponse());
+
+    render(<App />);
+    await flushPromises();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_000);
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(REFRESH_INTERVAL - 4_001);
+    });
+    expect(getPullsMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(getPullsMock).toHaveBeenCalledTimes(2);
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes overdue pulls silently on focus without replacing mounted row state", async () => {
+    usePullTimers();
+    setVisibility("visible");
+    const response = createPullsResponse();
+    const background = createDeferred<ReturnType<typeof createPullsResponse>>();
+    getPullsMock
+      .mockResolvedValueOnce(response)
+      .mockReturnValueOnce(background.promise);
+    taskActions.options.mockResolvedValue({
+      repositories: [
+        {
+          branches: ["main"],
+          defaultBranch: "main",
+          name: "cloud",
+          owner: "appwrite",
+          repository: "appwrite/cloud",
+          updatedAt: "2026-07-22T00:00:00.000Z",
+        },
+      ],
+      updatedAt: "2026-07-22T00:00:00.000Z",
+    });
+
+    render(<App />);
+    await flushPromises();
+
+    const prompt = screen.getByPlaceholderText("New task…");
+    fireEvent.change(prompt, {
+      target: { value: "Keep this unsaved task prompt." },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show blocker details" }),
+    );
+    expect(
+      screen.getByRole("button", { name: "Hide blocker details" }),
+    ).toBeInTheDocument();
+
+    act(() => {
+      setVisibility("hidden");
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(REFRESH_INTERVAL + 1);
+    });
+    expect(getPullsMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      setVisibility("visible");
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+    });
+    expect(getPullsMock).toHaveBeenNthCalledWith(
+      2,
+      false,
+      expect.any(AbortSignal),
+    );
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+    expect(
+      screen.queryByRole("button", { name: "Refreshing" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText(response.notReady[0]!.title)).toBeInTheDocument();
+    expect(prompt).toHaveValue("Keep this unsaved task prompt.");
+    expect(
+      screen.getByRole("button", { name: "Hide blocker details" }),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      background.resolve(response);
+      await background.promise;
+    });
+    expect(prompt).toHaveValue("Keep this unsaved task prompt.");
+    expect(
+      screen.getByRole("button", { name: "Hide blocker details" }),
+    ).toBeInTheDocument();
+  });
+
+  it("refreshes pulls and releases together when focus returns after five minutes", async () => {
+    usePullTimers();
+    setVisibility("visible");
+    getPullsMock.mockResolvedValue(createPullsResponse());
+    getRecentReleasesMock.mockResolvedValue(
+      releaseResponse([createRecentRelease("one", [11])]),
+    );
+
+    render(<App />);
+    await flushPromises();
+    act(() => {
+      setVisibility("hidden");
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RELEASE_REFRESH_INTERVAL);
+      setVisibility("visible");
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+    });
+
+    expect(getPullsMock).toHaveBeenCalledTimes(2);
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("coalesces paired visibility and focus resumes without aborting passive work", async () => {
+    usePullTimers();
+    setVisibility("visible");
+    const pulls = createDeferred<ReturnType<typeof createPullsResponse>>();
+    const releases = createDeferred<RecentReleasesResponse>();
+    let pullSignal: AbortSignal | undefined;
+    let releaseSignal: AbortSignal | undefined;
+    getPullsMock
+      .mockResolvedValueOnce(createPullsResponse())
+      .mockImplementationOnce((_refresh, signal) => {
+        pullSignal = signal;
+        return pulls.promise;
+      });
+    getRecentReleasesMock
+      .mockResolvedValueOnce(emptyReleases())
+      .mockImplementationOnce((_refresh, signal) => {
+        releaseSignal = signal;
+        return releases.promise;
+      });
+
+    render(<App />);
+    await flushPromises();
+    act(() => {
+      setVisibility("hidden");
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RELEASE_REFRESH_INTERVAL);
+      setVisibility("visible");
+      document.dispatchEvent(new Event("visibilitychange"));
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+    });
+
+    expect(getPullsMock).toHaveBeenCalledTimes(2);
+    expect(getRecentReleasesMock).toHaveBeenCalledTimes(2);
+    expect(pullSignal?.aborted).toBe(false);
+    expect(releaseSignal?.aborted).toBe(false);
+
+    await act(async () => {
+      pulls.resolve(createPullsResponse());
+      releases.resolve(emptyReleases());
+      await Promise.all([pulls.promise, releases.promise]);
+    });
+  });
+
+  it("does not duplicate or abort active initial pull work on focus", async () => {
+    setVisibility("visible");
+    const initial = createDeferred<ReturnType<typeof createPullsResponse>>();
+    let signal: AbortSignal | undefined;
+    getPullsMock.mockImplementationOnce((_refresh, requestSignal) => {
+      signal = requestSignal;
+      return initial.promise;
+    });
+
+    render(<App />);
+    act(() => window.dispatchEvent(new Event("focus")));
+
+    expect(getPullsMock).toHaveBeenCalledTimes(1);
+    expect(signal?.aborted).toBe(false);
+
+    await act(async () => {
+      initial.resolve(createPullsResponse());
+      await initial.promise;
+    });
+  });
+
+  it("does not duplicate or abort active manual pull work on overdue focus", async () => {
+    usePullTimers();
+    setVisibility("visible");
+    const manual = createDeferred<ReturnType<typeof createPullsResponse>>();
+    let signal: AbortSignal | undefined;
+    getPullsMock
+      .mockResolvedValueOnce(createPullsResponse())
+      .mockImplementationOnce((_refresh, requestSignal) => {
+        signal = requestSignal;
+        return manual.promise;
+      });
+
+    render(<App />);
+    await flushPromises();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(REFRESH_INTERVAL + 1);
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+    });
+
+    expect(getPullsMock).toHaveBeenCalledTimes(2);
+    expect(signal?.aborted).toBe(false);
+
+    await act(async () => {
+      manual.resolve(createPullsResponse());
+      await manual.promise;
+    });
+  });
+
   it("pauses hidden-tab work and refreshes when an overdue tab becomes visible", async () => {
-    vi.useFakeTimers();
+    usePullTimers();
     setVisibility("visible");
     getPullsMock.mockResolvedValue(createPullsResponse());
 
@@ -2807,7 +4199,7 @@ describe("App", () => {
   });
 
   it("deduplicates the StrictMode lifecycle and leaves no timer after unmount", async () => {
-    vi.useFakeTimers();
+    usePullTimers();
     const pending = createDeferred<ReturnType<typeof createPullsResponse>>();
     getPullsMock.mockReturnValue(pending.promise);
 

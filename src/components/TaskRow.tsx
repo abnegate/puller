@@ -9,6 +9,7 @@ import {
 import { motion, useReducedMotion } from "motion/react";
 import { memo, type UIEvent, useLayoutEffect, useRef } from "react";
 
+import { agentLabel } from "../agent";
 import { getPullKey, type PullKey } from "../preferences";
 import { isTaskActive, type TaskState } from "../tasks";
 import { formatRelativeTime } from "../time";
@@ -34,7 +35,7 @@ const labels: Record<TaskPhase, string> = {
   preparing: "Creating worktree",
   pushing: "Pushing branch",
   queued: "Queued",
-  running: "Claude running",
+  running: "Running",
 };
 
 const phaseBadge = (
@@ -57,6 +58,12 @@ function TaskRow({
   const terminal = useRef<HTMLPreElement>(null);
   const follow = useRef(true);
   const active = isTaskActive(state.task);
+  const label = agentLabel(state.task.agent);
+  const codeLabel = state.task.agent === "codex" ? "Codex" : "Claude Code";
+  const phaseLabel =
+    state.task.phase === "running"
+      ? `${label} running`
+      : labels[state.task.phase];
   const identity = state.task.pullRequest
     ? getPullKey({
         number: state.task.pullRequest.number,
@@ -165,7 +172,7 @@ function TaskRow({
               data-icon="inline-start"
             />
           )}
-          {labels[state.task.phase]}
+          {phaseLabel}
         </Badge>
       </div>
     </div>
@@ -207,8 +214,8 @@ function TaskRow({
             {icon}
             <span className="sr-only" role="status">
               {active
-                ? `Task active: ${labels[state.task.phase]}`
-                : `Task status: ${labels[state.task.phase]}`}
+                ? `Task active: ${phaseLabel}`
+                : `Task status: ${phaseLabel}`}
             </span>
             <div className="min-w-0 flex-1 space-y-2">
               {headerBoundary}
@@ -226,7 +233,7 @@ function TaskRow({
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-xs font-medium text-muted-foreground">
-                      Claude output
+                      {label} output
                     </span>
                     {state.connectionError && active && (
                       <span
@@ -238,7 +245,7 @@ function TaskRow({
                     )}
                   </div>
                   <pre
-                    aria-label={`Claude output for ${state.task.title}`}
+                    aria-label={`${label} output for ${state.task.title}`}
                     aria-busy={active}
                     aria-live="polite"
                     className="max-h-56 min-h-20 overflow-auto rounded-xl bg-zinc-950 p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap text-zinc-100"
@@ -248,7 +255,7 @@ function TaskRow({
                     role="log"
                     tabIndex={0}
                   >
-                    {state.output || "Waiting for Claude Code…"}
+                    {state.output || `Waiting for ${codeLabel}…`}
                   </pre>
                 </div>
               )}

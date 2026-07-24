@@ -1,13 +1,20 @@
 import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { EventEmitter } from "node:events";
 import { createServer, request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { SnapshotError } from "../cache.mjs";
 import { CheckLogsError } from "../check-logs.mjs";
-import { ActionError } from "../claude.mjs";
+import {
+  ActionError,
+  createClaudeRunManager,
+  createRunCoordinator,
+  validateRunInput,
+} from "../claude.mjs";
 import { DiffError } from "../diff.mjs";
 import { GRAPHQL_MAX_BUFFER } from "../github.mjs";
 import { TaskError } from "../task.mjs";
@@ -173,6 +180,35 @@ function diff() {
   };
 }
 
+function commits() {
+  return {
+    baseRefOid: BASE,
+    commits: [
+      {
+        authorLogin: "viewer",
+        authorName: "Viewer",
+        authoredAt: "2026-07-24T00:00:00.000Z",
+        message: "Commit",
+        sha: HEAD,
+        url: `https://github.com/owner/repo/commit/${HEAD}`,
+      },
+    ],
+    complete: true,
+    count: 1,
+    headRefOid: HEAD,
+    number: 7,
+    repository: "owner/repo",
+    warning: null,
+  };
+}
+
+function commitDiff() {
+  return {
+    ...diff(),
+    commitSha: HEAD,
+  };
+}
+
 function releaseOptions() {
   return {
     generatedAt: "2026-07-21T00:00:00.000Z",
@@ -197,6 +233,13 @@ function recentReleases() {
     partial: false,
     releases: [],
     warnings: [],
+  };
+}
+
+function releasePipelines() {
+  return {
+    generatedAt: "2026-07-21T00:00:00.000Z",
+    releases: [],
   };
 }
 
@@ -543,7 +586,93 @@ describe("local action API", () => {
       { type: "diagnostic", text: "Claude Code started." },
       { type: "complete", exitCode: 0 },
     ]);
-    expect(runManager.start.mock.calls[0][0]).toEqual(body);
+    expect(runManager.start.mock.calls[0][0]).toEqual({
+      ...body,
+      agent: "claude",
+    });
+    await running.close();
+  });
+
+  it("keeps the legacy route Claude-only and forwards explicit providers through the neutral route", async () => {
+    const runManager = {
+      start: vi.fn(async (value, channel) => {
+        const input = validateRunInput(value);
+        channel.write({
+          type: "start",
+          agent: input.agent,
+          runId: `${input.agent}-run`,
+          repository: input.repository,
+          number: input.number,
+        });
+        channel.write({ type: "complete", exitCode: 0 });
+      }),
+      cancel: vi.fn(async () => true),
+    };
+    const running = await actionServer(runManager);
+    const headers = {
+      Origin: running.origin,
+      "X-Action-Token": "process-token",
+      "Content-Type": "application/json",
+    };
+    const base = {
+      repository: "owner/repo",
+      number: 1,
+      expectedHeadRefOid: "a".repeat(40),
+      message: "fix",
+    };
+
+    const neutral = await fetch(`${running.origin}/api/agents/runs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ...base, agent: "codex" }),
+    });
+    expect(neutral.status).toBe(200);
+    expect(
+      (await neutral.text()).trim().split("\n").map(JSON.parse)[0],
+    ).toEqual(expect.objectContaining({ agent: "codex" }));
+
+    const legacy = await fetch(`${running.origin}/api/claude/runs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ...base, agent: "codex" }),
+    });
+    expect(legacy.status).toBe(200);
+    expect((await legacy.text()).trim().split("\n").map(JSON.parse)[0]).toEqual(
+      expect.objectContaining({ agent: "claude" }),
+    );
+    expect(runManager.start.mock.calls[0][0]).toMatchObject({
+      agent: "codex",
+    });
+    expect(runManager.start.mock.calls[1][0]).toMatchObject({
+      agent: "claude",
+    });
+
+    for (const value of [{ ...base }, { ...base, agent: "other" }]) {
+      const response = await fetch(`${running.origin}/api/agents/runs`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(value),
+      });
+      expect(response.status).toBe(400);
+    }
+
+    for (const path of [
+      "/api/agents/runs/codex-run",
+      "/api/claude/runs/claude-run",
+    ]) {
+      expect(
+        (
+          await fetch(`${running.origin}${path}`, {
+            method: "DELETE",
+            headers: {
+              Origin: running.origin,
+              "X-Action-Token": "process-token",
+            },
+          })
+        ).status,
+      ).toBe(204);
+    }
+    expect(runManager.cancel).toHaveBeenCalledTimes(2);
     await running.close();
   });
 
@@ -588,6 +717,186 @@ describe("local action API", () => {
     await new Promise((resolve) => setImmediate(resolve));
     release();
     await eventually(() => expect(disconnected).toHaveBeenCalledOnce());
+    await running.close();
+  });
+
+  it("aborts real review preflight over HTTP, releases its reservation, cleans its workspace, and retries immediately", async () => {
+    const coordinator = createRunCoordinator({ limit: 1 });
+    const cleanups = [];
+    const children = [];
+    let authorizations = 0;
+    const reviewProof = (headRefOid = HEAD) => ({
+      authored: true,
+      authorLogin: "viewer",
+      available: true,
+      baseRefOid: BASE,
+      complete: true,
+      headRefName: "fix/review",
+      headRefOid,
+      headRepository: "owner/repo",
+      isCrossRepository: false,
+      number: 7,
+      open: true,
+      repository: "owner/repo",
+      state: "OPEN",
+      url: "https://github.com/owner/repo/pull/7",
+      viewerLogin: "viewer",
+      viewerPermission: "WRITE",
+    });
+    const loadReviewAuthorization = vi.fn((_input, signal) => {
+      authorizations += 1;
+      if (authorizations === 3) {
+        return new Promise((_resolve, reject) => {
+          const abort = () => reject(signal.reason);
+          if (signal.aborted) abort();
+          else signal.addEventListener("abort", abort, { once: true });
+        });
+      }
+      return Promise.resolve(
+        reviewProof(authorizations === 7 ? "f".repeat(40) : HEAD),
+      );
+    });
+    const diffService = {
+      invalidate: vi.fn(),
+      loadAuthorized: vi.fn(async () => ({
+        authorization: {
+          authorLogin: "viewer",
+          baseRefOid: BASE,
+          headRefOid: HEAD,
+          number: 7,
+          repository: "owner/repo",
+          url: "https://github.com/owner/repo/pull/7",
+          viewerLogin: "viewer",
+        },
+        diff: {
+          baseRefOid: BASE,
+          complete: true,
+          files: [
+            {
+              hunks: [
+                {
+                  lines: [
+                    {
+                      content: "changed",
+                      kind: "addition",
+                      newLine: 1,
+                      oldLine: null,
+                    },
+                  ],
+                },
+              ],
+              path: "src/example.js",
+              truncated: false,
+            },
+          ],
+          headRefOid: HEAD,
+          number: 7,
+          repository: "owner/repo",
+        },
+      })),
+    };
+    const resolver = {
+      clear: vi.fn(),
+      resolve: vi.fn(),
+      resolveReview: vi.fn(async () => {
+        const cleanup = vi.fn(async () => undefined);
+        cleanups.push(cleanup);
+        return {
+          branch: "fix/review",
+          cleanup,
+          cwd: `/trusted/review-${cleanups.length}`,
+          headRefOid: HEAD,
+          remote: "origin",
+          repository: "owner/repo",
+        };
+      }),
+      verifyReview: vi.fn(async (workspace) => ({
+        ...workspace,
+        headRefOid: "f".repeat(40),
+      })),
+    };
+    const spawn = vi.fn(() => {
+      const childProcess = new EventEmitter();
+      childProcess.pid = 321;
+      childProcess.stdout = new PassThrough();
+      childProcess.stderr = new PassThrough();
+      childProcess.kill = vi.fn();
+      children.push(childProcess);
+      return childProcess;
+    });
+    const runManager = createClaudeRunManager({
+      cache: { get: vi.fn() },
+      canonicalize: vi.fn(async (value) => value),
+      coordinator,
+      createId: () => "review-http-run",
+      createTemporary: vi.fn(async () => "/private/tmp/review-http-run"),
+      diffService,
+      loadPull: vi.fn(),
+      loadReviewAuthorization,
+      removeTemporary: vi.fn(async () => undefined),
+      resolver,
+      spawn,
+    });
+    const running = await actionServer(runManager);
+    const url = new URL(running.origin);
+    const body = JSON.stringify({
+      expectedBaseRefOid: BASE,
+      expectedHeadRefOid: HEAD,
+      feedback: {
+        body: "Handle the edge case.",
+        line: 1,
+        path: "src/example.js",
+        side: "RIGHT",
+      },
+      message: "",
+      number: 7,
+      repository: "owner/repo",
+      source: "review",
+    });
+    const headers = {
+      "Content-Length": Buffer.byteLength(body),
+      "Content-Type": "application/json",
+      Origin: running.origin,
+      "X-Action-Token": "process-token",
+    };
+    const outgoing = request({
+      headers,
+      host: url.hostname,
+      method: "POST",
+      path: "/api/claude/runs",
+      port: url.port,
+    });
+    outgoing.on("error", () => undefined);
+    outgoing.end(body);
+
+    await eventually(() =>
+      expect(loadReviewAuthorization).toHaveBeenCalledTimes(3),
+    );
+    outgoing.destroy();
+    await eventually(() => expect(cleanups[0]).toHaveBeenCalledOnce());
+    await eventually(() => expect(coordinator.activeCount()).toBe(0));
+    expect(spawn).not.toHaveBeenCalled();
+
+    const retry = await fetch(`${running.origin}/api/claude/runs`, {
+      body,
+      headers: {
+        "Content-Type": "application/json",
+        Origin: running.origin,
+        "X-Action-Token": "process-token",
+      },
+      method: "POST",
+    });
+    expect(retry.status).toBe(200);
+    expect(spawn).toHaveBeenCalledOnce();
+    children[0].emit("close", 0, null);
+    const events = (await retry.text()).trim().split("\n").map(JSON.parse);
+    expect(events[0]).toMatchObject({
+      runId: "review-http-run",
+      type: "start",
+    });
+    expect(events.at(-1)).toEqual({ exitCode: 0, type: "complete" });
+    await eventually(() => expect(cleanups[1]).toHaveBeenCalledOnce());
+    expect(coordinator.activeCount()).toBe(0);
     await running.close();
   });
 
@@ -642,6 +951,7 @@ describe("new task API", () => {
     updatedAt: "2026-07-22T00:00:00.000Z",
   };
   const task = {
+    agent: "claude",
     base: "main",
     branch: "puller/task-one",
     id: "task-one-123",
@@ -705,6 +1015,7 @@ describe("new task API", () => {
     const taskManager = manager();
     const running = await taskServer(taskManager);
     const body = {
+      agent: "claude",
       base: "main",
       id: "task-one-123",
       prompt: "Add the feature",
@@ -726,6 +1037,7 @@ describe("new task API", () => {
     const taskManager = manager();
     const running = await taskServer(taskManager);
     const valid = JSON.stringify({
+      agent: "claude",
       base: "main",
       id: "task-one-123",
       prompt: "Add it",
@@ -879,6 +1191,7 @@ describe("new task API", () => {
     const conflict = await taskServer(conflictManager);
     const conflictResponse = await fetch(`${conflict.origin}/api/tasks/runs`, {
       body: JSON.stringify({
+        agent: "claude",
         base: "main",
         id: "task-one-123",
         prompt: "Add it",
@@ -900,6 +1213,7 @@ describe("new task API", () => {
     const running = await taskServer(taskManager, false);
     const response = await fetch(`${running.origin}/api/tasks/runs`, {
       body: JSON.stringify({
+        agent: "claude",
         base: "main",
         id: "task-one-123",
         prompt: "Add it",
@@ -933,6 +1247,10 @@ describe("GitHub operations API", () => {
             runId,
           }),
         ),
+      },
+      commitsService: {
+        load: vi.fn(async () => commits()),
+        loadCommitDiff: vi.fn(async () => commitDiff()),
       },
       diffService: {
         load: vi.fn(async () => diff()),
@@ -1013,6 +1331,7 @@ describe("GitHub operations API", () => {
           url: `https://github.com/${repository}/releases/tag/${tag}`,
         })),
         getOptions: vi.fn(async () => releaseOptions()),
+        getPipelines: vi.fn(async () => releasePipelines()),
         getRecent: vi.fn(async () => recentReleases()),
       },
       releaseVerificationManager: {
@@ -1075,9 +1394,12 @@ describe("GitHub operations API", () => {
     const running = await operationServer();
     const paths = [
       "/api/pulls",
+      `/api/pulls/owner/repo/7/commits?base=${BASE}&head=${HEAD}`,
+      `/api/pulls/owner/repo/7/commits/${HEAD}?base=${BASE}&head=${HEAD}`,
       `/api/pulls/owner/repo/7/diff?base=${BASE}&head=${HEAD}`,
       `/api/pulls/owner/repo/7/checks/123/jobs/456/logs?baseRefOid=${BASE}&headRefOid=${HEAD}`,
       "/api/releases/options",
+      "/api/releases/pipelines",
       "/api/releases/recent",
       "/api/actions/token",
     ];
@@ -1104,6 +1426,7 @@ describe("GitHub operations API", () => {
     expect(running.checkLogsService.load).not.toHaveBeenCalled();
     expect(running.diffService.load).not.toHaveBeenCalled();
     expect(running.releaseService.getOptions).not.toHaveBeenCalled();
+    expect(running.releaseService.getPipelines).not.toHaveBeenCalled();
     expect(running.releaseService.getRecent).not.toHaveBeenCalled();
     await running.close();
   });
@@ -1115,6 +1438,7 @@ describe("GitHub operations API", () => {
       `/api/pulls/owner/repo/7/diff?base=${BASE}&head=${HEAD}`,
       `/api/pulls/owner/repo/7/checks/123/jobs/456/logs?baseRefOid=${BASE}&headRefOid=${HEAD}`,
       "/api/releases/options",
+      "/api/releases/pipelines",
       "/api/releases/recent",
       "/api/actions/token",
     ];
@@ -1134,6 +1458,7 @@ describe("GitHub operations API", () => {
     expect(running.checkLogsService.load).not.toHaveBeenCalled();
     expect(running.diffService.load).not.toHaveBeenCalled();
     expect(running.releaseService.getOptions).not.toHaveBeenCalled();
+    expect(running.releaseService.getPipelines).not.toHaveBeenCalled();
     expect(running.releaseService.getRecent).not.toHaveBeenCalled();
     await running.close();
   });
@@ -1297,6 +1622,36 @@ describe("GitHub operations API", () => {
     await running.close();
   });
 
+  it("loads a head-pinned commit list and an exact proven commit diff", async () => {
+    const running = await operationServer();
+    const query = `base=${BASE.toUpperCase()}&head=${HEAD.toUpperCase()}`;
+
+    const list = await fetch(
+      `${running.origin}/api/pulls/owner/repo/7/commits?${query}`,
+    );
+    const selected = await fetch(
+      `${running.origin}/api/pulls/owner/repo/7/commits/${HEAD.toUpperCase()}?${query}`,
+    );
+
+    expect(list.status).toBe(200);
+    await expect(list.json()).resolves.toEqual(commits());
+    expect(selected.status).toBe(200);
+    await expect(selected.json()).resolves.toEqual(commitDiff());
+    const identity = {
+      expectedBaseRefOid: BASE,
+      expectedHeadRefOid: HEAD,
+      number: 7,
+      repository: "owner/repo",
+      signal: expect.any(AbortSignal),
+    };
+    expect(running.commitsService.load).toHaveBeenCalledWith(identity);
+    expect(running.commitsService.loadCommitDiff).toHaveBeenCalledWith({
+      ...identity,
+      commitSha: HEAD,
+    });
+    await running.close();
+  });
+
   it.each([
     [
       "diff",
@@ -1358,6 +1713,14 @@ describe("GitHub operations API", () => {
     await expect(
       (await fetch(`${running.origin}/api/releases/recent?refresh=1`)).json(),
     ).resolves.toEqual(recentReleases());
+    await expect(
+      (await fetch(`${running.origin}/api/releases/pipelines`)).json(),
+    ).resolves.toEqual(releasePipelines());
+    await expect(
+      (
+        await fetch(`${running.origin}/api/releases/pipelines?refresh=1`)
+      ).json(),
+    ).resolves.toEqual(releasePipelines());
     await fetch(`${running.origin}/api/releases/options?refresh=1`);
     expect(running.releaseService.getOptions).toHaveBeenNthCalledWith(1, {
       refresh: false,
@@ -1368,6 +1731,12 @@ describe("GitHub operations API", () => {
     expect(running.releaseService.getRecent).toHaveBeenCalledWith({
       refresh: true,
     });
+    expect(running.releaseService.getPipelines).toHaveBeenNthCalledWith(1, {
+      refresh: false,
+    });
+    expect(running.releaseService.getPipelines).toHaveBeenNthCalledWith(2, {
+      refresh: true,
+    });
     await running.close();
   });
 
@@ -1376,7 +1745,10 @@ describe("GitHub operations API", () => {
     const response = await fetch(
       `${running.origin}/api/pulls/owner/repo/7/merge`,
       {
-        body: JSON.stringify({ expectedHeadRefOid: HEAD }),
+        body: JSON.stringify({
+          agent: "claude",
+          expectedHeadRefOid: HEAD,
+        }),
         headers: actionHeaders(running.origin),
         method: "POST",
       },
@@ -1391,6 +1763,7 @@ describe("GitHub operations API", () => {
       url: "https://github.com/owner/repo/pull/7",
     });
     expect(running.mergeService.merge).toHaveBeenCalledWith({
+      agent: "claude",
       expectedHeadRefOid: HEAD,
       number: 7,
       repository: "owner/repo",
@@ -1419,6 +1792,7 @@ describe("GitHub operations API", () => {
     const running = await operationServer();
     const body = {
       expectedLatestTag: "v1.2.3",
+      prerelease: false,
       repository: "owner/repo",
       tag: "v1.2.4",
     };
@@ -1435,6 +1809,50 @@ describe("GitHub operations API", () => {
       tag: "v1.2.4",
     });
     expect(running.releaseService.create).toHaveBeenCalledWith(body);
+    await running.close();
+  });
+
+  it("forwards pre-release creation and rejects incomplete or extra release input", async () => {
+    const running = await operationServer();
+    const prerelease = {
+      expectedLatestTag: "v1.2.3",
+      prerelease: true,
+      repository: "owner/repo",
+      tag: "v1.2.4-rc.1",
+    };
+    const created = await fetch(`${running.origin}/api/releases`, {
+      body: JSON.stringify(prerelease),
+      headers: actionHeaders(running.origin),
+      method: "POST",
+    });
+    expect(created.status).toBe(201);
+    expect(running.releaseService.create).toHaveBeenCalledWith(prerelease);
+
+    for (const body of [
+      {
+        expectedLatestTag: "v1.2.3",
+        repository: "owner/repo",
+        tag: "v1.2.4",
+      },
+      {
+        expectedLatestTag: "v1.2.3",
+        extra: true,
+        prerelease: false,
+        repository: "owner/repo",
+        tag: "v1.2.4",
+      },
+    ]) {
+      const response = await fetch(`${running.origin}/api/releases`, {
+        body: JSON.stringify(body),
+        headers: actionHeaders(running.origin),
+        method: "POST",
+      });
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toMatchObject({
+        code: "invalid_request",
+      });
+    }
+    expect(running.releaseService.create).toHaveBeenCalledTimes(1);
     await running.close();
   });
 
@@ -1560,6 +1978,7 @@ describe("GitHub operations API", () => {
     const mergeService = {
       merge: vi.fn(async () => ({
         action: {
+          agent: "claude",
           deduplicated: false,
           id: "repair-1",
           state: "repair_queued",
@@ -1576,7 +1995,10 @@ describe("GitHub operations API", () => {
     const running = await operationServer({ mergeService });
     const path = `${running.origin}/api/pulls/owner/repo/7/merge`;
     const unauthorized = await fetch(path, {
-      body: JSON.stringify({ expectedHeadRefOid: HEAD }),
+      body: JSON.stringify({
+        agent: "claude",
+        expectedHeadRefOid: HEAD,
+      }),
       headers: { "Content-Type": "application/json", Origin: running.origin },
       method: "POST",
     });
@@ -1584,7 +2006,10 @@ describe("GitHub operations API", () => {
     expect(mergeService.merge).not.toHaveBeenCalled();
 
     const accepted = await fetch(path, {
-      body: JSON.stringify({ expectedHeadRefOid: HEAD }),
+      body: JSON.stringify({
+        agent: "claude",
+        expectedHeadRefOid: HEAD,
+      }),
       headers: actionHeaders(running.origin),
       method: "POST",
     });
@@ -1600,6 +2025,7 @@ describe("GitHub operations API", () => {
   it("streams and cancels release verification through the dedicated manager", async () => {
     const running = await operationServer();
     const body = {
+      agent: "claude",
       headSha: HEAD,
       pullNumber: 7,
       pullUrl: "https://github.com/owner/repo/pull/7",
@@ -1639,7 +2065,12 @@ describe("GitHub operations API", () => {
 
   it("streams and cancels a server-owned whole-release verification batch", async () => {
     const running = await operationServer();
-    const body = { releaseId: "10", repository: "owner/repo", tag: "v1.2.4" };
+    const body = {
+      agent: "claude",
+      releaseId: "10",
+      repository: "owner/repo",
+      tag: "v1.2.4",
+    };
     const response = await fetch(
       `${running.origin}/api/releases/verifications`,
       {
@@ -1678,8 +2109,19 @@ describe("GitHub operations API", () => {
 
   it.each([
     [`/api/pulls/owner/repo/7/diff?base=${BASE}&head=${HEAD}`, "POST", "GET"],
+    [
+      `/api/pulls/owner/repo/7/commits?base=${BASE}&head=${HEAD}`,
+      "POST",
+      "GET",
+    ],
+    [
+      `/api/pulls/owner/repo/7/commits/${HEAD}?base=${BASE}&head=${HEAD}`,
+      "POST",
+      "GET",
+    ],
     ["/api/pulls/owner/repo/7/merge", "GET", "POST"],
     ["/api/releases/options", "POST", "GET"],
+    ["/api/releases/pipelines", "POST", "GET"],
     ["/api/releases/recent", "POST", "GET"],
     ["/api/releases", "GET", "POST"],
     ["/api/releases/verifications", "GET", "POST"],
@@ -1728,6 +2170,9 @@ describe("GitHub operations API", () => {
     expect(
       (await fetch(`${running.origin}/api/releases/recent?refresh=0`)).status,
     ).toBe(400);
+    expect(
+      (await fetch(`${running.origin}/api/releases/pipelines?refresh=0`)).status,
+    ).toBe(400);
     const merge = await fetch(
       `${running.origin}/api/pulls/owner/repo/7/merge`,
       {
@@ -1767,6 +2212,7 @@ describe("GitHub operations API", () => {
     const running = await operationServer();
     const releaseBody = JSON.stringify({
       expectedLatestTag: "v1.2.3",
+      prerelease: false,
       repository: "owner/repo",
       tag: "v1.2.4",
     });
@@ -1789,7 +2235,10 @@ describe("GitHub operations API", () => {
     const blocked = await fetch(
       `${disabled.origin}/api/pulls/owner/repo/7/merge`,
       {
-        body: JSON.stringify({ expectedHeadRefOid: HEAD }),
+        body: JSON.stringify({
+          agent: "claude",
+          expectedHeadRefOid: HEAD,
+        }),
         headers: actionHeaders(disabled.origin),
         method: "POST",
       },
@@ -1813,7 +2262,10 @@ describe("GitHub operations API", () => {
     const action = await fetch(
       `${running.origin}/api/pulls/owner/repo/7/merge`,
       {
-        body: JSON.stringify({ expectedHeadRefOid: HEAD }),
+        body: JSON.stringify({
+          agent: "claude",
+          expectedHeadRefOid: HEAD,
+        }),
         headers: actionHeaders(running.origin),
         method: "POST",
       },
@@ -2057,6 +2509,7 @@ describe("server startup", () => {
     const authorizer = {
       authorizeFailedCheck: vi.fn(),
       authorizePull: vi.fn(),
+      authorizePullCommits: vi.fn(),
     };
     const checkLogsService = { load: vi.fn() };
     const diffService = { load: vi.fn(), loadAuthorized: vi.fn() };
@@ -2093,6 +2546,7 @@ describe("server startup", () => {
         loadCheckAuthorization: vi.fn(),
         loadPull: vi.fn(),
         loadPullAuthorization: vi.fn(),
+        loadPullCommitsAuthorization: vi.fn(),
       },
       createManager: (options) => {
         fixCoordinator = options.coordinator;
@@ -2131,6 +2585,7 @@ describe("server startup", () => {
     expect(createAuthorization).toHaveBeenCalledWith({
       loadCheckAuthorization: running.loader.loadCheckAuthorization,
       loadPullAuthorization: running.loader.loadPullAuthorization,
+      loadPullCommitsAuthorization: running.loader.loadPullCommitsAuthorization,
       peek: running.cache.peek,
     });
     expect(createCheckLogs).toHaveBeenCalledWith({
@@ -2226,6 +2681,7 @@ describe("server startup", () => {
 
     await expect(
       running.mergeService.merge({
+        agent: "claude",
         expectedHeadRefOid: HEAD,
         number: 7,
         repository: "owner/repo",

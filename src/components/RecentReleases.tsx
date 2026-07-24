@@ -4,6 +4,10 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  CircleCheck,
+  CircleDashed,
+  CircleX,
+  Clock3,
   ExternalLink,
   LoaderCircle,
   RefreshCw,
@@ -11,9 +15,12 @@ import {
   Square,
 } from "lucide-react";
 
+import { agentLabel } from "@/agent";
 import type {
+  Agent,
   RecentRelease,
   RecentReleasesResponse,
+  ReleasePipelineRunState,
   ReleasedPull,
 } from "@/types";
 import { formatRelativeTime } from "@/time";
@@ -53,6 +60,7 @@ import {
 } from "@/components/ui/tooltip";
 
 type RecentReleasesProps = {
+  agent?: Agent;
   data: RecentReleasesResponse | null;
   error: string | null;
   loading: boolean;
@@ -83,6 +91,187 @@ export type DateReleaseGroup = {
   label: string;
   releases: RecentRelease[];
 };
+
+type PipelinePresentation = {
+  className: string;
+  icon: typeof CircleDashed;
+  label: string;
+  spin?: boolean;
+};
+
+const pipelinePresentation = (
+  state: ReleasePipelineRunState,
+  updatedAt: string,
+  name: string,
+): PipelinePresentation => {
+  const deployment = /\bdeploy(?:ed|ing|ment)?\b/i.test(name);
+  if (state === "succeeded") {
+    return {
+      className:
+        "border-emerald-600/25 bg-emerald-500/8 text-emerald-700 dark:text-emerald-300",
+      icon: CircleCheck,
+      label: `${deployment ? "Deployed" : "Succeeded"} ${formatRelativeTime(updatedAt)}`,
+    };
+  }
+  if (state === "running") {
+    return {
+      className:
+        "border-amber-600/25 bg-amber-500/8 text-amber-700 dark:text-amber-300",
+      icon: LoaderCircle,
+      label: deployment ? "Deploying" : "Running",
+      spin: true,
+    };
+  }
+  if (state === "queued") {
+    return {
+      className:
+        "border-amber-600/25 bg-amber-500/8 text-amber-700 dark:text-amber-300",
+      icon: Clock3,
+      label: "Queued",
+    };
+  }
+  if (state === "failed") {
+    return {
+      className: "border-destructive/25 bg-destructive/8 text-destructive",
+      icon: CircleX,
+      label: "Failed",
+    };
+  }
+  if (state === "timed-out") {
+    return {
+      className: "border-destructive/25 bg-destructive/8 text-destructive",
+      icon: Clock3,
+      label: "Timed out",
+    };
+  }
+  if (state === "action-required") {
+    return {
+      className: "border-destructive/25 bg-destructive/8 text-destructive",
+      icon: CircleX,
+      label: "Action required",
+    };
+  }
+  if (state === "stale") {
+    return {
+      className: "border-border bg-muted/45 text-muted-foreground",
+      icon: CircleDashed,
+      label: "Stale",
+    };
+  }
+  if (state === "cancelled") {
+    return {
+      className: "border-border bg-muted/45 text-muted-foreground",
+      icon: CircleX,
+      label: "Cancelled",
+    };
+  }
+  if (state === "skipped") {
+    return {
+      className: "border-border bg-muted/45 text-muted-foreground",
+      icon: CircleDashed,
+      label: "Skipped",
+    };
+  }
+  if (state === "neutral") {
+    return {
+      className: "border-border bg-muted/45 text-muted-foreground",
+      icon: CircleDashed,
+      label: "Neutral",
+    };
+  }
+  return {
+    className: "border-border bg-muted/45 text-muted-foreground",
+    icon: CircleDashed,
+    label: "Unknown",
+  };
+};
+
+const preciseDate = (value: string): string => {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+};
+
+function PipelineStatus({ release }: { release: RecentRelease }) {
+  const pipeline = release.pipeline;
+  if (pipeline.runs.length === 0) {
+    if (pipeline.lookup === "complete") return null;
+    const pending = pipeline.lookup === "pending";
+    return (
+      <span
+        aria-live="polite"
+        className={`inline-flex items-center gap-1 text-[11px] ${
+          pending
+            ? "text-amber-700 dark:text-amber-300"
+            : "text-muted-foreground"
+        }`}
+        data-release-pipeline-empty={pipeline.lookup}
+        role="status"
+      >
+        {pending ? (
+          <Clock3 aria-hidden="true" className="size-3" />
+        ) : (
+          <CircleDashed aria-hidden="true" className="size-3" />
+        )}
+        {pending ? "Waiting for pipeline" : "Pipeline status unavailable"}
+      </span>
+    );
+  }
+
+  return (
+    <span
+      aria-live="polite"
+      className="inline-flex min-w-0 max-w-full flex-wrap items-center gap-1"
+      data-release-pipeline=""
+    >
+      {pipeline.runs.map((run) => {
+        const presentation = pipelinePresentation(
+          run.state,
+          run.updatedAt,
+          run.name,
+        );
+        const Icon = presentation.icon;
+        const description = `${run.name}: ${presentation.label}, attempt ${run.attempt}, updated ${preciseDate(run.updatedAt)}`;
+        return (
+          <Tooltip key={`${run.path}:${run.attempt}:${run.url}`}>
+            <TooltipTrigger asChild>
+              <a
+                aria-label={description}
+                className={`release-pipeline-chip inline-flex h-5 min-w-0 max-w-full items-center gap-1 rounded-full border px-1.5 text-[10px] leading-none font-medium underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${presentation.className}`}
+                data-pipeline-state={run.state}
+                href={run.url}
+                rel="noopener noreferrer"
+                target="_blank"
+                title={description}
+              >
+                <Icon
+                  aria-hidden="true"
+                  className={`size-3 shrink-0 ${
+                    presentation.spin
+                      ? "animate-spin motion-reduce:animate-none"
+                      : ""
+                  }`}
+                />
+                <span className="min-w-0 truncate">{run.name}</span>
+                <span className="shrink-0">{presentation.label}</span>
+              </a>
+            </TooltipTrigger>
+            <TooltipContent side="top">{description}</TooltipContent>
+          </Tooltip>
+        );
+      })}
+      {pipeline.lookup === "unavailable" && (
+        <span
+          className="inline-flex items-center gap-1 text-[10px] text-muted-foreground"
+          data-release-pipeline-stale=""
+          title={`Pipeline status last checked ${preciseDate(pipeline.checkedAt)}`}
+        >
+          <CircleDashed aria-hidden="true" className="size-3" />
+          Status unavailable
+        </span>
+      )}
+    </span>
+  );
+}
 
 const localDate = (value: Date): string =>
   [
@@ -152,15 +341,16 @@ function VerificationTerminal({
   }, [state.output, state.status]);
 
   if (state.status === "idle") return null;
+  const label = agentLabel(state.agent);
 
   return (
     <div className="mt-2 overflow-hidden rounded-lg border bg-zinc-950 text-zinc-100 dark:bg-black">
       <div className="flex items-center justify-between gap-3 border-b border-white/10 px-2.5 py-1.5 text-[11px] text-zinc-400">
-        <span>Claude verification</span>
+        <span>{label} verification</span>
         <span aria-live="polite">{statusLabels[state.status]}</span>
       </div>
       <pre
-        aria-label={`Claude verification output for ${pull.repository} #${pull.number}`}
+        aria-label={`${label} verification output for ${pull.repository} #${pull.number}`}
         aria-live="polite"
         className="max-h-56 min-h-16 overflow-auto p-2.5 font-mono text-[11px] leading-relaxed whitespace-pre-wrap"
         ref={terminal}
@@ -169,7 +359,7 @@ function VerificationTerminal({
       >
         {state.output ||
           (state.status === "starting"
-            ? "Starting Claude verification…"
+            ? `Starting ${label} verification…`
             : "Waiting for output…")}
       </pre>
     </div>
@@ -252,11 +442,13 @@ function ReleasedPullRow({
   release,
   run,
   batchActive,
+  directActive,
   cancel,
   start,
 }: {
   cancel: (key: string) => Promise<void>;
   batchActive: boolean;
+  directActive: boolean;
   pull: ReleasedPull;
   release: RecentRelease;
   run: VerificationRunState;
@@ -297,7 +489,7 @@ function ReleasedPullRow({
               !supported
                 ? "Verification requires a listed pull request and available release membership."
                 : release.source === "notes-fallback"
-                  ? "Discovered from GitHub release notes. Verify will recheck exact adjacent-tag membership before Claude runs."
+                  ? "Discovered from GitHub release notes. Verify will recheck exact adjacent-tag membership before the selected agent runs."
                   : undefined
             }
             type="button"
@@ -314,7 +506,7 @@ function ReleasedPullRow({
                 ? "Verify"
                 : "Verify again"}
           </Button>
-          {active && !batchActive && (
+          {active && (directActive || !batchActive) && (
             <Button
               aria-label={`Cancel verification for ${pull.repository} #${pull.number}`}
               disabled={run.cancelling}
@@ -347,7 +539,13 @@ function ReleaseGroup({
     batches.states.get(releaseVerificationKey(release)) ??
     IDLE_RELEASE_VERIFICATION_STATE;
   const batchActive = batch.status === "starting" || batch.status === "running";
-  const disabledReason = verifyAllDisabledReason(release, batchActive);
+  const directActive = release.pulls.some((pull) =>
+    isVerificationActive(runs.states.get(verificationKey(release, pull))),
+  );
+  const disabledReason = verifyAllDisabledReason(
+    release,
+    batchActive || directActive,
+  );
   const disabledReasonId = useId();
   const pullListId = useId();
   const [open, setOpen] = useState(false);
@@ -357,6 +555,7 @@ function ReleaseGroup({
   const pullCount = release.pulls.length;
   const pullLabel = pullCount === 1 ? "pull request" : "pull requests";
   const startBatch = (): void => {
+    if (directActive) return;
     setIndividual(new Set());
     void batches.start(release);
   };
@@ -392,20 +591,23 @@ function ReleaseGroup({
               </Badge>
               <ProvenanceBadge release={release} />
             </div>
-            <p className="mt-1 flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
-              <a
-                className="min-w-0 truncate underline-offset-4 hover:text-foreground hover:underline"
-                href={release.repositoryUrl}
-                rel="noreferrer"
-                target="_blank"
-              >
-                {release.repository}
-              </a>
-              <span aria-hidden="true">·</span>
-              <time dateTime={release.publishedAt}>
-                {formatRelativeTime(release.publishedAt)}
-              </time>
-            </p>
+            <div className="mt-1 flex min-w-0 max-w-full flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
+              <span className="inline-flex min-w-0 items-center gap-1.5">
+                <a
+                  className="min-w-0 truncate underline-offset-4 hover:text-foreground hover:underline"
+                  href={release.repositoryUrl}
+                  rel="noreferrer"
+                  target="_blank"
+                >
+                  {release.repository}
+                </a>
+                <span aria-hidden="true">·</span>
+                <time className="shrink-0" dateTime={release.publishedAt}>
+                  {formatRelativeTime(release.publishedAt)}
+                </time>
+              </span>
+              <PipelineStatus release={release} />
+            </div>
           </div>
           <CardAction className="flex max-w-full shrink-0 flex-wrap items-center justify-end gap-1.5 self-center">
             <Badge
@@ -519,15 +721,18 @@ function ReleaseGroup({
                   const key = verificationKey(release, pull);
                   const direct = runs.states.get(key);
                   const batched = batches.pullStates.get(key);
+                  const activeDirect =
+                    direct !== undefined && isVerificationActive(direct);
                   return (
                     <ReleasedPullRow
                       batchActive={batchActive}
                       cancel={runs.cancel}
+                      directActive={activeDirect}
                       key={pull.url}
                       pull={pull}
                       release={release}
                       run={
-                        individual.has(key)
+                        activeDirect || individual.has(key)
                           ? (direct ?? IDLE_VERIFICATION_STATE)
                           : (batched ?? direct ?? IDLE_VERIFICATION_STATE)
                       }
@@ -556,6 +761,7 @@ function ReleaseGroup({
 }
 
 export default function RecentReleases({
+  agent = "claude",
   data,
   error,
   loading,
@@ -569,10 +775,12 @@ export default function RecentReleases({
     releases.length > PAGE_SIZE
       ? releases.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE)
       : releases;
-  const runs = useVerificationRuns(releases, data?.partial !== true);
+  const runs = useVerificationRuns(releases, data?.partial !== true, agent);
   const batches = useReleaseVerificationBatches(
     releases,
     data?.partial !== true,
+    agent,
+    runs.states,
   );
   const dates = groupReleasesByDate(paginated);
   const headingId = "recent-releases-heading";
@@ -746,7 +954,7 @@ export default function RecentReleases({
                       {date.releases.length}
                     </Badge>
                   </header>
-                  <div className="grid gap-2">
+                  <div className="grid gap-2 pl-1">
                     {date.releases.map((release) => (
                       <ReleaseGroup
                         batches={batches}

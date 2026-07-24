@@ -15,10 +15,11 @@ const BASE = "1234567890abcdef1234567890abcdef12345678";
 const HEAD = "abcdef0123456789abcdef0123456789abcdef01";
 const NEXT = "fedcba9876543210fedcba9876543210fedcba98";
 const VERIFICATION_FAILURE =
-  "Review verification failed after Claude Code exited successfully. Its push may have succeeded. Refresh the pull request before retrying.";
+  "Review verification failed after the agent exited successfully. Its push may have succeeded. Refresh the pull request before retrying.";
 
 function input(overrides = {}) {
   return {
+    agent: "claude",
     expectedBaseRefOid: BASE,
     expectedHeadRefOid: HEAD,
     feedback: {
@@ -132,7 +133,7 @@ function stream() {
 
 function fixture(overrides = {}) {
   const process = overrides.child ?? child();
-  const spawn = vi.fn(() => process);
+  const spawn = overrides.spawn ?? vi.fn(() => process);
   const loadReviewAuthorization =
     overrides.loadReviewAuthorization ??
     vi
@@ -147,6 +148,7 @@ function fixture(overrides = {}) {
   };
   const workspace = {
     branch: "fix/review",
+    cleanup: vi.fn(async () => undefined),
     cwd: "/trusted/workspace",
     headRefOid: HEAD,
     remote: "origin",
@@ -184,6 +186,17 @@ function fixture(overrides = {}) {
     ...(overrides.reviewPreflightTimeout === undefined
       ? {}
       : { reviewPreflightTimeout: overrides.reviewPreflightTimeout }),
+    ...(overrides.reviewCleanupTimeout === undefined
+      ? {}
+      : { reviewCleanupTimeout: overrides.reviewCleanupTimeout }),
+    ...(overrides.reportDiagnostic === undefined
+      ? {}
+      : { reportDiagnostic: overrides.reportDiagnostic }),
+    ...(overrides.prepareCodex === undefined
+      ? {}
+      : { prepareCodex: overrides.prepareCodex }),
+    ...(overrides.git === undefined ? {} : { git: overrides.git }),
+    ...(overrides.runtime === undefined ? {} : { runtime: overrides.runtime }),
     removeTemporary: vi.fn(async () => undefined),
     resolver,
     spawn,
@@ -196,10 +209,70 @@ function fixture(overrides = {}) {
     refreshReadiness,
     resolver,
     spawn,
+    workspace,
   };
 }
 
 describe("review Claude runs", () => {
+  it("lets Codex edit while Puller commits and normally pushes the review fix", async () => {
+    const process = child();
+    process.stdin = new PassThrough();
+    vi.spyOn(process.stdin, "end");
+    const cleanup = vi.fn(async () => undefined);
+    const prepareCodex = vi.fn(async () => ({
+      args: ["exec", "--json", "-"],
+      cleanup,
+      command: "/opt/homebrew/bin/codex",
+      cwd: "/protected/control",
+      environment: {},
+      prompt: "trusted review prompt",
+    }));
+    let statuses = 0;
+    const git = vi.fn(async (_command, arguments_) => {
+      if (arguments_.includes("rev-parse")) {
+        return { stderr: "", stdout: `${HEAD}\n` };
+      }
+      if (arguments_.includes("status")) {
+        statuses += 1;
+        return {
+          stderr: "",
+          stdout: statuses === 1 ? " M src/example.js\n" : "",
+        };
+      }
+      return { stderr: "", stdout: "" };
+    });
+    const running = fixture({ child: process, git, prepareCodex });
+    const output = stream();
+    const started = await running.manager.start(
+      input({ agent: "codex" }),
+      output.value,
+    );
+
+    expect(prepareCodex).toHaveBeenCalledWith(
+      expect.objectContaining({
+        purpose: "review",
+        target: "/trusted/workspace",
+      }),
+    );
+    expect(process.stdin.end).toHaveBeenCalledWith("trusted review prompt");
+    process.stdout.write(
+      '{"type":"item.completed","item":{"type":"agent_message","text":"Done."}}\n',
+    );
+    process.stdout.write('{"type":"turn.completed"}\n');
+    process.emit("close", 0, null);
+    await started.done;
+
+    expect(output.events.at(-1)).toEqual({ type: "complete", exitCode: 0 });
+    expect(
+      git.mock.calls.some(
+        ([, arguments_]) =>
+          arguments_.includes("push") &&
+          arguments_.includes("HEAD:refs/heads/fix/review"),
+      ),
+    ).toBe(true);
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
   it("uses dangerous permissions only for review runs", () => {
     const review = reviewClaudeArguments("prompt");
     const fix = claudeArguments(
@@ -256,6 +329,15 @@ describe("review Claude runs", () => {
       CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
       ENABLE_CLAUDEAI_MCP_SERVERS: "false",
       ENABLE_TOOL_SEARCH: "false",
+      GIT_ATTR_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+      GIT_NO_REPLACE_OBJECTS: "1",
+      GIT_OPTIONAL_LOCKS: "0",
+      GIT_SSH_COMMAND:
+        "ssh -oBatchMode=yes -oConnectTimeout=15 -oStrictHostKeyChecking=yes",
+      GIT_TERMINAL_PROMPT: "0",
       HOME: "/Users/test",
       PATH: "/usr/bin:/bin",
       SSH_AUTH_SOCK: "/private/tmp/agent.sock",
@@ -281,6 +363,7 @@ describe("review Claude runs", () => {
     });
     expect(running.refreshReadiness).toHaveBeenCalledOnce();
     expect(channel.events.at(-1)).toEqual({ type: "complete", exitCode: 0 });
+    expect(running.workspace.cleanup).toHaveBeenCalledOnce();
   });
 
   it("rejects stale or truncated anchors before spawning Claude", async () => {
@@ -304,11 +387,13 @@ describe("review Claude runs", () => {
   });
 
   it("warns that a push may have succeeded when local post-push proof fails", async () => {
+    const cleanup = vi.fn(async () => undefined);
     const resolver = {
       clear: vi.fn(),
       resolve: vi.fn(),
       resolveReview: vi.fn(async () => ({
         branch: "fix/review",
+        cleanup,
         cwd: "/trusted/workspace",
         headRefOid: HEAD,
         remote: "origin",
@@ -334,6 +419,7 @@ describe("review Claude runs", () => {
     ).toEqual([{ message: VERIFICATION_FAILURE, type: "error" }]);
     expect(running.loadReviewAuthorization).toHaveBeenCalledTimes(3);
     expect(running.refreshReadiness).not.toHaveBeenCalled();
+    expect(cleanup).toHaveBeenCalledOnce();
   });
 
   it("warns that a push may have succeeded when GitHub post-push proof fails", async () => {
@@ -357,6 +443,245 @@ describe("review Claude runs", () => {
       ),
     ).toEqual([{ message: VERIFICATION_FAILURE, type: "error" }]);
     expect(running.refreshReadiness).not.toHaveBeenCalled();
+    expect(running.workspace.cleanup).toHaveBeenCalledOnce();
+  });
+
+  it("cleans a provisioned workspace when final preflight authorization fails and allows an immediate retry", async () => {
+    const coordinator = createRunCoordinator({ limit: 1 });
+    const loadReviewAuthorization = vi
+      .fn()
+      .mockResolvedValueOnce(proof())
+      .mockResolvedValueOnce(proof())
+      .mockResolvedValueOnce(proof(HEAD, { headRefName: "other/branch" }))
+      .mockResolvedValueOnce(proof())
+      .mockResolvedValueOnce(proof())
+      .mockResolvedValueOnce(proof())
+      .mockResolvedValueOnce(proof(NEXT));
+    const running = fixture({ coordinator, loadReviewAuthorization });
+
+    await expect(
+      running.manager.start(input(), stream().value),
+    ).rejects.toMatchObject({ code: "review_identity_changed" });
+    expect(running.workspace.cleanup).toHaveBeenCalledOnce();
+    expect(coordinator.activeCount()).toBe(0);
+
+    const retry = await running.manager.start(input(), stream().value);
+    running.process.emit("close", 0, null);
+    await retry.done;
+    expect(running.spawn).toHaveBeenCalledOnce();
+    expect(running.workspace.cleanup).toHaveBeenCalledTimes(2);
+    expect(coordinator.activeCount()).toBe(0);
+  });
+
+  it("cleans a provisioned workspace when process startup throws", async () => {
+    const spawn = vi.fn(() => {
+      throw new Error("spawn failed");
+    });
+    const running = fixture({ spawn });
+
+    await expect(
+      running.manager.start(input(), stream().value),
+    ).rejects.toThrow("spawn failed");
+    expect(running.workspace.cleanup).toHaveBeenCalledOnce();
+    expect(running.manager.activeCount()).toBe(0);
+    expect(running.manager.activeWorkspaceCount()).toBe(0);
+  });
+
+  it("surfaces a path-redacted cleanup rejection after preflight and releases every reservation", async () => {
+    const coordinator = createRunCoordinator({ limit: 1 });
+    const spawn = vi.fn(() => {
+      throw new Error("spawn failed");
+    });
+    const running = fixture({ coordinator, spawn });
+    running.workspace.cleanup.mockRejectedValueOnce(
+      new Error("rm /private/tmp/puller-review-secret failed"),
+    );
+
+    await expect(
+      running.manager.start(input(), stream().value),
+    ).rejects.toMatchObject({
+      code: "review_workspace_cleanup_failed",
+      message: expect.not.stringContaining("/private/tmp"),
+    });
+    expect(running.workspace.cleanup).toHaveBeenCalledOnce();
+    expect(running.manager.activeCount()).toBe(0);
+    expect(running.manager.activeWorkspaceCount()).toBe(0);
+    expect(coordinator.activeCount()).toBe(0);
+    expect(coordinator.activeWorkspaceCount()).toBe(0);
+  });
+
+  it("reports terminal cleanup rejection instead of treating the review run as successful", async () => {
+    const coordinator = createRunCoordinator({ limit: 1 });
+    const running = fixture({ coordinator });
+    running.workspace.cleanup.mockRejectedValueOnce(
+      new Error("rm /private/tmp/puller-review-secret failed"),
+    );
+    const channel = stream();
+    const started = await running.manager.start(input(), channel.value);
+
+    running.process.emit("close", 0, null);
+    await started.done;
+
+    expect(channel.events.at(-1)).toEqual({
+      message:
+        "The agent finished, but Puller could not remove its isolated review workspace. Its push may have succeeded. The run reservation was released.",
+      type: "error",
+    });
+    expect(channel.events).not.toContainEqual({
+      type: "complete",
+      exitCode: 0,
+    });
+    expect(coordinator.activeCount()).toBe(0);
+  });
+
+  it("bounds terminal cleanup when the filesystem operation never settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const coordinator = createRunCoordinator({ limit: 1 });
+      const running = fixture({
+        coordinator,
+        reviewCleanupTimeout: 10,
+      });
+      running.workspace.cleanup.mockImplementationOnce(
+        () => new Promise(() => undefined),
+      );
+      const channel = stream();
+      const started = await running.manager.start(input(), channel.value);
+
+      running.process.emit("close", 0, null);
+      await vi.advanceTimersByTimeAsync(10);
+      await started.done;
+
+      expect(channel.events.at(-1)).toMatchObject({
+        message: expect.stringContaining(
+          "could not remove its isolated review workspace",
+        ),
+        type: "error",
+      });
+      expect(coordinator.activeCount()).toBe(0);
+      expect(coordinator.activeWorkspaceCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits for review verification before cleaning a terminal workspace", async () => {
+    let releaseVerification;
+    const verification = new Promise((resolve) => {
+      releaseVerification = resolve;
+    });
+    const running = fixture({
+      resolver: {
+        clear: vi.fn(),
+        resolve: vi.fn(),
+        resolveReview: vi.fn(async () => ({
+          branch: "fix/review",
+          cleanup: vi.fn(async () => undefined),
+          cwd: "/trusted/workspace",
+          headRefOid: HEAD,
+          remote: "origin",
+          repository: "owner/repo",
+        })),
+        verifyReview: vi.fn(async () => {
+          await verification;
+          return { headRefOid: NEXT };
+        }),
+      },
+    });
+    const started = await running.manager.start(input(), stream().value);
+    running.process.emit("close", 0, null);
+
+    await vi.waitFor(() =>
+      expect(running.resolver.verifyReview).toHaveBeenCalledOnce(),
+    );
+    const proof = await running.resolver.resolveReview.mock.results[0].value;
+    expect(proof.cleanup).not.toHaveBeenCalled();
+    releaseVerification();
+    await started.done;
+    expect(proof.cleanup).toHaveBeenCalledOnce();
+  });
+
+  it("cleans once when client cancellation and child termination race", async () => {
+    const running = fixture();
+    const channel = stream();
+    const started = await running.manager.start(input(), channel.value);
+
+    channel.close();
+    running.process.emit("error", new Error("child failed while closing"));
+    running.process.emit("close", null, "SIGTERM");
+    await started.done;
+
+    expect(running.workspace.cleanup).toHaveBeenCalledOnce();
+    expect(running.manager.activeCount()).toBe(0);
+  });
+
+  it("cleans a provisioned workspace when final preflight authorization times out", async () => {
+    const coordinator = createRunCoordinator({ limit: 1 });
+    const loadReviewAuthorization = vi
+      .fn()
+      .mockResolvedValueOnce(proof())
+      .mockResolvedValueOnce(proof())
+      .mockImplementationOnce(() => new Promise(() => undefined));
+    const running = fixture({
+      coordinator,
+      loadReviewAuthorization,
+      reviewPreflightTimeout: 10,
+    });
+
+    await expect(
+      running.manager.start(input(), stream().value),
+    ).rejects.toMatchObject({ code: "review_preflight_timeout" });
+    expect(running.workspace.cleanup).toHaveBeenCalledOnce();
+    expect(running.spawn).not.toHaveBeenCalled();
+    expect(coordinator.activeCount()).toBe(0);
+  });
+
+  it("cleans a review workspace after a nonzero child exit", async () => {
+    const running = fixture();
+    const channel = stream();
+    const started = await running.manager.start(input(), channel.value);
+
+    running.process.emit("close", 1, null);
+    await started.done;
+
+    expect(channel.events.at(-1)).toEqual({
+      message: "Claude Code exited with an error.",
+      type: "error",
+    });
+    expect(running.workspace.cleanup).toHaveBeenCalledOnce();
+  });
+
+  it("cleans a review workspace after its runtime limit", async () => {
+    vi.useFakeTimers();
+    try {
+      const running = fixture({ runtime: 10 });
+      const channel = stream();
+      const started = await running.manager.start(input(), channel.value);
+
+      await vi.advanceTimersByTimeAsync(10);
+      expect(channel.events.at(-1)).toEqual({
+        message: "Claude Code exceeded the run time limit.",
+        type: "limit",
+      });
+      running.process.emit("close", null, "SIGTERM");
+      await started.done;
+      expect(running.workspace.cleanup).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cleans a review workspace during manager shutdown", async () => {
+    const running = fixture();
+    const started = await running.manager.start(input(), stream().value);
+
+    const shutdown = running.manager.shutdown();
+    running.process.emit("close", null, "SIGTERM");
+    await shutdown;
+    await started.done;
+
+    expect(running.workspace.cleanup).toHaveBeenCalledOnce();
+    expect(running.manager.activeCount()).toBe(0);
   });
 
   it("aborts pending authorization immediately when the client closes", async () => {

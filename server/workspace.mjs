@@ -11,29 +11,36 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
 const execFile = promisify(executeFile);
 const GITHUB = "github.com";
 const SHA = /^[a-f0-9]{40}$/i;
+const DEFAULT_REVIEW_CLEANUP_TIMEOUT = 30_000;
 const DEFAULT_REVIEW_COMMAND_TIMEOUT = 30_000;
+const REVIEW_DIRECTORY_PREFIX = "review-";
+const REVIEW_ROOT_MODE = 0o700;
+const REVIEW_WORKSPACE_CLEANUP_FAILURE =
+  "The review workspace could not be removed safely.";
 const REVIEW_SSH_COMMAND =
   "ssh -oBatchMode=yes -oConnectTimeout=15 -oStrictHostKeyChecking=yes";
-const REVIEW_GIT_ENVIRONMENT = new Set([
-  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-  "GIT_ATTR_SOURCE",
-  "GIT_CEILING_DIRECTORIES",
-  "GIT_COMMON_DIR",
-  "GIT_CONFIG_COUNT",
-  "GIT_CONFIG_PARAMETERS",
-  "GIT_DIR",
-  "GIT_INDEX_FILE",
-  "GIT_OBJECT_DIRECTORY",
-  "GIT_REPLACE_REF_BASE",
-  "GIT_SHALLOW_FILE",
-  "GIT_WORK_TREE",
+const REVIEW_GIT_ENVIRONMENT = Object.freeze([
+  "HOME",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "LOGNAME",
+  "PATH",
+  "SHELL",
+  "SSH_AUTH_SOCK",
+  "TERM",
+  "TMP",
+  "TMPDIR",
+  "TEMP",
+  "USER",
+  "__CF_USER_TEXT_ENCODING",
 ]);
 const SAFE_GIT_CONFIGURATION = Object.freeze([
   "-c",
@@ -130,7 +137,11 @@ export function resolveWorkspaceOptions(
   home = homedir(),
 ) {
   const task = resolveTaskWorkspaceOptions(environment, home);
+  const base = resolve(environment.PULLER_TASK_ROOT || join(home, ".puller"));
   return {
+    reviewRoot: resolve(
+      environment.PULLER_REVIEW_WORKSPACE_ROOT || join(base, "reviews"),
+    ),
     roots: [
       ...new Set([
         ...splitRoots(environment.ACTION_WORKSPACE_ROOTS, home),
@@ -430,6 +441,197 @@ async function inspectCandidate(run, roots, candidate, options = {}) {
   };
 }
 
+async function inspectSourceCandidate(run, roots, candidate, options = {}) {
+  const top = await command(
+    run,
+    candidate,
+    ["rev-parse", "--show-toplevel"],
+    options,
+  );
+  if (!top) return null;
+
+  const cwd = await canonicalPath(top);
+  if (!cwd || !roots.some((root) => isInside(root, cwd))) return null;
+
+  const common = await command(
+    run,
+    cwd,
+    ["rev-parse", "--git-common-dir"],
+    options,
+  );
+  const git = await command(
+    run,
+    cwd,
+    ["rev-parse", "--absolute-git-dir"],
+    options,
+  );
+  const commonDirectory = await canonicalGitPath(common, cwd);
+  const gitDirectory = await canonicalGitPath(git, cwd);
+  if (
+    !commonDirectory ||
+    !gitDirectory ||
+    !roots.some((root) => isInside(root, commonDirectory)) ||
+    !roots.some((root) => isInside(root, gitDirectory))
+  ) {
+    return null;
+  }
+
+  const origin = await command(
+    run,
+    cwd,
+    ["config", "--get", "remote.origin.url"],
+    options,
+  );
+  const initialHead = await command(run, cwd, ["rev-parse", "HEAD"], options);
+  const head = await command(run, cwd, ["rev-parse", "HEAD"], options);
+  if (!origin || !SHA.test(initialHead ?? "") || !SHA.test(head ?? "")) {
+    return null;
+  }
+
+  return {
+    commonDirectory,
+    cwd,
+    gitDirectory,
+    head: head.toLowerCase(),
+    repository: repositoryFromOrigin(origin),
+    stable: initialHead.toLowerCase() === head.toLowerCase(),
+  };
+}
+
+function canonicalGitHubOrigin(repository) {
+  return `git@github.com:${repository}.git`;
+}
+
+function directReviewDirectory(root, cwd) {
+  const path = relative(root, cwd);
+  return (
+    path.startsWith(REVIEW_DIRECTORY_PREFIX) &&
+    !path.includes(sep) &&
+    path !== REVIEW_DIRECTORY_PREFIX
+  );
+}
+
+function reviewWorkspaceCleanupError() {
+  return new WorkspaceError(
+    REVIEW_WORKSPACE_CLEANUP_FAILURE,
+    "review_workspace_cleanup_failed",
+  );
+}
+
+async function createReviewDirectory(
+  root,
+  { cleanupTimeout, removeReviewDirectory },
+) {
+  const configured = resolve(root);
+  await mkdir(configured, { mode: REVIEW_ROOT_MODE, recursive: true });
+  const rootState = await lstat(configured);
+  if (
+    !rootState.isDirectory() ||
+    rootState.isSymbolicLink() ||
+    (typeof process.getuid === "function" && rootState.uid !== process.getuid())
+  ) {
+    throw new WorkspaceError(
+      "The review workspace root is not app-owned.",
+      "review_workspace_root_untrusted",
+    );
+  }
+  await chmod(configured, REVIEW_ROOT_MODE);
+  const canonicalRoot = await realpath(configured);
+  const rootIdentity = await lstat(canonicalRoot);
+  const created = await mkdtemp(join(canonicalRoot, REVIEW_DIRECTORY_PREFIX));
+  await chmod(created, REVIEW_ROOT_MODE);
+  const cwd = await realpath(created);
+  const identity = await lstat(cwd);
+  if (
+    !identity.isDirectory() ||
+    identity.isSymbolicLink() ||
+    !directReviewDirectory(canonicalRoot, cwd)
+  ) {
+    await rm(created, { force: true, recursive: true });
+    throw new WorkspaceError(
+      "The review workspace could not be created safely.",
+      "review_workspace_create_failed",
+    );
+  }
+
+  let removal = null;
+  const cleanup = () => {
+    if (removal !== null) return removal;
+    const attempt = Promise.resolve().then(async () => {
+      const currentRoot = await canonicalPath(canonicalRoot);
+      let currentRootIdentity;
+      let current;
+      try {
+        currentRootIdentity = await lstat(canonicalRoot);
+        current = await lstat(cwd);
+      } catch {
+        throw reviewWorkspaceCleanupError();
+      }
+      const currentCwd = await canonicalPath(cwd);
+      if (
+        currentRoot !== canonicalRoot ||
+        !currentRootIdentity.isDirectory() ||
+        currentRootIdentity.isSymbolicLink() ||
+        currentRootIdentity.dev !== rootIdentity.dev ||
+        currentRootIdentity.ino !== rootIdentity.ino ||
+        currentRootIdentity.uid !== rootIdentity.uid ||
+        (currentRootIdentity.mode & 0o777) !== REVIEW_ROOT_MODE ||
+        currentCwd !== cwd ||
+        !directReviewDirectory(canonicalRoot, currentCwd ?? "")
+      ) {
+        throw reviewWorkspaceCleanupError();
+      }
+      if (
+        !current.isDirectory() ||
+        current.isSymbolicLink() ||
+        current.dev !== identity.dev ||
+        current.ino !== identity.ino ||
+        current.uid !== identity.uid
+      ) {
+        throw reviewWorkspaceCleanupError();
+      }
+      await removeReviewDirectory(cwd);
+    });
+    removal = new Promise((resolveRemoval, rejectRemoval) => {
+      let settled = false;
+      const finish = (complete) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        complete();
+      };
+      const timer = setTimeout(
+        () => finish(() => rejectRemoval(reviewWorkspaceCleanupError())),
+        cleanupTimeout,
+      );
+      timer.unref?.();
+      attempt.then(
+        () => finish(resolveRemoval),
+        () => finish(() => rejectRemoval(reviewWorkspaceCleanupError())),
+      );
+    });
+    return removal;
+  };
+
+  return { cleanup, cwd, root: canonicalRoot };
+}
+
+async function rejectAlternates(commonDirectory) {
+  try {
+    await lstat(join(commonDirectory, "objects", "info", "alternates"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    throw new WorkspaceError(
+      "The review repository object storage could not be inspected.",
+      "review_git_metadata_unavailable",
+    );
+  }
+  throw new WorkspaceError(
+    "Git object alternates are not allowed in review workspaces.",
+    "review_git_alternates_present",
+  );
+}
+
 function selectCandidate(inspected, expected) {
   const eligible = inspected.filter(
     (candidate) =>
@@ -479,33 +681,62 @@ function selectCandidate(inspected, expected) {
 }
 
 export function createWorkspaceResolver({
-  roots = resolveWorkspaceOptions().roots,
+  environment = process.env,
+  reviewRoot = resolveWorkspaceOptions(environment).reviewRoot,
+  roots = resolveWorkspaceOptions(environment).roots,
   run = execFile,
   discoverRepositories = discover,
+  removeReviewDirectory = (path) => rm(path, { force: true, recursive: true }),
+  reviewCleanupTimeout = DEFAULT_REVIEW_CLEANUP_TIMEOUT,
   reviewCommandTimeout = DEFAULT_REVIEW_COMMAND_TIMEOUT,
 } = {}) {
+  if (!Number.isSafeInteger(reviewCleanupTimeout) || reviewCleanupTimeout < 1) {
+    throw new TypeError("reviewCleanupTimeout must be a positive integer.");
+  }
   if (!Number.isSafeInteger(reviewCommandTimeout) || reviewCommandTimeout < 1) {
     throw new TypeError("reviewCommandTimeout must be a positive integer.");
   }
+  if (typeof removeReviewDirectory !== "function") {
+    throw new TypeError("removeReviewDirectory must be a function.");
+  }
+  if (
+    typeof reviewRoot !== "string" ||
+    reviewRoot === "" ||
+    reviewRoot.includes("\0")
+  ) {
+    throw new TypeError("reviewRoot must be a non-empty path.");
+  }
   const associations = new Map();
 
+  function throwIfAborted(signal) {
+    if (!signal?.aborted) return;
+    if (typeof signal.throwIfAborted === "function") signal.throwIfAborted();
+    throw (
+      signal.reason ?? new Error("The review workspace request was aborted.")
+    );
+  }
+
   function reviewCommandOptions(signal) {
-    const environment = { ...process.env };
-    for (const name of Object.keys(environment)) {
-      if (
-        REVIEW_GIT_ENVIRONMENT.has(name) ||
-        name.startsWith("GIT_CONFIG_KEY_") ||
-        name.startsWith("GIT_CONFIG_VALUE_")
-      ) {
-        delete environment[name];
+    const selected = {};
+    for (const name of REVIEW_GIT_ENVIRONMENT) {
+      const value = environment[name];
+      if (typeof value === "string" && !value.includes("\0")) {
+        selected[name] = value;
       }
     }
     return {
       env: {
-        ...environment,
+        ...selected,
+        GIT_ASKPASS: "/usr/bin/false",
+        GIT_ATTR_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_SYSTEM: "/dev/null",
         GIT_NO_REPLACE_OBJECTS: "1",
+        GIT_OPTIONAL_LOCKS: "0",
         GIT_SSH_COMMAND: REVIEW_SSH_COMMAND,
         GIT_TERMINAL_PROMPT: "0",
+        SSH_ASKPASS: "/usr/bin/false",
       },
       gitConfiguration: SAFE_GIT_CONFIGURATION,
       killSignal: "SIGKILL",
@@ -536,6 +767,102 @@ export function createWorkspaceResolver({
       return null;
     }
     return candidate;
+  }
+
+  async function resolveReviewSource(repository, expected, options, signal) {
+    const canonical = await canonicalRoots(roots);
+    if (canonical.length === 0) {
+      throw new WorkspaceError("No trusted workspace roots are available.");
+    }
+
+    const [, name] = repository.split("/");
+    const preferred = [];
+    for (const root of canonical) {
+      for (const path of [
+        join(root, name),
+        join(root, ...repository.split("/")),
+      ]) {
+        const candidate = await canonicalPath(path);
+        if (candidate && isInside(root, candidate)) preferred.push(candidate);
+      }
+    }
+
+    const inspected = [];
+    const attempted = new Set();
+    const inspect = async (paths) => {
+      for (const path of paths) {
+        throwIfAborted(signal);
+        if (attempted.has(path)) continue;
+        attempted.add(path);
+        const candidate = await inspectSourceCandidate(
+          run,
+          canonical,
+          path,
+          options,
+        );
+        throwIfAborted(signal);
+        if (candidate?.repository === repository && candidate.stable) {
+          inspected.push(candidate);
+        }
+      }
+    };
+
+    await inspect(preferred);
+    if (inspected.length === 0) {
+      const direct = [];
+      for (const root of canonical) {
+        throwIfAborted(signal);
+        for (const candidate of await discoverRepositories(root)) {
+          direct.push(candidate);
+        }
+      }
+      const candidates = await registeredCandidates(
+        run,
+        canonical,
+        direct,
+        expected,
+        options,
+      );
+      await inspect(candidates.fast);
+      await inspect(candidates.full);
+    }
+
+    const unique = new Map();
+    for (const candidate of inspected) {
+      const current = unique.get(candidate.commonDirectory);
+      if (
+        !current ||
+        candidate.cwd.split(sep).length < current.cwd.split(sep).length ||
+        (candidate.cwd.split(sep).length === current.cwd.split(sep).length &&
+          candidate.cwd.localeCompare(current.cwd) < 0)
+      ) {
+        unique.set(candidate.commonDirectory, candidate);
+      }
+    }
+    const selected = [...unique.values()].sort((left, right) =>
+      left.cwd.localeCompare(right.cwd),
+    )[0];
+    if (!selected) {
+      throw new WorkspaceError(
+        "No trusted local repository matches this pull request.",
+        "workspace_missing",
+      );
+    }
+    return selected;
+  }
+
+  async function requiredReviewCommand(
+    cwd,
+    args,
+    options,
+    signal,
+    message,
+    code,
+  ) {
+    const result = await command(run, cwd, args, options);
+    throwIfAborted(signal);
+    if (result === null) throw new WorkspaceError(message, code);
+    return result;
   }
 
   async function resolvePull(
@@ -641,6 +968,7 @@ export function createWorkspaceResolver({
   }
 
   async function inspectReviewState({
+    allowedRoots = roots,
     branch,
     cwd,
     expectedHead,
@@ -648,7 +976,7 @@ export function createWorkspaceResolver({
     requireClean = true,
     options = {},
   }) {
-    const canonical = await canonicalRoots(roots);
+    const canonical = await canonicalRoots(allowedRoots);
     if (
       canonical.length === 0 ||
       !canonical.some((root) => isInside(root, cwd))
@@ -691,16 +1019,64 @@ export function createWorkspaceResolver({
         "review_workspace_branch_mismatch",
       );
     }
+    const expectedOrigin = canonicalGitHubOrigin(repository);
+    const fetchOrigin = await command(
+      run,
+      cwd,
+      ["config", "--get", "remote.origin.url"],
+      options,
+    );
     const pushOrigin = await command(
       run,
       cwd,
       ["remote", "get-url", "--push", "origin"],
       options,
     );
-    if (repositoryFromOrigin(pushOrigin) !== repository) {
+    if (fetchOrigin !== expectedOrigin || pushOrigin !== expectedOrigin) {
       throw new WorkspaceError(
-        "The review worktree push remote does not match the pull request repository.",
+        "The review worktree remote does not exactly match the authorized GitHub repository.",
         "review_workspace_remote_mismatch",
+      );
+    }
+    const fetchRefspec = await command(
+      run,
+      cwd,
+      ["config", "--local", "--get-all", "remote.origin.fetch"],
+      options,
+    );
+    const upstream = await command(
+      run,
+      cwd,
+      ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+      options,
+    );
+    if (
+      fetchRefspec !== `+refs/heads/${branch}:refs/remotes/origin/${branch}` ||
+      upstream !== `origin/${branch}`
+    ) {
+      throw new WorkspaceError(
+        "The review worktree remote tracking proof changed.",
+        "review_workspace_remote_mismatch",
+      );
+    }
+    const hardening = await Promise.all(
+      [
+        ["core.fsmonitor", "false"],
+        ["core.hooksPath", "/dev/null"],
+        ["commit.gpgsign", "false"],
+        ["tag.gpgsign", "false"],
+        ["user.email", "puller@localhost"],
+        ["user.name", "Puller Review"],
+        ["user.useConfigOnly", "true"],
+      ].map(async ([key, expected]) => [
+        expected,
+        await command(run, cwd, ["config", "--local", "--get", key], options),
+      ]),
+    );
+    if (hardening.some(([expected, actual]) => expected !== actual)) {
+      throw new WorkspaceError(
+        "The review worktree local security configuration changed.",
+        "review_workspace_hardening_changed",
       );
     }
     const remoteHead = await command(
@@ -747,60 +1123,265 @@ export function createWorkspaceResolver({
     }) {
       const normalized = normalizeRepository(repository);
       const expected = String(expectedHeadRefOid).toLowerCase();
-      if (!normalized || !validateGitBranch(headRefName)) {
+      if (
+        !normalized ||
+        !SHA.test(expected) ||
+        !validateGitBranch(headRefName)
+      ) {
         throw new WorkspaceError(
           "The pull request branch is invalid.",
           "review_workspace_branch_invalid",
         );
       }
       const options = reviewCommandOptions(signal);
-      const cwd = await resolvePull(
-        {
-          expectedHeadRefOid: expected,
-          number,
+      let owned = null;
+      try {
+        throwIfAborted(signal);
+        const source = await resolveReviewSource(
+          normalized,
+          expected,
+          options,
+          signal,
+        );
+        owned = await createReviewDirectory(reviewRoot, {
+          cleanupTimeout: reviewCleanupTimeout,
+          removeReviewDirectory,
+        });
+        throwIfAborted(signal);
+        await requiredReviewCommand(
+          owned.root,
+          [
+            "clone",
+            "--no-hardlinks",
+            "--no-checkout",
+            "--",
+            source.cwd,
+            owned.cwd,
+          ],
+          options,
+          signal,
+          "The owned review workspace could not be cloned.",
+          "review_workspace_clone_failed",
+        );
+
+        const confirmedSource = await inspectSourceCandidate(
+          run,
+          await canonicalRoots(roots),
+          source.cwd,
+          options,
+        );
+        throwIfAborted(signal);
+        if (
+          !confirmedSource ||
+          confirmedSource.cwd !== source.cwd ||
+          confirmedSource.commonDirectory !== source.commonDirectory ||
+          confirmedSource.repository !== normalized ||
+          confirmedSource.head !== source.head ||
+          !confirmedSource.stable
+        ) {
+          throw new WorkspaceError(
+            "The trusted local repository changed while the review workspace was created.",
+            "review_workspace_source_changed",
+          );
+        }
+
+        const origin = canonicalGitHubOrigin(normalized);
+        const configurations = [
+          ["config", "--local", "core.fsmonitor", "false"],
+          ["config", "--local", "core.hooksPath", "/dev/null"],
+          ["config", "--local", "commit.gpgsign", "false"],
+          ["config", "--local", "tag.gpgsign", "false"],
+          ["config", "--local", "user.email", "puller@localhost"],
+          ["config", "--local", "user.name", "Puller Review"],
+          ["config", "--local", "user.useConfigOnly", "true"],
+          ["remote", "set-url", "origin", origin],
+          ["remote", "set-url", "--push", "origin", origin],
+          [
+            "config",
+            "--local",
+            "--replace-all",
+            "remote.origin.fetch",
+            `+refs/heads/${headRefName}:refs/remotes/origin/${headRefName}`,
+          ],
+          ["config", "--local", "remote.origin.tagOpt", "--no-tags"],
+        ];
+        for (const args of configurations) {
+          await requiredReviewCommand(
+            owned.cwd,
+            args,
+            options,
+            signal,
+            "The owned review workspace could not be hardened.",
+            "review_workspace_hardening_failed",
+          );
+        }
+
+        const common = await requiredReviewCommand(
+          owned.cwd,
+          ["rev-parse", "--git-common-dir"],
+          options,
+          signal,
+          "The owned review Git metadata could not be inspected.",
+          "review_git_metadata_unavailable",
+        );
+        const commonDirectory = await canonicalGitPath(common, owned.cwd);
+        if (!commonDirectory || !isInside(owned.cwd, commonDirectory)) {
+          throw new WorkspaceError(
+            "The owned review Git metadata is outside the review workspace.",
+            "review_git_metadata_unavailable",
+          );
+        }
+        await rejectAlternates(commonDirectory);
+
+        await requiredReviewCommand(
+          owned.cwd,
+          [
+            "fetch",
+            "--force",
+            "--no-tags",
+            "--recurse-submodules=no",
+            "origin",
+            `+refs/heads/${headRefName}:refs/remotes/origin/${headRefName}`,
+          ],
+          options,
+          signal,
+          "The pull request branch could not be fetched into the owned review workspace.",
+          "review_workspace_fetch_failed",
+        );
+        const fetched = await requiredReviewCommand(
+          owned.cwd,
+          ["rev-parse", "--verify", `refs/remotes/origin/${headRefName}`],
+          options,
+          signal,
+          "The fetched pull request branch could not be verified.",
+          "review_workspace_remote_head_mismatch",
+        );
+        if (fetched.toLowerCase() !== expected) {
+          throw new WorkspaceError(
+            "The fetched pull request branch does not match the authorized head.",
+            "review_workspace_remote_head_mismatch",
+          );
+        }
+
+        await requiredReviewCommand(
+          owned.cwd,
+          [
+            "checkout",
+            "--force",
+            "-B",
+            headRefName,
+            `refs/remotes/origin/${headRefName}`,
+          ],
+          options,
+          signal,
+          "The pull request branch could not be checked out in the owned review workspace.",
+          "review_workspace_checkout_failed",
+        );
+        await requiredReviewCommand(
+          owned.cwd,
+          ["branch", "--set-upstream-to", `origin/${headRefName}`, headRefName],
+          options,
+          signal,
+          "The pull request branch upstream could not be configured.",
+          "review_workspace_upstream_failed",
+        );
+
+        await inspectReviewState({
+          allowedRoots: [owned.root],
+          branch: headRefName,
+          cwd: owned.cwd,
+          expectedHead: expected,
+          options,
           repository: normalized,
-        },
-        options,
-      );
-      await inspectReviewState({
-        branch: headRefName,
-        cwd,
-        expectedHead: expected,
-        options,
-        repository: normalized,
-      });
-      const pushable = await command(
-        run,
-        cwd,
-        [
-          "push",
-          "--dry-run",
-          "--porcelain",
-          "origin",
-          `${expected}:refs/heads/${headRefName}`,
-        ],
-        options,
-      );
-      if (pushable === null) {
-        throw new WorkspaceError(
+        });
+        const [configuredOrigin, configuredPush, configuredFetch, upstream] =
+          await Promise.all([
+            command(
+              run,
+              owned.cwd,
+              ["config", "--local", "--get", "remote.origin.url"],
+              options,
+            ),
+            command(
+              run,
+              owned.cwd,
+              ["config", "--local", "--get", "remote.origin.pushurl"],
+              options,
+            ),
+            command(
+              run,
+              owned.cwd,
+              ["config", "--local", "--get-all", "remote.origin.fetch"],
+              options,
+            ),
+            command(
+              run,
+              owned.cwd,
+              [
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+              ],
+              options,
+            ),
+          ]);
+        throwIfAborted(signal);
+        if (
+          configuredOrigin !== origin ||
+          configuredPush !== origin ||
+          configuredFetch !==
+            `+refs/heads/${headRefName}:refs/remotes/origin/${headRefName}` ||
+          upstream !== `origin/${headRefName}`
+        ) {
+          throw new WorkspaceError(
+            "The owned review remote or upstream proof is invalid.",
+            "review_workspace_remote_mismatch",
+          );
+        }
+
+        await requiredReviewCommand(
+          owned.cwd,
+          [
+            "push",
+            "--dry-run",
+            "--porcelain",
+            "origin",
+            `${expected}:refs/heads/${headRefName}`,
+          ],
+          options,
+          signal,
           "The pull request branch cannot be pushed through the proven origin remote.",
           "review_workspace_not_pushable",
         );
+        await inspectReviewState({
+          allowedRoots: [owned.root],
+          branch: headRefName,
+          cwd: owned.cwd,
+          expectedHead: expected,
+          options,
+          repository: normalized,
+        });
+        await rejectAlternates(commonDirectory);
+
+        return Object.freeze({
+          branch: headRefName,
+          cleanup: owned.cleanup,
+          cwd: owned.cwd,
+          headRefOid: expected,
+          remote: "origin",
+          repository: normalized,
+        });
+      } catch (error) {
+        if (owned !== null) {
+          try {
+            await owned.cleanup();
+          } catch {
+            throw reviewWorkspaceCleanupError();
+          }
+        }
+        throw error;
       }
-      await inspectReviewState({
-        branch: headRefName,
-        cwd,
-        expectedHead: expected,
-        options,
-        repository: normalized,
-      });
-      return Object.freeze({
-        branch: headRefName,
-        cwd,
-        headRefOid: expected,
-        remote: "origin",
-        repository: normalized,
-      });
     },
 
     async verifyReview(workspace, { expectedHeadRefOid, signal }) {
@@ -810,19 +1391,21 @@ export function createWorkspaceResolver({
         !repository ||
         !SHA.test(previous) ||
         !validateGitBranch(workspace?.branch) ||
-        typeof workspace?.cwd !== "string"
+        typeof workspace?.cwd !== "string" ||
+        typeof workspace?.cleanup !== "function"
       ) {
         throw new WorkspaceError(
           "The review worktree proof is invalid.",
           "review_workspace_invalid",
         );
       }
-      const canonical = await canonicalRoots(roots);
+      const canonical = await canonicalRoots([reviewRoot]);
       const options = reviewCommandOptions(signal);
       const cwd = await canonicalPath(workspace.cwd);
       if (
         !cwd ||
         !canonical.some((root) => isInside(root, cwd)) ||
+        !canonical.some((root) => directReviewDirectory(root, cwd)) ||
         cwd !== workspace.cwd
       ) {
         throw new WorkspaceError(
@@ -833,12 +1416,13 @@ export function createWorkspaceResolver({
       const head = await command(run, cwd, ["rev-parse", "HEAD"], options);
       if (!SHA.test(head ?? "") || head.toLowerCase() === previous) {
         throw new WorkspaceError(
-          "Claude must create a new commit for the review feedback.",
+          "The agent must create a new commit for the review feedback.",
           "review_commit_missing",
         );
       }
       const current = head.toLowerCase();
       const state = await inspectReviewState({
+        allowedRoots: canonical,
         branch: workspace.branch,
         cwd,
         expectedHead: current,
@@ -859,6 +1443,7 @@ export function createWorkspaceResolver({
         );
       }
       const confirmed = await inspectReviewState({
+        allowedRoots: canonical,
         branch: workspace.branch,
         cwd,
         expectedHead: current,
@@ -1247,7 +1832,7 @@ export function createVerificationWorkspaceManager({
   discoverRepositories = discover,
   makeTemporary = (prefix) => mkdtemp(prefix),
   remove = (path) => rm(path, { recursive: true, force: true }),
-  temporaryRoot = tmpdir(),
+  temporaryRoot = join(homedir(), ".puller", "verification-workspaces"),
 } = {}) {
   return Object.freeze({
     async prepare({ commitOid, repository, tag }) {
@@ -1349,6 +1934,7 @@ export function createVerificationWorkspaceManager({
 
       let trustedTemporaryRoot;
       try {
+        await mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
         trustedTemporaryRoot = await realpath(temporaryRoot);
       } catch {
         throw new WorkspaceError(

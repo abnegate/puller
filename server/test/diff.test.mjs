@@ -121,6 +121,7 @@ async function expiredSnapshotDiff({ loadPullAuthorization, rest }) {
   const authorizer = createArtifactAuthorizer({
     loadCheckAuthorization: vi.fn(),
     loadPullAuthorization,
+    loadPullCommitsAuthorization: vi.fn(),
     peek: snapshot.peek,
   });
 

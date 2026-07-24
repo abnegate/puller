@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000002"}
+{"type":"turn.started"}
+{"type":"error","message":"You have no weighted tokens left"}
+{"type":"turn.failed","error":{"message":"You have no weighted tokens left"}}

@@ -1,3 +1,4 @@
+import { validateAgent } from "./agent.mjs";
 import { validateGitBranch } from "./workspace.mjs";
 
 const PERMISSIONS = new Set(["WRITE", "MAINTAIN", "ADMIN"]);
@@ -119,6 +120,7 @@ export function validateReviewFeedback(value, bodyLimit) {
 
 export function validateReviewRunInput(value, messageLimit) {
   const keys = [
+    "agent",
     "expectedBaseRefOid",
     "expectedHeadRefOid",
     "feedback",
@@ -145,7 +147,7 @@ export function validateReviewRunInput(value, messageLimit) {
   if (typeof value.message !== "string" || value.message.includes("\0")) {
     throw invalid(
       "invalid_message",
-      "The Claude Code instructions must be a string.",
+      "The agent instructions must be a string.",
     );
   }
   if (byteLength(value.message) > messageLimit) {
@@ -157,6 +159,7 @@ export function validateReviewRunInput(value, messageLimit) {
   }
 
   return Object.freeze({
+    agent: validateAgent(value.agent),
     expectedBaseRefOid: value.expectedBaseRefOid.toLowerCase(),
     expectedHeadRefOid: value.expectedHeadRefOid.toLowerCase(),
     feedback: validateReviewFeedback(value.feedback, messageLimit),
@@ -333,7 +336,7 @@ export function validateReviewAuthorization(proof, input, expectedHead) {
   ) {
     throw invalid(
       "review_identity_changed",
-      "The pull request changed. Refresh its diff before running Claude.",
+      "The pull request changed. Refresh its diff before running the agent.",
       409,
     );
   }
@@ -433,7 +436,7 @@ export function validateReviewDiffProof(authorization, loaded, input) {
   ) {
     throw invalid(
       "review_identity_changed",
-      "The pull request changed. Refresh its diff before running Claude.",
+      "The pull request changed. Refresh its diff before running the agent.",
       409,
     );
   }

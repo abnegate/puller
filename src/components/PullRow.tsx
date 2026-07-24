@@ -5,6 +5,7 @@ import {
   CircleAlert,
   CircleCheck,
   CircleDotDashed,
+  GitCommitHorizontal,
   GitMerge,
   LoaderCircle,
   SquareTerminal,
@@ -19,6 +20,7 @@ import {
   useEffect,
   useId,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -36,9 +38,15 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
 
+import { agentLabel } from "../agent";
 import { getPullDiff, mergePull, PullDiffHttpError } from "../api";
 import {
   getPullDiffKey,
@@ -47,25 +55,36 @@ import {
 } from "../diffs";
 import type { PullMovement } from "../movements";
 import { getPullKey, type PullKey } from "../preferences";
+import { usePullRowContinuity } from "../row-continuity";
 import {
   isRunActive,
+  isRunPreparing,
   type PullRuns,
+  type RunHistoryEntry,
   type RunState,
   type RunStatus,
 } from "../runs";
 import { formatRelativeTime } from "../time";
 import type {
+  Agent,
   MergePullResponse,
   PullDiff as PullDiffData,
   PullReadiness,
 } from "../types";
 import BlockerDetails from "./BlockerDetails";
 import PullActionsMenu, { PullFavoriteIndicator } from "./PullActionsMenu";
+import PullCommits, {
+  normalizePullCommitsPersistence,
+  type PullCommitsPersistence,
+} from "./PullCommits";
 import PullDiff from "./PullDiff";
+import type { PullDiffPersistence } from "./PullDiff";
 
 type PullRowProps = {
+  agent?: Agent;
   artifactEpoch: number;
   cancelRun: PullRuns["cancel"];
+  clearReviewRetry: PullRuns["clearReviewRetry"];
   favorite?: boolean;
   hidePull?: (key: PullKey) => void;
   movement?: PullMovement | null;
@@ -74,7 +93,9 @@ type PullRowProps = {
     response: MergePullResponse,
   ) => void;
   onToggleViewed: ToggleViewedFile;
+  loadTranscript: PullRuns["loadTranscript"];
   pull: PullReadiness;
+  revealFocusedPull?: (key: PullKey) => boolean;
   run: RunState;
   setFavorite?: (key: PullKey, favorite: boolean) => void;
   setRunMessage: PullRuns["setMessage"];
@@ -91,11 +112,113 @@ type DiffState =
 
 type MergeState = "idle" | "loading" | "success";
 
+type PersistedRowDiff = {
+  persistence?: PullDiffPersistence;
+  state?: { diff: PullDiffData; status: "success" };
+};
+
+type PersistedRowCommits = {
+  persistence: PullCommitsPersistence;
+};
+
+const persistedDiff = (value: unknown): PersistedRowDiff | undefined => {
+  if (!value || typeof value !== "object") return;
+  const persisted = value as {
+    persistence?: PullDiffPersistence;
+    state?: unknown;
+  };
+  const state = persisted.state;
+  const success =
+    state &&
+    typeof state === "object" &&
+    "status" in state &&
+    state.status === "success" &&
+    "diff" in state;
+  if (!success && persisted.persistence === undefined) return;
+  return persisted as PersistedRowDiff;
+};
+
+const persistedCommits = (value: unknown): PersistedRowCommits | undefined => {
+  if (!value || typeof value !== "object" || !("persistence" in value)) {
+    return;
+  }
+  const persistence = value.persistence;
+  if (
+    !persistence ||
+    typeof persistence !== "object" ||
+    !("diffs" in persistence) ||
+    !persistence.diffs ||
+    typeof persistence.diffs !== "object" ||
+    !("selectedSha" in persistence) ||
+    (persistence.selectedSha !== null &&
+      typeof persistence.selectedSha !== "string") ||
+    !("viewed" in persistence) ||
+    !persistence.viewed ||
+    typeof persistence.viewed !== "object" ||
+    ("listVisible" in persistence &&
+      typeof persistence.listVisible !== "boolean")
+  ) {
+    return;
+  }
+  const normalized = normalizePullCommitsPersistence(
+    persistence as PullCommitsPersistence,
+  );
+  return normalized === persistence
+    ? (value as PersistedRowCommits)
+    : { persistence: normalized };
+};
+
+const hasActivePullIdentity = (identity: PullKey): boolean => {
+  if (typeof document === "undefined") return false;
+  const active = document.activeElement;
+  if (!(active instanceof Element)) return false;
+  return (
+    active.closest<HTMLElement>("[data-pull-identity]")?.dataset
+      .pullIdentity === identity
+  );
+};
+
+type FocusScope = "blockers" | "commits" | "diff";
+
+const FOCUS_SCOPE_SEPARATOR = "\0";
+
+const scopedFocusToken = (target: HTMLElement, token: string): string => {
+  const scope: FocusScope | null = target.closest("[data-blocker-panel]")
+    ? "blockers"
+    : target.closest("[data-commits-panel]")
+      ? "commits"
+      : target.closest("[data-diff-panel]")
+        ? "diff"
+        : null;
+  return scope === null ? token : `${scope}${FOCUS_SCOPE_SEPARATOR}${token}`;
+};
+
+const parseFocusToken = (
+  token: string,
+): { scope: FocusScope | null; token: string } => {
+  const separator = token.indexOf(FOCUS_SCOPE_SEPARATOR);
+  if (separator < 0) return { scope: null, token };
+  const scope = token.slice(0, separator);
+  return scope === "blockers" || scope === "commits" || scope === "diff"
+    ? { scope, token: token.slice(separator + 1) }
+    : { scope: null, token };
+};
+
+const sameDiffState = (left: DiffState, right: DiffState): boolean =>
+  left.status === right.status &&
+  (left.status !== "error" ||
+    right.status !== "error" ||
+    left.error === right.error) &&
+  (left.status !== "success" ||
+    right.status !== "success" ||
+    left.diff === right.diff);
+
 const statusLabels: Record<Exclude<RunStatus, "idle">, string> = {
   cancelled: "Cancelled",
   completed: "Completed",
   failed: "Failed",
   limited: "Limited",
+  preparing: "Preparing",
   running: "Running",
   starting: "Starting",
 };
@@ -105,8 +228,32 @@ const getStatusLabel = (status: RunStatus): string =>
 
 const getRunLabel = (run: RunState): string => {
   if (run.kind === "repair") return "Conflict repair";
-  if (run.source === "auto") return "Auto fix";
-  return run.source === "review" ? "Review fix" : "Claude";
+  const label = agentLabel(run.agent);
+  if (run.source === "auto") return `${label} auto fix`;
+  return run.source === "review" ? `${label} review fix` : label;
+};
+
+const historySourceLabels: Record<RunHistoryEntry["source"], string> = {
+  auto: "Auto fix",
+  manual: "Manual fix",
+  review: "Review fix",
+};
+
+const getHistoryLabel = (entry: RunHistoryEntry): string =>
+  `${agentLabel(entry.agent)} ${historySourceLabels[entry.source].toLowerCase()}`;
+
+const getHistoryInstructions = (entry: RunHistoryEntry): string => {
+  const { instructions } = entry;
+  if (instructions.kind === "manual") return instructions.text;
+  if (instructions.kind === "auto") {
+    return instructions.message || "Fix every current readiness blocker.";
+  }
+
+  const feedback = instructions.feedback.body;
+  if (!instructions.message || instructions.message === feedback) {
+    return feedback;
+  }
+  return `${feedback}\n\nAdditional context: ${instructions.message}`;
 };
 
 const dateFormatter = new Intl.DateTimeFormat(undefined, {
@@ -165,18 +312,31 @@ const getReadyEvidence = (pull: PullReadiness): string =>
   }`;
 
 const getCIProgress = (pull: PullReadiness): string => {
-  const { passed, total } = pull.ci;
+  const checks = pull.ci.checks ?? [];
+  const count = (...states: string[]): number =>
+    checks.filter((check) => states.includes(check.state)).length;
+  const inProgress =
+    pull.ci.inProgress ??
+    (checks.length > 0 ? count("in_progress") : (pull.ci.running ?? 0));
+  const queued = pull.ci.queued ?? count("pending", "queued");
+  const successful = pull.ci.passed ?? count("success", "neutral", "skipped");
+  const failed = pull.ci.failed ?? count("failure");
+  const unknown = pull.ci.unknown ?? count("unknown");
+  const total =
+    pull.ci.total ?? inProgress + queued + successful + failed + unknown;
 
-  if (typeof passed === "number" && typeof total === "number") {
-    if (total === 0) return "No CI checks reported";
-    return `${passed} of ${total} checks passed`;
+  if (total === 0) return "No CI checks reported";
+
+  const overview = [
+    `${inProgress} in progress`,
+    `${queued} queued`,
+    `${successful} successful`,
+    `${failed} failed`,
+  ];
+  if (unknown > 0 || pull.ci.complete === false) {
+    overview.push(`${unknown} unknown`);
   }
-
-  if (pull.ci.state === "pending") return "CI checks running";
-  if (pull.ci.state === "success") return "CI checks passed";
-  if (pull.ci.state === "failure") return "CI checks failed";
-  if (pull.ci.state === "none") return "No CI checks reported";
-  return "CI check progress unavailable";
+  return overview.join(" · ");
 };
 
 const stopControlClick = (event: MouseEvent<HTMLElement>) => {
@@ -305,10 +465,10 @@ function RunOutput({ pull, run }: { pull: PullReadiness; run: RunState }) {
             {run.kind === "repair"
               ? "Conflict repair"
               : run.source === "auto"
-                ? "Auto fix"
+                ? `${agentLabel(run.agent)} auto fix`
                 : run.source === "review"
-                  ? "Review fix"
-                  : "Claude output"}
+                  ? `${agentLabel(run.agent)} review fix`
+                  : `${agentLabel(run.agent)} output`}
           </span>
           <Badge
             aria-live="polite"
@@ -341,6 +501,273 @@ function RunOutput({ pull, run }: { pull: PullReadiness; run: RunState }) {
   );
 }
 
+type TranscriptLoadState =
+  | { status: "idle" | "loading" }
+  | { message: string; status: "error" }
+  | { status: "missing" }
+  | { status: "success"; transcript: string };
+
+function HistoryTranscript({
+  entry,
+  loadTranscript,
+}: {
+  entry: RunHistoryEntry;
+  loadTranscript: PullRuns["loadTranscript"];
+}) {
+  const contentId = useId();
+  const request = useRef(0);
+  const controller = useRef<AbortController | null>(null);
+  const [open, setOpen] = useState(false);
+  const [state, setState] = useState<TranscriptLoadState>({
+    status: "idle",
+  });
+  const label = `${getHistoryLabel(entry)} ${statusLabels[
+    entry.status
+  ].toLowerCase()} from ${formatRelativeTime(entry.finishedAt)}`;
+
+  const load = useCallback(() => {
+    if (entry.transcript.availability === "unavailable") return;
+    controller.current?.abort();
+    const nextController = new AbortController();
+    controller.current = nextController;
+    const token = ++request.current;
+    setState({ status: "loading" });
+    void loadTranscript(entry, nextController.signal).then(
+      (transcript) => {
+        if (nextController.signal.aborted || request.current !== token) {
+          return;
+        }
+        setState(
+          transcript === null
+            ? { status: "missing" }
+            : { status: "success", transcript },
+        );
+      },
+      (error: unknown) => {
+        if (nextController.signal.aborted || request.current !== token) {
+          return;
+        }
+        setState({
+          message: safeError(
+            error,
+            "The saved transcript could not be loaded.",
+          ),
+          status: "error",
+        });
+      },
+    );
+  }, [entry, loadTranscript]);
+
+  useEffect(
+    () => () => {
+      request.current += 1;
+      controller.current?.abort();
+    },
+    [],
+  );
+
+  if (entry.transcript.availability === "unavailable") {
+    return (
+      <div className="border-t px-3 py-3 text-xs text-muted-foreground">
+        <p className="m-0 font-medium text-foreground">
+          Transcript unavailable
+        </p>
+        <p className="mt-1 mb-0">{entry.transcript.message}</p>
+      </div>
+    );
+  }
+
+  return (
+    <Collapsible
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (next) {
+          load();
+          return;
+        }
+        request.current += 1;
+        controller.current?.abort();
+        controller.current = null;
+        setState({ status: "idle" });
+      }}
+      open={open}
+    >
+      <div className="border-t px-3 py-2">
+        <CollapsibleTrigger asChild>
+          <Button
+            aria-controls={contentId}
+            aria-expanded={open}
+            aria-label={`${open ? "Hide" : "Show"} transcript for ${label}`}
+            className="min-h-9 gap-2 px-2 text-muted-foreground sm:min-h-7"
+            size="sm"
+            type="button"
+            variant="ghost"
+          >
+            <ChevronDown
+              aria-hidden="true"
+              className={`size-3.5 transition-transform motion-reduce:transition-none ${
+                open ? "rotate-180" : ""
+              }`}
+            />
+            Transcript
+          </Button>
+        </CollapsibleTrigger>
+      </div>
+      <CollapsibleContent
+        aria-label={`Transcript for ${label}`}
+        id={contentId}
+        role="region"
+      >
+        {state.status === "loading" && (
+          <div className="flex min-h-16 items-center gap-2 border-t px-3 py-3 text-xs text-muted-foreground">
+            <LoaderCircle
+              aria-hidden="true"
+              className="size-3.5 animate-spin"
+            />
+            Loading transcript…
+          </div>
+        )}
+        {state.status === "missing" && (
+          <p className="m-0 border-t px-3 py-3 text-xs text-muted-foreground">
+            The saved transcript is no longer available.
+          </p>
+        )}
+        {state.status === "error" && (
+          <div className="flex flex-wrap items-center gap-2 border-t px-3 py-3 text-xs text-destructive">
+            <span className="min-w-0 flex-1 wrap-anywhere">
+              {state.message}
+            </span>
+            <Button onClick={load} size="sm" type="button" variant="outline">
+              Retry
+            </Button>
+          </div>
+        )}
+        {state.status === "success" && (
+          <pre
+            aria-label={`${getHistoryLabel(entry)} transcript from ${formatRelativeTime(entry.finishedAt)}`}
+            className="max-h-56 min-h-12 max-w-full overflow-auto whitespace-pre-wrap border-t p-3 font-mono text-xs leading-relaxed text-foreground wrap-anywhere"
+            data-run-history-transcript=""
+            tabIndex={0}
+          >
+            {state.transcript}
+          </pre>
+        )}
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+function PreviousFixes({
+  loadTranscript,
+  pull,
+  run,
+}: {
+  loadTranscript: PullRuns["loadTranscript"];
+  pull: PullReadiness;
+  run: RunState;
+}) {
+  const contentId = useId();
+  const [open, setOpen] = useState(false);
+  if (run.history.length === 0) return null;
+  const count = run.history.length;
+
+  return (
+    <Collapsible
+      className="relative z-20 mt-3 w-full min-w-0"
+      data-run-history=""
+      onOpenChange={setOpen}
+      open={open}
+    >
+      <CollapsibleTrigger asChild>
+        <Button
+          aria-controls={contentId}
+          aria-expanded={open}
+          aria-label={`Previous fixes, ${count} ${count === 1 ? "run" : "runs"}`}
+          className="group min-h-9 max-w-full gap-2 px-2 text-muted-foreground sm:min-h-7"
+          data-run-history-trigger=""
+          onClick={stopControlClick}
+          size="sm"
+          type="button"
+          variant="ghost"
+        >
+          <ChevronDown
+            aria-hidden="true"
+            className="size-3.5 shrink-0 transition-transform group-data-[state=open]:rotate-180 motion-reduce:transition-none"
+          />
+          <span>Previous fixes</span>
+          <Badge
+            aria-hidden="true"
+            className="tabular-nums"
+            variant="secondary"
+          >
+            {count}
+          </Badge>
+        </Button>
+      </CollapsibleTrigger>
+      <CollapsibleContent
+        aria-label={`Previous fixes for ${pull.repository} pull request ${pull.number}`}
+        className="min-w-0"
+        id={contentId}
+        role="region"
+      >
+        <div className="mt-2 grid min-w-0 gap-2 overflow-hidden">
+          {open &&
+            run.history.map((entry) => {
+              const absolute = formatAbsoluteDate(entry.finishedAt);
+              return (
+                <Card
+                  className="min-w-0 gap-0 overflow-hidden py-0"
+                  data-run-history-entry={entry.id}
+                  key={`${entry.id}:${entry.finishedAt}`}
+                  size="sm"
+                >
+                  <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 border-b px-3 py-2 text-xs">
+                    <SquareTerminal
+                      aria-hidden="true"
+                      className="size-3.5 shrink-0 text-muted-foreground"
+                    />
+                    <span className="font-medium text-foreground">
+                      {getHistoryLabel(entry)}
+                    </span>
+                    <Badge
+                      className="shrink-0"
+                      variant={
+                        entry.status === "failed" || entry.status === "limited"
+                          ? "destructive"
+                          : "outline"
+                      }
+                    >
+                      {statusLabels[entry.status]}
+                    </Badge>
+                    <time
+                      className="ml-auto text-muted-foreground"
+                      dateTime={entry.finishedAt}
+                      title={absolute}
+                    >
+                      {formatRelativeTime(entry.finishedAt)}
+                    </time>
+                  </div>
+                  <div className="min-w-0 border-b px-3 py-2">
+                    <p className="m-0 text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
+                      Instructions
+                    </p>
+                    <p className="mt-1 whitespace-pre-wrap text-xs leading-relaxed text-foreground wrap-anywhere">
+                      {getHistoryInstructions(entry)}
+                    </p>
+                  </div>
+                  <HistoryTranscript
+                    entry={entry}
+                    loadTranscript={loadTranscript}
+                  />
+                </Card>
+              );
+            })}
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
 function FixPanel({
   cancelRun,
   pull,
@@ -350,8 +777,11 @@ function FixPanel({
 }: Omit<
   PullRowProps,
   | "artifactEpoch"
+  | "agent"
+  | "clearReviewRetry"
   | "favorite"
   | "hidePull"
+  | "loadTranscript"
   | "onMutationComplete"
   | "onToggleViewed"
   | "setFavorite"
@@ -402,7 +832,7 @@ function FixPanel({
               {active && (
                 <LoaderCircle aria-hidden="true" className="animate-spin" />
               )}
-              Run fix
+              {isRunPreparing(run) ? "Preparing review fix" : "Run fix"}
             </Button>
             {active && (
               <Button
@@ -460,9 +890,23 @@ type DiffDisclosure = {
   viewed: ReadonlySet<string>;
 };
 
+type CommitsDisclosure = {
+  available: boolean;
+  contentId: string;
+  expanded: boolean;
+  toggle: (event: MouseEvent<HTMLElement>) => void;
+};
+
 type DiffIdentityState = {
   key: string;
   state: DiffState;
+};
+
+type DiffContinuity = {
+  diff?: PullDiffData;
+  expanded: boolean;
+  onExpandedChange: (expanded: boolean) => void;
+  onSuccess: (diff: PullDiffData) => void;
 };
 
 export function useDiffDisclosure(
@@ -471,36 +915,71 @@ export function useDiffDisclosure(
   artifactEpoch: number,
   viewed: ViewedFiles,
   onToggleViewed: ToggleViewedFile,
+  continuity?: DiffContinuity,
 ): DiffDisclosure {
   const contentId = useId();
   const pullRef = useRef(pull);
-  const [expanded, setExpanded] = useState(false);
+  const continuityRef = useRef(continuity);
+  const [localExpanded, setLocalExpanded] = useState(false);
   const [reload, setReload] = useState(0);
   const available = viewerLogin !== null;
   const key = getPullDiffKey(pull, viewerLogin, artifactEpoch);
   const keyRef = useRef(key);
   keyRef.current = key;
   pullRef.current = pull;
+  continuityRef.current = continuity;
   const [identity, setIdentity] = useState<DiffIdentityState>(() => ({
     key,
-    state: { status: "idle" },
+    state: continuity?.diff
+      ? { diff: continuity.diff, status: "success" }
+      : { status: "idle" },
   }));
+  const expanded = continuity?.expanded ?? localExpanded;
+  const expandedRef = useRef(expanded);
+  expandedRef.current = expanded;
+  const setExpanded = useCallback(
+    (next: boolean | ((value: boolean) => boolean)) => {
+      const value =
+        typeof next === "function" ? next(expandedRef.current) : next;
+      const current = continuityRef.current;
+      if (current) current.onExpandedChange(value);
+      else setLocalExpanded(value);
+    },
+    [],
+  );
 
   if (identity.key !== key) {
-    setIdentity({ key, state: { status: "idle" } });
+    setIdentity({
+      key,
+      state: continuity?.diff
+        ? { diff: continuity.diff, status: "success" }
+        : { status: "idle" },
+    });
   }
 
-  const current: DiffIdentityState =
+  const currentIdentity: DiffIdentityState =
     identity.key === key ? identity : { key, state: { status: "idle" } };
+  const currentState =
+    currentIdentity.state.status === "idle" && continuity?.diff
+      ? ({ diff: continuity.diff, status: "success" } as const)
+      : currentIdentity.state;
+  const stateRef = useRef(currentState);
+  stateRef.current = currentState;
   const setState = useCallback(
     (state: DiffState) => {
+      if (sameDiffState(stateRef.current, state)) return;
+      stateRef.current = state;
       setIdentity((value) => (value.key === key ? { ...value, state } : value));
+      if (state.status === "success") {
+        continuityRef.current?.onSuccess(state.diff);
+      }
     },
     [key],
   );
 
   useEffect(() => {
     if (!expanded || !available) return;
+    if (continuity?.diff) return;
 
     const controller = new AbortController();
     let current = true;
@@ -544,6 +1023,7 @@ export function useDiffDisclosure(
   }, [
     expanded,
     available,
+    continuity?.diff,
     key,
     pull.baseRefOid,
     pull.headRefOid,
@@ -565,7 +1045,7 @@ export function useDiffDisclosure(
       if (expanded) setState({ status: "idle" });
       setExpanded((value) => !value);
     },
-    [available, expanded, setState],
+    [available, expanded, setExpanded, setState],
   );
   const toggleViewed = useCallback(
     (path: string) => onToggleViewed(pullRef.current, path),
@@ -577,7 +1057,7 @@ export function useDiffDisclosure(
     contentId,
     expanded,
     retry,
-    state: current.state,
+    state: currentState,
     toggle,
     toggleViewed,
     viewed,
@@ -590,6 +1070,7 @@ function DiffTrigger({ disclosure }: { disclosure: DiffDisclosure }) {
       aria-controls={disclosure.contentId}
       aria-expanded={disclosure.expanded}
       className="min-h-11 sm:min-h-7"
+      data-pull-focus-token="diff"
       disabled={!disclosure.available}
       onClick={disclosure.toggle}
       size="sm"
@@ -601,6 +1082,25 @@ function DiffTrigger({ disclosure }: { disclosure: DiffDisclosure }) {
         className={`transition-transform motion-reduce:transition-none ${disclosure.expanded ? "rotate-180" : ""}`}
       />
       Files changed
+    </Button>
+  );
+}
+
+function CommitsTrigger({ disclosure }: { disclosure: CommitsDisclosure }) {
+  return (
+    <Button
+      aria-controls={disclosure.contentId}
+      aria-expanded={disclosure.expanded}
+      className="min-h-11 sm:min-h-7"
+      data-pull-focus-token="commits"
+      disabled={!disclosure.available}
+      onClick={disclosure.toggle}
+      size="sm"
+      type="button"
+      variant="outline"
+    >
+      <GitCommitHorizontal aria-hidden="true" />
+      Commits
     </Button>
   );
 }
@@ -622,6 +1122,7 @@ function BlockerTrigger({
       aria-controls={contentId}
       aria-expanded={expanded}
       className="min-h-11 sm:min-h-7"
+      data-pull-focus-token="blockers"
       disabled={!available}
       onClick={toggle}
       size="sm"
@@ -638,12 +1139,20 @@ function BlockerTrigger({
 }
 
 function DiffPanel({
+  agent,
+  clearReviewRetry,
   disclosure,
+  onPersistenceChange,
+  persistence,
   pull,
   run,
   startRun,
 }: {
+  agent: Agent;
+  clearReviewRetry: PullRuns["clearReviewRetry"];
   disclosure: DiffDisclosure;
+  onPersistenceChange?: (persistence: PullDiffPersistence) => void;
+  persistence?: PullDiffPersistence;
   pull: PullReadiness;
   run: RunState;
   startRun: PullRuns["start"];
@@ -652,7 +1161,7 @@ function DiffPanel({
 
   return (
     <div
-      className="relative z-20 mt-3 w-full min-w-0"
+      className="relative mt-3 w-full min-w-0"
       data-diff-panel=""
       id={disclosure.contentId}
     >
@@ -691,8 +1200,12 @@ function DiffPanel({
         disclosure.state.diff.headRefOid.toLowerCase() ===
           pull.headRefOid.toLowerCase() && (
           <PullDiff
+            agent={agent}
+            clearReviewRetry={clearReviewRetry}
             diff={disclosure.state.diff}
             key={`${disclosure.state.diff.baseRefOid}:${disclosure.state.diff.headRefOid}`}
+            onPersistenceChange={onPersistenceChange}
+            persistence={persistence}
             pull={pull}
             run={run}
             startRun={startRun}
@@ -704,10 +1217,57 @@ function DiffPanel({
   );
 }
 
+function CommitsPanel({
+  agent,
+  clearReviewRetry,
+  disclosure,
+  onPersistenceChange,
+  persistence,
+  pull,
+  run,
+  startRun,
+  viewerLogin,
+}: {
+  agent: Agent;
+  clearReviewRetry: PullRuns["clearReviewRetry"];
+  disclosure: CommitsDisclosure;
+  onPersistenceChange?: (persistence: PullCommitsPersistence) => void;
+  persistence?: PullCommitsPersistence;
+  pull: PullReadiness;
+  run: RunState;
+  startRun: PullRuns["start"];
+  viewerLogin: string | null;
+}) {
+  if (!disclosure.expanded || viewerLogin === null) return null;
+
+  return (
+    <div
+      className="relative mt-3 w-full min-w-0"
+      data-commits-panel=""
+      id={disclosure.contentId}
+    >
+      <PullCommits
+        agent={agent}
+        clearReviewRetry={clearReviewRetry}
+        onPersistenceChange={onPersistenceChange}
+        persistence={persistence}
+        pull={pull}
+        run={run}
+        startRun={startRun}
+        viewerLogin={viewerLogin}
+      />
+    </div>
+  );
+}
+
 function MergeControl({
+  agent,
+  disabled = false,
   onMutationComplete,
   pull,
 }: {
+  agent: Agent;
+  disabled?: boolean;
   onMutationComplete?: (
     pull: PullReadiness,
     response: MergePullResponse,
@@ -728,7 +1288,7 @@ function MergeControl({
   );
 
   const confirm = async () => {
-    if (pending.current || state === "success") return;
+    if (disabled || pending.current || state === "success") return;
 
     pending.current = true;
     setError(null);
@@ -739,6 +1299,7 @@ function MergeControl({
     try {
       const response = await mergePull(
         {
+          agent,
           expectedHeadRefOid: pull.headRefOid,
           number: pull.number,
           repository: pull.repository,
@@ -776,7 +1337,7 @@ function MergeControl({
       <AlertDialogTrigger asChild>
         <Button
           className="relative z-20 min-h-11 sm:min-h-7"
-          disabled={state === "success"}
+          disabled={disabled || state === "success"}
           onClick={stopControlClick}
           size="sm"
           type="button"
@@ -829,18 +1390,28 @@ function MergeControl({
 }
 
 function ReadyRow({
+  agent = "claude",
+  clearReviewRetry,
+  commitsDisclosure,
+  commitsPersistence,
   disclosure,
   favorite = false,
   hidePull,
   movement,
+  onCommitsPersistenceChange,
   onMutationComplete,
+  onPersistenceChange,
+  persistence,
   pull,
   run,
   setFavorite,
   startRun,
+  viewerLogin,
 }: Pick<
   PullRowProps,
+  | "agent"
   | "favorite"
+  | "clearReviewRetry"
   | "hidePull"
   | "movement"
   | "onMutationComplete"
@@ -848,7 +1419,15 @@ function ReadyRow({
   | "run"
   | "setFavorite"
   | "startRun"
-> & { disclosure: DiffDisclosure }) {
+  | "viewerLogin"
+> & {
+  commitsDisclosure: CommitsDisclosure;
+  commitsPersistence?: PullCommitsPersistence;
+  disclosure: DiffDisclosure;
+  onCommitsPersistenceChange?: (persistence: PullCommitsPersistence) => void;
+  onPersistenceChange?: (persistence: PullDiffPersistence) => void;
+  persistence?: PullDiffPersistence;
+}) {
   const reviewUrl = pull.greptile.commentUrl;
   if (!reviewUrl) return null;
 
@@ -947,26 +1526,58 @@ function ReadyRow({
             data-row-actions=""
             data-ready-controls=""
           >
-            <Badge variant="secondary">All checks passed</Badge>
+            {isRunPreparing(run) ? (
+              <Badge
+                className="border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-300"
+                variant="outline"
+              >
+                <LoaderCircle
+                  aria-hidden="true"
+                  className="animate-spin"
+                  data-icon="inline-start"
+                />
+                Review fix preparing
+              </Badge>
+            ) : (
+              <Badge variant="secondary">All checks passed</Badge>
+            )}
             <div
               className="flex flex-wrap items-center justify-end gap-2"
               data-ready-actions=""
             >
+              <CommitsTrigger disclosure={commitsDisclosure} />
               <DiffTrigger disclosure={disclosure} />
               <MergeControl
+                agent={agent}
+                disabled={isRunActive(run)}
                 onMutationComplete={onMutationComplete}
                 pull={pull}
               />
             </div>
           </div>
         </div>
-        {disclosure.expanded && (
+        {(commitsDisclosure.expanded || disclosure.expanded) && (
           <CardContent
             className="px-3 pb-3 sm:px-4 sm:pb-4"
             data-ready-diff-content=""
           >
+            <CommitsPanel
+              agent={agent}
+              clearReviewRetry={clearReviewRetry}
+              disclosure={commitsDisclosure}
+              onPersistenceChange={onCommitsPersistenceChange}
+              persistence={commitsPersistence}
+              pull={pull}
+              run={run}
+              startRun={startRun}
+              viewerLogin={viewerLogin}
+            />
             <DiffPanel
+              agent={agent}
+              clearReviewRetry={clearReviewRetry}
               disclosure={disclosure}
+              onPersistenceChange={onPersistenceChange}
+              persistence={persistence}
               pull={pull}
               run={run}
               startRun={startRun}
@@ -980,14 +1591,18 @@ function ReadyRow({
 }
 
 function PullRow({
+  agent = "claude",
   artifactEpoch,
   cancelRun,
+  clearReviewRetry,
   favorite = false,
   hidePull,
+  loadTranscript,
   movement,
   onMutationComplete,
   onToggleViewed,
   pull,
+  revealFocusedPull,
   run,
   setFavorite,
   setRunMessage,
@@ -997,23 +1612,128 @@ function PullRow({
   viewedFiles,
 }: PullRowProps) {
   const reducedMotion = useReducedMotion();
+  const identity = getPullKey(pull);
+  const continuity = usePullRowContinuity(identity);
+  const { claimFocus, ensureDiffKey, entry, update } = continuity;
+  const diffKey = getPullDiffKey(pull, viewerLogin, artifactEpoch);
+  useLayoutEffect(() => {
+    ensureDiffKey(diffKey, variant);
+  }, [diffKey, ensureDiffKey, variant]);
+  const savedDiff =
+    entry.diffKey === diffKey ? persistedDiff(entry.diff) : undefined;
+  const savedCommits =
+    entry.diffKey === diffKey ? persistedCommits(entry.commits) : undefined;
+  const changeDiffExpanded = useCallback(
+    (expanded: boolean) =>
+      update((current) => {
+        const previous = persistedDiff(current.diff);
+        const diff = expanded
+          ? current.diff
+          : previous?.persistence === undefined
+            ? undefined
+            : { persistence: previous.persistence };
+        if (
+          current.diffExpanded === expanded &&
+          (expanded || current.diff === diff)
+        ) {
+          return current;
+        }
+        return { ...current, diff, diffExpanded: expanded };
+      }),
+    [update],
+  );
+  const saveDiff = useCallback(
+    (diff: PullDiffData) =>
+      update((current) => {
+        if (current.diffKey !== diffKey) return current;
+        const previous = persistedDiff(current.diff);
+        if (previous?.state?.diff === diff) return current;
+        return {
+          ...current,
+          diff: {
+            ...(previous?.persistence
+              ? { persistence: previous.persistence }
+              : {}),
+            state: { diff, status: "success" },
+          },
+        };
+      }),
+    [diffKey, update],
+  );
+  const diffContinuity = useMemo(
+    () => ({
+      diff: savedDiff?.state?.diff,
+      expanded: entry.diffExpanded,
+      onExpandedChange: changeDiffExpanded,
+      onSuccess: saveDiff,
+    }),
+    [changeDiffExpanded, entry.diffExpanded, saveDiff, savedDiff?.state?.diff],
+  );
   const disclosure = useDiffDisclosure(
     pull,
     viewerLogin,
     artifactEpoch,
     viewedFiles,
     onToggleViewed,
+    diffContinuity,
   );
   const blockerContentId = useId();
-  const [blockersExpanded, setBlockersExpanded] = useState(false);
+  const commitsContentId = useId();
+  const blockersExpanded = entry.blockersExpanded;
+  const commitsExpanded = entry.commitsExpanded;
+  const saveDiffPersistence = useCallback(
+    (persistence: PullDiffPersistence) =>
+      update((current) => {
+        if (current.diffKey !== diffKey) return current;
+        const previous = persistedDiff(current.diff);
+        if (!previous || previous.persistence === persistence) {
+          return current;
+        }
+        return {
+          ...current,
+          diff: {
+            ...previous,
+            persistence,
+          },
+        };
+      }),
+    [diffKey, update],
+  );
   const blockerAvailable = viewerLogin !== null;
+  const toggleCommits = useCallback(
+    (event: MouseEvent<HTMLElement>) => {
+      stopControlClick(event);
+      if (!blockerAvailable) return;
+      update({ commitsExpanded: !commitsExpanded });
+    },
+    [blockerAvailable, commitsExpanded, update],
+  );
+  const commitsDisclosure = useMemo<CommitsDisclosure>(
+    () => ({
+      available: blockerAvailable,
+      contentId: commitsContentId,
+      expanded: commitsExpanded,
+      toggle: toggleCommits,
+    }),
+    [blockerAvailable, commitsContentId, commitsExpanded, toggleCommits],
+  );
+  const saveCommitsPersistence = useCallback(
+    (persistence: PullCommitsPersistence) =>
+      update((current) => {
+        if (current.diffKey !== diffKey) return current;
+        const previous = persistedCommits(current.commits);
+        if (previous?.persistence === persistence) return current;
+        return { ...current, commits: { persistence } };
+      }),
+    [diffKey, update],
+  );
   const toggleBlockers = useCallback(
     (event: MouseEvent<HTMLElement>) => {
       stopControlClick(event);
       if (!blockerAvailable) return;
-      setBlockersExpanded((value) => !value);
+      update({ blockersExpanded: !blockersExpanded });
     },
-    [blockerAvailable],
+    [blockerAvailable, blockersExpanded, update],
   );
   const blockers = pull.blockers.length
     ? pull.blockers
@@ -1028,7 +1748,108 @@ function PullRow({
         : variant === "blocked"
           ? getFallbackBlockers(pull)
           : [];
-  const identity = getPullKey(pull);
+  const row = useRef<HTMLLIElement>(null);
+  const focusWasActive = useRef(false);
+  if (hasActivePullIdentity(identity)) focusWasActive.current = true;
+  if (entry.focus === null) focusWasActive.current = false;
+  const focusGeneration = useRef(0);
+  focusGeneration.current = Math.max(
+    focusGeneration.current,
+    entry.focus?.generation ?? 0,
+  );
+  const captureFocus = useCallback(
+    (target: HTMLElement) => {
+      const semantic =
+        target.closest<HTMLElement>("[data-pull-focus-token]")?.dataset
+          .pullFocusToken ?? "row";
+      const token = scopedFocusToken(target, semantic);
+      update({
+        focus: {
+          generation: ++focusGeneration.current,
+          pending: false,
+          token,
+          variant,
+        },
+      });
+    },
+    [update, variant],
+  );
+  const releaseFocus = useCallback(() => {
+    queueMicrotask(() => {
+      if (hasActivePullIdentity(identity)) return;
+      focusWasActive.current = false;
+      update((current) =>
+        current.focus === null ? current : { ...current, focus: null },
+      );
+    });
+  }, [identity, update]);
+  useLayoutEffect(() => {
+    const focus = entry.focus;
+    if (!focus?.pending || focus.variant !== variant) return;
+    if (!focusWasActive.current && !hasActivePullIdentity(identity)) return;
+    if (revealFocusedPull && !revealFocusedPull(identity)) return;
+    const semantic = parseFocusToken(focus.token);
+    const panel =
+      semantic.scope === null
+        ? row.current
+        : row.current?.querySelector<HTMLElement>(
+            `[data-${semantic.scope === "blockers" ? "blocker" : semantic.scope}-panel]`,
+          );
+    const findExact = (): HTMLElement | null =>
+      semantic.token === "row"
+        ? row.current
+        : (Array.from(
+            panel?.querySelectorAll<HTMLElement>("[data-pull-focus-token]") ??
+              [],
+          ).find(
+            (element) => element.dataset.pullFocusToken === semantic.token,
+          ) ?? null);
+    const exact = findExact();
+    if (
+      exact === null &&
+      commitsExpanded &&
+      (semantic.scope === "commits" ||
+        (semantic.scope === null && semantic.token.startsWith("commit:"))) &&
+      row.current
+    ) {
+      const observer = new MutationObserver(() => {
+        const restored = findExact();
+        if (!restored || !claimFocus(focus)) return;
+        observer.disconnect();
+        focusWasActive.current = false;
+        restored.focus({ preventScroll: true });
+      });
+      observer.observe(row.current, { childList: true, subtree: true });
+      return () => observer.disconnect();
+    }
+    const files = row.current?.querySelector<HTMLElement>(
+      '[data-pull-focus-token="diff"]',
+    );
+    const blocker = row.current?.querySelector<HTMLElement>(
+      '[data-pull-focus-token="blockers"]',
+    );
+    const commits = row.current?.querySelector<HTMLElement>(
+      '[data-pull-focus-token="commits"]',
+    );
+    const target =
+      exact ??
+      (semantic.scope === "blockers" || semantic.token.startsWith("blocker:")
+        ? (blocker ?? files ?? commits ?? row.current)
+        : semantic.scope === "commits" || semantic.token.startsWith("commit")
+          ? (commits ?? files ?? blocker ?? row.current)
+          : (files ?? commits ?? blocker ?? row.current));
+    if (!target || !claimFocus(focus)) return;
+    focusWasActive.current = false;
+    target.focus({ preventScroll: true });
+  }, [
+    claimFocus,
+    commitsExpanded,
+    entry.focus,
+    identity,
+    revealFocusedPull,
+    variant,
+  ]);
+  const exiting = entry.variant !== null && entry.variant !== variant;
   const active = variant === "progress" && isRunActive(run);
   const summary = (
     <div className="flex items-stretch gap-3" data-pull-summary="">
@@ -1062,25 +1883,33 @@ function PullRow({
           <PullSummary pull={pull} />
           {favorite && <PullFavoriteIndicator />}
         </div>
-        {variant === "progress" && (
+        {variant !== "ready" && (
           <>
             <p
-              className="mt-1 text-xs text-amber-800 dark:text-amber-300"
+              className={
+                variant === "progress"
+                  ? "mt-1 text-xs text-amber-800 dark:text-amber-300"
+                  : "mt-1 text-xs text-muted-foreground"
+              }
               data-ci-progress=""
             >
               {getCIProgress(pull)}
-              {active && (
+              {variant === "progress" && active && (
                 <>
                   <span aria-hidden="true"> · </span>
                   {getRunLabel(run)} {getStatusLabel(run.status).toLowerCase()}
                 </>
               )}
             </p>
-            <span className="sr-only" role="status">
-              {active
-                ? `${getRunLabel(run)} is active`
-                : "CI checks are still in progress"}
-            </span>
+            {variant === "progress" && (
+              <span className="sr-only" role="status">
+                {active
+                  ? isRunPreparing(run)
+                    ? `${getRunLabel(run)} is preparing`
+                    : `${getRunLabel(run)} is active`
+                  : "CI checks are still in progress"}
+              </span>
+            )}
           </>
         )}
         {blockers.length > 0 && (
@@ -1107,6 +1936,14 @@ function PullRow({
 
   return (
     <motion.li
+      aria-hidden={exiting || undefined}
+      data-pull-identity={identity}
+      data-pull-focus-token="row"
+      inert={exiting || undefined}
+      onBlurCapture={releaseFocus}
+      onFocusCapture={(event) => captureFocus(event.target)}
+      ref={row}
+      tabIndex={-1}
       animate={{ opacity: 1, y: 0 }}
       exit={reducedMotion ? { opacity: 0 } : { opacity: 0, y: -6 }}
       initial={reducedMotion ? false : { opacity: 0, y: 6 }}
@@ -1123,19 +1960,34 @@ function PullRow({
       }
     >
       {variant === "ready" ? (
-        <ReadyRow
-          disclosure={disclosure}
-          favorite={favorite}
-          hidePull={hidePull}
-          movement={movement}
-          onMutationComplete={onMutationComplete}
-          pull={pull}
-          run={run}
-          setFavorite={setFavorite}
-          startRun={startRun}
-        />
+        <>
+          <ReadyRow
+            agent={agent}
+            clearReviewRetry={clearReviewRetry}
+            commitsDisclosure={commitsDisclosure}
+            commitsPersistence={savedCommits?.persistence}
+            disclosure={disclosure}
+            onCommitsPersistenceChange={saveCommitsPersistence}
+            onPersistenceChange={saveDiffPersistence}
+            persistence={savedDiff?.persistence}
+            favorite={favorite}
+            hidePull={hidePull}
+            movement={movement}
+            onMutationComplete={onMutationComplete}
+            pull={pull}
+            run={run}
+            setFavorite={setFavorite}
+            startRun={startRun}
+            viewerLogin={viewerLogin}
+          />
+          <PreviousFixes
+            loadTranscript={loadTranscript}
+            pull={pull}
+            run={run}
+          />
+        </>
       ) : (
-        <Card className="gap-0 py-0" size="sm">
+        <Card className="gap-0 overflow-visible py-0" size="sm">
           <CardContent className="p-3 sm:p-4">
             <div
               className="flex flex-col gap-3 sm:flex-row sm:items-stretch"
@@ -1147,7 +1999,7 @@ function PullRow({
                 data-pull-controls=""
                 data-row-actions=""
               >
-                {variant === "progress" ? (
+                {variant === "progress" || isRunPreparing(run) ? (
                   <ProgressBadge run={run} />
                 ) : (
                   <Badge variant="destructive">
@@ -1165,6 +2017,7 @@ function PullRow({
                     expanded={blockersExpanded}
                     toggle={toggleBlockers}
                   />
+                  <CommitsTrigger disclosure={commitsDisclosure} />
                   <DiffTrigger disclosure={disclosure} />
                 </div>
               </div>
@@ -1179,10 +2032,25 @@ function PullRow({
               </div>
             )}
             <DiffPanel
+              agent={agent}
+              clearReviewRetry={clearReviewRetry}
               disclosure={disclosure}
+              onPersistenceChange={saveDiffPersistence}
+              persistence={savedDiff?.persistence}
               pull={pull}
               run={run}
               startRun={startRun}
+            />
+            <CommitsPanel
+              agent={agent}
+              clearReviewRetry={clearReviewRetry}
+              disclosure={commitsDisclosure}
+              onPersistenceChange={saveCommitsPersistence}
+              persistence={savedCommits?.persistence}
+              pull={pull}
+              run={run}
+              startRun={startRun}
+              viewerLogin={viewerLogin}
             />
             <Separator className="my-3" />
             <FixPanel
@@ -1191,6 +2059,11 @@ function PullRow({
               run={run}
               setRunMessage={setRunMessage}
               startRun={startRun}
+            />
+            <PreviousFixes
+              loadTranscript={loadTranscript}
+              pull={pull}
+              run={run}
             />
           </CardContent>
         </Card>

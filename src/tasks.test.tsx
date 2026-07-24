@@ -53,6 +53,39 @@ afterEach(() => {
 });
 
 describe("useTasks", () => {
+  it("captures Codex for a new task request and its returned task", async () => {
+    const id = "12345678-1234-4234-8234-123456789abc";
+    vi.spyOn(globalThis.crypto, "randomUUID").mockReturnValue(id);
+    const completed: Task = {
+      ...task("completed"),
+      agent: "codex",
+      id,
+    };
+    api.start.mockResolvedValue(completed);
+    api.stream.mockImplementation(async function* () {
+      // A completed task has no live output to replay.
+    });
+    const hook = renderHook(() => useTasks("codex"));
+    await waitFor(() => expect(hook.result.current.loading).toBe(false));
+
+    await act(async () => {
+      await hook.result.current.start({
+        base: "main",
+        prompt: "Use the repository instructions.",
+        repository: "appwrite/cloud",
+      });
+    });
+
+    expect(api.start).toHaveBeenCalledWith({
+      agent: "codex",
+      base: "main",
+      id,
+      prompt: "Use the repository instructions.",
+      repository: "appwrite/cloud",
+    });
+    expect(hook.result.current.states[0]?.task.agent).toBe("codex");
+  });
+
   it("restores task state and replayed output without cancelling on unmount", async () => {
     let streamSignal: AbortSignal | undefined;
     api.list.mockResolvedValue([task()]);

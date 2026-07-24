@@ -20,6 +20,12 @@ import {
   createStreamRedactor,
   streamingClaudeArguments,
 } from "./claude.mjs";
+import { agentLabel, migrateAgent, validateAgent } from "./agent.mjs";
+import {
+  CodexError,
+  createCodexInvocation,
+  eventsForCodexLine,
+} from "./codex.mjs";
 import {
   createTaskRepositoryCatalog,
   resolveTaskWorkspaceOptions,
@@ -38,7 +44,7 @@ const ACTIVE_PHASES = new Set([
   "opening-pr",
   "running",
 ]);
-const MANIFEST_VERSION = 1;
+const MANIFEST_VERSION = 2;
 const DEFAULT_PROMPT_LIMIT = 32 * 1024;
 const DEFAULT_OUTPUT_LIMIT = 8 * 1024 * 1024;
 const DEFAULT_REPLAY_LIMIT = 1024 * 1024;
@@ -128,6 +134,7 @@ export function validateTaskStartInput(
     );
   }
   return Object.freeze({
+    agent: validateAgent(value.agent),
     base: value.base,
     id,
     prompt,
@@ -138,6 +145,7 @@ export function validateTaskStartInput(
 
 function sameInput(left, right) {
   return (
+    left.agent === right.agent &&
     left.base === right.base &&
     left.id === right.id &&
     left.prompt === right.prompt &&
@@ -148,6 +156,7 @@ function sameInput(left, right) {
 
 function publicTask(task) {
   const value = {
+    agent: task.agent,
     id: task.id,
     repository: task.repository,
     title: task.title,
@@ -192,7 +201,7 @@ function taskBody(input) {
     "",
     input.prompt,
     "",
-    "_This draft pull request was opened by Puller before Claude Code started._",
+    `_This draft pull request was opened by Puller before ${agentLabel(input.agent)} started._`,
   ].join("\n");
 }
 
@@ -202,7 +211,9 @@ function taskPrompt(task, input) {
     `An existing draft pull request is already open: ${task.pullRequest.url}`,
     `The checked-out task branch is ${task.branch}, based on ${task.base}.`,
     "",
-    "Implement the task below completely. Inspect the repository, make the changes, add or update tests, run the relevant validation, commit every intended change, and push this existing branch to origin.",
+    input.agent === "codex"
+      ? "Implement the task below completely. Inspect the repository, make the changes, add or update tests, and run the relevant validation. Do not use Git or publish remote state; Puller will validate, commit, and push the intended changes after you finish."
+      : "Implement the task below completely. Inspect the repository, make the changes, add or update tests, run the relevant validation, commit every intended change, and push this existing branch to origin.",
     "Do not create another branch, worktree, pull request, or release. Do not close or merge the existing pull request.",
     "",
     input.prompt,
@@ -297,6 +308,7 @@ function persistedTask(value, input, worktreeRoot) {
     typeof value !== "object" ||
     Array.isArray(value) ||
     value.base !== input.base ||
+    migrateAgent(value.agent) !== input.agent ||
     value.id !== input.id ||
     value.repository !== input.repository ||
     value.title !== input.title ||
@@ -324,6 +336,7 @@ function persistedTask(value, input, worktreeRoot) {
     pullRequest = parsed;
   }
   return {
+    agent: input.agent,
     base: input.base,
     createdAt: value.createdAt,
     id: input.id,
@@ -344,17 +357,21 @@ function persistedManifest(value, worktreeRoot) {
     !value ||
     typeof value !== "object" ||
     Array.isArray(value) ||
-    value.version !== MANIFEST_VERSION ||
+    (value.version !== 1 && value.version !== MANIFEST_VERSION) ||
     !value.input ||
     !value.task ||
     !Array.isArray(value.events)
   )
     return null;
   try {
+    const migratedInput =
+      value.version === 1 && value.input?.agent === undefined
+        ? { ...value.input, agent: "claude" }
+        : value.input;
     const input = validateTaskStartInput(
-      value.input,
+      migratedInput,
       DEFAULT_PROMPT_LIMIT,
-      () => value.input.id,
+      () => migratedInput.id,
     );
     const task = persistedTask(value.task, input, worktreeRoot);
     if (!task) return null;
@@ -462,6 +479,7 @@ export function createTaskManager({
   worktreeRoot: configuredWorktreeRoot,
   repositoryRoot,
   write = writeFile,
+  prepareCodex = createCodexInvocation,
 } = {}) {
   const configured = resolveTaskWorkspaceOptions(environment);
   const stateRoot = resolve(configuredStateRoot || configured.stateRoot);
@@ -928,7 +946,10 @@ export function createTaskManager({
     }
   }
 
-  function terminate(record, signal = "SIGTERM") {
+  function terminate(
+    record,
+    signal = record.input.agent === "codex" ? "SIGINT" : "SIGTERM",
+  ) {
     if (!record.child || record.childClosed) return;
     try {
       kill(-record.child.pid, signal);
@@ -963,9 +984,10 @@ export function createTaskManager({
     });
     record.killTimer = setTimer(() => {
       record.killTimer = null;
-      terminate(record, "SIGKILL");
+      terminate(record, record.input.agent === "codex" ? "SIGTERM" : "SIGKILL");
       record.forceTimer = setTimer(() => {
         record.forceTimer = null;
+        if (record.input.agent === "codex") terminate(record, "SIGKILL");
         release(record, true);
         record.resolveKill?.();
         record.resolveKill = null;
@@ -1025,7 +1047,7 @@ export function createTaskManager({
     void finish(record, "failed", message).catch(() => {});
   }
 
-  function closeChild(record) {
+  function closeChild(record, releaseNow = true) {
     if (record.childClosed) return;
     record.childClosed = true;
     clearTimer(record.killTimer);
@@ -1036,7 +1058,7 @@ export function createTaskManager({
     record.resolveKill = null;
     flushOutput(record);
     record.resolveChildDone?.();
-    release(record);
+    if (releaseNow) release(record);
   }
 
   function createDecoders(record) {
@@ -1048,8 +1070,9 @@ export function createTaskManager({
       const ready = record.redactors[stream].push(text);
       if (ready) output(record, stream, ready);
     };
+    const label = agentLabel(record.input.agent);
     const limit = () =>
-      stop(record, "Claude Code exceeded the per-line output limit.");
+      stop(record, `${label} exceeded the per-line output limit.`);
     return {
       stderr: createLineDecoder({
         maximum: lineLimit,
@@ -1063,6 +1086,31 @@ export function createTaskManager({
         onLimit: limit,
         onLine: (line) => {
           if (!line.trim()) return;
+          if (record.input.agent === "codex") {
+            for (const event of eventsForCodexLine(
+              line,
+              record.task.worktree,
+            )) {
+              if (event.type === "protocol") {
+                record.codexCompleted = event.status === "completed";
+              } else if (event.type === "error") {
+                stop(record, event.message);
+              } else if (event.type === "text") {
+                redact("stdout", event.text);
+              } else if (event.type === "tool") {
+                flushOutput(record, "stdout");
+                output(
+                  record,
+                  "stdout",
+                  `${event.name}${event.status ? ` (${event.status})` : ""}\n`,
+                );
+              } else if (event.type === "diagnostic") {
+                flushOutput(record, "stdout");
+                output(record, "stderr", `${event.text}\n`);
+              }
+            }
+            return;
+          }
           const value = safeJSON(line);
           const delta =
             value?.type === "stream_event" &&
@@ -1093,14 +1141,126 @@ export function createTaskManager({
       if (record.failure || TERMINAL_PHASES.has(record.task.phase)) return;
       record.output += chunk.byteLength;
       if (record.output > outputLimit) {
-        stop(record, "Claude Code exceeded the total output limit.");
+        stop(
+          record,
+          `${agentLabel(record.input.agent)} exceeded the total output limit.`,
+        );
         return;
       }
       decoder.push(chunk);
     };
   }
 
-  async function runClaude(record) {
+  async function publishCodexTask(record) {
+    throwIfCancelled(record);
+    const head = await execute(
+      "git",
+      ["-C", record.task.worktree, "rev-parse", "--verify", "HEAD"],
+      { signal: record.controller.signal },
+    );
+    if (
+      String(head.stdout ?? "")
+        .trim()
+        .toLowerCase() !== record.task.headRefOid
+    ) {
+      throw new TaskError(
+        409,
+        "task_head_changed",
+        "The task branch changed while Codex was running.",
+      );
+    }
+    const status = await execute(
+      "git",
+      ["-C", record.task.worktree, "status", "--porcelain=v1", "-z"],
+      { signal: record.controller.signal },
+    );
+    if (String(status.stdout ?? "") === "") {
+      throw new TaskError(
+        409,
+        "task_no_changes",
+        "Codex completed without making task changes.",
+      );
+    }
+    await execute(
+      "git",
+      [...SAFE_GIT_CONFIGURATION, "-C", record.task.worktree, "add", "--all"],
+      { signal: record.controller.signal },
+    );
+    await execute(
+      "git",
+      [
+        ...SAFE_GIT_CONFIGURATION,
+        "-c",
+        "commit.gpgSign=false",
+        "-c",
+        "user.name=Puller",
+        "-c",
+        "user.email=puller@localhost",
+        "-C",
+        record.task.worktree,
+        "commit",
+        "--no-verify",
+        "-m",
+        `feat: ${record.input.title}`,
+      ],
+      { signal: record.controller.signal },
+    );
+    await execute(
+      "git",
+      [
+        ...SAFE_GIT_CONFIGURATION,
+        "-C",
+        record.task.worktree,
+        "push",
+        "--no-verify",
+        "origin",
+        `HEAD:refs/heads/${record.task.branch}`,
+      ],
+      { signal: record.controller.signal },
+    );
+    const next = await execute(
+      "git",
+      ["-C", record.task.worktree, "rev-parse", "--verify", "HEAD"],
+      { signal: record.controller.signal },
+    );
+    const headRefOid = String(next.stdout ?? "")
+      .trim()
+      .toLowerCase();
+    if (!SHA.test(headRefOid)) {
+      throw new TaskError(
+        500,
+        "task_head_invalid",
+        "The published task head could not be verified.",
+      );
+    }
+    const clean = await execute(
+      "git",
+      ["-C", record.task.worktree, "status", "--porcelain=v1", "-z"],
+      { signal: record.controller.signal },
+    );
+    if (String(clean.stdout ?? "") !== "") {
+      throw new TaskError(
+        409,
+        "task_worktree_dirty",
+        "The task worktree was not clean after publishing.",
+      );
+    }
+    record.task.headRefOid = headRefOid;
+    if (record.task.pullRequest) {
+      record.task.pullRequest = {
+        ...record.task.pullRequest,
+        headRefOid,
+      };
+    }
+  }
+
+  async function cleanupCodex(record) {
+    const invocation = record.codex;
+    record.codex = null;
+    if (invocation) await invocation.cleanup();
+  }
+
+  async function runAgent(record) {
     throwIfCancelled(record);
     const reservation = scheduler
       ? await scheduler.reserveQueued(
@@ -1122,31 +1282,62 @@ export function createTaskManager({
     const decoders = createDecoders(record);
     let child;
     try {
-      child = spawn(
-        "claude",
-        [
-          ...streamingClaudeArguments(),
-          "--dangerously-skip-permissions",
-          "--",
+      if (record.input.agent === "codex") {
+        record.codex = await prepareCodex({
+          environment,
+          newTask: true,
           prompt,
-        ],
-        {
-          cwd: record.task.worktree,
+          purpose: "task",
+          target: record.task.worktree,
+        });
+        child = spawn(record.codex.command, record.codex.args, {
+          cwd: record.codex.cwd,
           detached: true,
-          env: {
-            ...environment,
-            CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
-          },
+          env: record.codex.environment,
           shell: false,
-          stdio: ["ignore", "pipe", "pipe"],
+          stdio: ["pipe", "pipe", "pipe"],
           windowsHide: true,
-        },
-      );
-    } catch {
+        });
+        if (
+          !child.stdin ||
+          typeof child.stdin.end !== "function" ||
+          typeof child.stdin.once !== "function"
+        ) {
+          throw new TaskError(
+            500,
+            "codex_start_failed",
+            "Codex could not be started safely.",
+          );
+        }
+      } else {
+        child = spawn(
+          "claude",
+          [
+            ...streamingClaudeArguments(),
+            "--dangerously-skip-permissions",
+            "--",
+            prompt,
+          ],
+          {
+            cwd: record.task.worktree,
+            detached: true,
+            env: {
+              ...environment,
+              CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
+            },
+            shell: false,
+            stdio: ["ignore", "pipe", "pipe"],
+            windowsHide: true,
+          },
+        );
+      }
+    } catch (cause) {
+      await cleanupCodex(record).catch(() => {});
       throw new TaskError(
         500,
-        "claude_start_failed",
-        "Claude Code could not be started.",
+        `${record.input.agent}_start_failed`,
+        `${agentLabel(record.input.agent)} could not be started.`,
+        cause,
       );
     }
     record.child = child;
@@ -1156,31 +1347,66 @@ export function createTaskManager({
 
     try {
       child.once("close", (code, signal) => {
-        closeChild(record);
-        if (record.shutdown) {
-          void finish(
-            record,
-            "failed",
-            "The server stopped before this task completed.",
-          ).catch(() => {});
-        } else if (record.cancelled) {
-          void finish(record, "cancelled", "Task cancelled.").catch(() => {});
-        } else if (record.failure) {
-          void finish(record, "failed", record.failure).catch(() => {});
-        } else if (code === 0) {
-          void finish(record, "completed").catch(() => {});
-        } else {
-          void finish(
-            record,
-            "failed",
-            signal
-              ? "Claude Code was terminated unexpectedly."
-              : "Claude Code exited with an error.",
-          ).catch(() => {});
-        }
+        closeChild(record, record.input.agent !== "codex");
+        void (async () => {
+          try {
+            if (record.shutdown) {
+              await finish(
+                record,
+                "failed",
+                "The server stopped before this task completed.",
+              );
+            } else if (record.cancelled) {
+              await finish(record, "cancelled", "Task cancelled.");
+            } else if (record.failure) {
+              await finish(record, "failed", record.failure);
+            } else if (
+              record.input.agent === "codex" &&
+              (code !== 0 || !record.codexCompleted)
+            ) {
+              await finish(
+                record,
+                "failed",
+                signal
+                  ? "Codex was terminated unexpectedly."
+                  : code === 0
+                    ? "Codex exited without completing its turn."
+                    : "Codex exited with an error.",
+              );
+            } else if (code === 0) {
+              if (record.input.agent === "codex") {
+                await publishCodexTask(record);
+                await cleanupCodex(record);
+              }
+              await finish(record, "completed");
+            } else {
+              await finish(
+                record,
+                "failed",
+                signal
+                  ? `${agentLabel(record.input.agent)} was terminated unexpectedly.`
+                  : `${agentLabel(record.input.agent)} exited with an error.`,
+              );
+            }
+          } catch (error) {
+            await finish(
+              record,
+              "failed",
+              processError(error, "The task could not be published.").message,
+            );
+          } finally {
+            await cleanupCodex(record).catch(() => {});
+          }
+        })().catch(() => {});
       });
       child.once("error", () => {
-        stop(record, "Claude Code could not be started.");
+        stop(record, `${agentLabel(record.input.agent)} could not be started.`);
+      });
+      child.stdin?.once?.("error", () => {
+        stop(
+          record,
+          `${agentLabel(record.input.agent)} could not receive the task instructions.`,
+        );
       });
       child.stdout?.on("data", consume(record, decoders.stdout));
       child.stdout?.once("end", () => {
@@ -1192,17 +1418,27 @@ export function createTaskManager({
         decoders.stderr.end();
         flushOutput(record, "stderr");
       });
+      if (record.input.agent === "codex") {
+        try {
+          child.stdin.end(record.codex.prompt);
+        } catch {
+          stop(record, "Codex could not receive the task instructions.");
+        }
+      }
       record.runtimeTimer = setTimer(() => {
-        stop(record, "Claude Code exceeded the runtime limit.");
+        stop(
+          record,
+          `${agentLabel(record.input.agent)} exceeded the runtime limit.`,
+        );
       }, runtime);
       record.runtimeTimer.unref?.();
     } catch {
-      record.failure = "Claude Code could not be started.";
+      record.failure = `${agentLabel(record.input.agent)} could not be started.`;
       await terminateGracefully(record);
       throw new TaskError(
         500,
-        "claude_start_failed",
-        "Claude Code could not be started.",
+        `${record.input.agent}_start_failed`,
+        record.failure,
       );
     }
   }
@@ -1225,7 +1461,7 @@ export function createTaskManager({
       throwIfCancelled(record);
       await openPull(record);
       throwIfCancelled(record);
-      await runClaude(record);
+      await runAgent(record);
     } catch (caught) {
       const error = processError(caught, "The task could not be prepared.");
       if (record.shutdown || stopping) {
@@ -1248,6 +1484,8 @@ export function createTaskManager({
       child: null,
       childClosed: false,
       childDone: null,
+      codex: null,
+      codexCompleted: false,
       controller: new AbortController(),
       events,
       failure: null,
@@ -1372,6 +1610,7 @@ export function createTaskManager({
 
       const createdAt = timestamp();
       const task = {
+        agent: input.agent,
         base: input.base,
         createdAt,
         id: input.id,

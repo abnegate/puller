@@ -12,6 +12,7 @@ import {
   useReleaseVerificationBatches,
   useVerificationRuns,
   verificationKey,
+  type VerificationRunState,
 } from "./verifications";
 import type {
   RecentRelease,
@@ -55,6 +56,11 @@ const release = (id: string, number: number): RecentRelease => ({
   complete: true,
   id,
   name: `Release ${id}`,
+  pipeline: {
+    checkedAt: "2026-07-17T10:00:00.000Z",
+    lookup: "complete",
+    runs: [],
+  },
   publishedAt: "2026-07-17T10:00:00.000Z",
   pulls: [
     {
@@ -83,6 +89,32 @@ afterEach(() => {
 });
 
 describe("useVerificationRuns", () => {
+  it("captures Codex for an individual verification", async () => {
+    const item = release("release-codex", 1);
+    api.stream.mockImplementation(async function* (
+      request: VerificationRunRequest,
+    ): AsyncGenerator<VerificationRunEvent, void, undefined> {
+      yield { ...request, runId: "codex-verification", type: "start" };
+      yield { exitCode: 0, type: "complete" };
+    });
+    const view = renderHook(() =>
+      useVerificationRuns([item], true, "codex"),
+    );
+
+    await act(async () => {
+      await view.result.current.start(item, item.pulls[0]!);
+    });
+
+    expect(api.stream).toHaveBeenCalledWith(
+      expect.objectContaining({ agent: "codex" }),
+      expect.any(AbortSignal),
+    );
+    expect(
+      view.result.current.states.get(verificationKey(item, item.pulls[0]!))
+        ?.agent,
+    ).toBe("codex");
+  });
+
   it("streams concurrent release verifications independently", async () => {
     const firstGate = createDeferred<void>();
     const secondGate = createDeferred<void>();
@@ -366,8 +398,10 @@ const batchStart = (
   item: RecentRelease,
   pulls: readonly ReleasedPull[] = item.pulls,
 ): Extract<ReleaseVerificationEvent, { type: "batch-start" }> => ({
+  agent: "claude",
   batchId: "batch-1",
   pulls: pulls.map((pull) => ({
+    agent: "claude",
     headSha: pull.headSha,
     pullNumber: pull.number,
     pullUrl: pull.url,
@@ -400,6 +434,142 @@ const batchVerification = (
 };
 
 describe("useReleaseVerificationBatches", () => {
+  it("refuses a batch while a direct run is active and allows the selected agent after it settles", async () => {
+    const item = release("10", 1);
+    const pull = item.pulls[0]!;
+    const key = verificationKey(item, pull);
+    const active = new Map<string, VerificationRunState>([
+      [
+        key,
+        {
+          agent: "claude" as const,
+          cancelling: false,
+          output: "Direct output.",
+          runId: "direct-run",
+          status: "running" as const,
+        },
+      ],
+    ]);
+    api.streamBatch.mockImplementation(async function* (
+      request: {
+        agent: "claude" | "codex";
+        releaseId: string;
+        repository: string;
+        tag: string;
+      },
+    ): AsyncGenerator<ReleaseVerificationEvent, void, undefined> {
+      yield {
+        ...batchStart(item),
+        agent: request.agent,
+        pulls: [
+          {
+            ...batchStart(item).pulls[0]!,
+            agent: request.agent,
+          },
+        ],
+      };
+      yield batchVerification(item, 0, "complete", {
+        exitCode: 0,
+        type: "complete",
+      });
+      yield {
+        batchId: "batch-1",
+        totals: { complete: 1, error: 0, existing: 0, total: 1 },
+        type: "complete",
+      };
+    });
+    const view = renderHook(
+      ({ direct }) =>
+        useReleaseVerificationBatches([item], true, "codex", direct),
+      { initialProps: { direct: active } },
+    );
+
+    await act(async () => {
+      await view.result.current.start(item);
+    });
+    expect(api.streamBatch).not.toHaveBeenCalled();
+
+    view.rerender({
+      direct: new Map([
+        [
+          key,
+          {
+            ...active.get(key)!,
+            status: "completed" as const,
+          },
+        ],
+      ]),
+    });
+    await act(async () => {
+      await view.result.current.start(item);
+    });
+
+    expect(api.streamBatch).toHaveBeenCalledWith(
+      expect.objectContaining({ agent: "codex" }),
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("captures Codex for Verify all and every batch member", async () => {
+    const item = batchRelease();
+    api.streamBatch.mockImplementation(async function* (
+      request: {
+        agent: "claude" | "codex";
+        releaseId: string;
+        repository: string;
+        tag: string;
+      },
+    ): AsyncGenerator<ReleaseVerificationEvent, void, undefined> {
+      yield {
+        ...batchStart(item),
+        agent: request.agent,
+        pulls: item.pulls.map((pull) => ({
+          agent: request.agent,
+          headSha: pull.headSha,
+          pullNumber: pull.number,
+          pullUrl: pull.url,
+          releaseId: item.id,
+          repository: item.repository,
+          tag: item.tag,
+        })),
+      };
+      for (const pull of item.pulls) {
+        yield batchVerification(item, item.pulls.indexOf(pull), "queued");
+        yield batchVerification(item, item.pulls.indexOf(pull), "complete", {
+          exitCode: 0,
+          type: "complete",
+        });
+      }
+      yield {
+        batchId: "batch-1",
+        totals: {
+          complete: item.pulls.length,
+          error: 0,
+          existing: 0,
+          total: item.pulls.length,
+        },
+        type: "complete",
+      };
+    });
+    const view = renderHook(() =>
+      useReleaseVerificationBatches([item], true, "codex"),
+    );
+
+    await act(async () => {
+      await view.result.current.start(item);
+    });
+
+    expect(api.streamBatch).toHaveBeenCalledWith(
+      expect.objectContaining({ agent: "codex" }),
+      expect.any(AbortSignal),
+    );
+    expect(
+      [...view.result.current.pullStates.values()].every(
+        (state) => state.agent === "codex",
+      ),
+    ).toBe(true);
+  });
+
   it("reconciles an authoritative subset, keeps omitted rows settled, and supports newly returned members", async () => {
     const item = batchRelease();
     const added = {
@@ -466,6 +636,7 @@ describe("useReleaseVerificationBatches", () => {
     });
     expect(api.streamBatch).toHaveBeenCalledWith(
       {
+        agent: "claude",
         releaseId: item.id,
         repository: item.repository,
         tag: item.tag,
@@ -514,6 +685,7 @@ describe("useReleaseVerificationBatches", () => {
     ).toMatchObject({ settled: 0, status: "completed", total: 0 });
     expect(api.streamBatch).toHaveBeenCalledWith(
       {
+        agent: "claude",
         releaseId: item.id,
         repository: item.repository,
         tag: item.tag,
@@ -599,6 +771,7 @@ describe("useReleaseVerificationBatches", () => {
       yield batchVerification(item, 0, "queued");
       yield batchVerification(item, 0, "running", {
         ...{
+          agent: "claude",
           headSha: item.pulls[0]!.headSha,
           pullNumber: item.pulls[0]!.number,
           pullUrl: item.pulls[0]!.url,
@@ -933,5 +1106,115 @@ describe("reconcileRecentReleases", () => {
       retained.id,
       incomingRelease.id,
     ]);
+  });
+
+  it("does not let an older complete membership response regress pipeline evidence", () => {
+    const item = release("release-pipeline", 1);
+    const run = {
+      attempt: 1,
+      createdAt: "2026-07-17T10:01:00.000Z",
+      id: "123",
+      name: "Production Deployment",
+      path: ".github/workflows/production.yml",
+      startedAt: "2026-07-17T10:02:00.000Z",
+      state: "succeeded" as const,
+      updatedAt: "2026-07-17T10:03:00.000Z",
+      url: "https://github.com/appwrite/cloud/actions/runs/123",
+      workflowId: "456",
+    };
+    const previousRelease = {
+      ...item,
+      pipeline: {
+        checkedAt: "2026-07-17T10:05:00.000Z",
+        lookup: "complete" as const,
+        runs: [run],
+      },
+    };
+    const incomingRelease = {
+      ...item,
+      pipeline: {
+        checkedAt: "2026-07-17T10:04:00.000Z",
+        lookup: "pending" as const,
+        runs: [{ ...run, state: "running" as const }],
+      },
+    };
+
+    const reconciled = reconcileRecentReleases(
+      response([previousRelease], false),
+      response([incomingRelease], false),
+    );
+
+    expect(reconciled.releases[0]!.pipeline).toBe(previousRelease.pipeline);
+  });
+
+  it("retains exact runs while recording a newer unavailable lookup", () => {
+    const item = release("release-pipeline", 1);
+    const previousRelease = {
+      ...item,
+      pipeline: {
+        checkedAt: "2026-07-17T10:04:00.000Z",
+        lookup: "complete" as const,
+        runs: [
+          {
+            attempt: 1,
+            createdAt: "2026-07-17T10:01:00.000Z",
+            id: "123",
+            name: "Production Deployment",
+            path: ".github/workflows/production.yml",
+            startedAt: "2026-07-17T10:02:00.000Z",
+            state: "succeeded" as const,
+            updatedAt: "2026-07-17T10:03:00.000Z",
+            url: "https://github.com/appwrite/cloud/actions/runs/123",
+            workflowId: "456",
+          },
+        ],
+      },
+    };
+    const incomingRelease = {
+      ...item,
+      pipeline: {
+        checkedAt: "2026-07-17T10:05:00.000Z",
+        lookup: "unavailable" as const,
+        runs: [],
+      },
+    };
+
+    const reconciled = reconcileRecentReleases(
+      response([previousRelease], false),
+      response([incomingRelease], false),
+    );
+
+    expect(reconciled.releases[0]!.pipeline).toEqual({
+      checkedAt: incomingRelease.pipeline.checkedAt,
+      lookup: "unavailable",
+      runs: previousRelease.pipeline.runs,
+    });
+  });
+
+  it("does not carry pipeline evidence across a changed publication identity", () => {
+    const previousRelease = {
+      ...release("release-reused", 1),
+      pipeline: {
+        checkedAt: "2026-07-17T10:05:00.000Z",
+        lookup: "complete" as const,
+        runs: [],
+      },
+    };
+    const incomingRelease = {
+      ...previousRelease,
+      pipeline: {
+        checkedAt: "2026-07-17T10:01:00.000Z",
+        lookup: "pending" as const,
+        runs: [],
+      },
+      publishedAt: "2026-07-17T10:00:01.000Z",
+    };
+
+    const reconciled = reconcileRecentReleases(
+      response([previousRelease], false),
+      response([incomingRelease], false),
+    );
+
+    expect(reconciled.releases[0]).toBe(incomingRelease);
   });
 });

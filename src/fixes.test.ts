@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  cancelAgentRun,
   cancelClaudeRun,
   ClaudeRunHttpError,
   resetActionTokenForTests,
+  streamAgentRun,
   streamClaudeRun,
   type AutoTrigger,
   type ClaudeRunRequest,
@@ -496,6 +498,101 @@ describe("streamClaudeRun", () => {
   });
 });
 
+describe("streamAgentRun", () => {
+  it("sends the selected agent to the provider-neutral endpoint and validates the echo", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(tokenResponse())
+      .mockResolvedValueOnce(
+        streamResponse([
+          '{"agent":"codex","type":"start","runId":"run-codex","repository":"appwrite/cloud","number":102}\n',
+          '{"type":"complete","exitCode":0}\n',
+        ]),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const events = [];
+    for await (const event of streamAgentRun({
+      ...request,
+      agent: "codex",
+      source: "manual",
+    })) {
+      events.push(event);
+    }
+
+    expect(events[0]).toMatchObject({
+      agent: "codex",
+      runId: "run-codex",
+      type: "start",
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/agents/runs",
+      expect.objectContaining({
+        body: JSON.stringify({
+          agent: "codex",
+          ...request,
+          source: "manual",
+        }),
+        method: "POST",
+      }),
+    );
+  });
+
+  it("rejects a start event from a different agent", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(tokenResponse())
+        .mockResolvedValueOnce(
+          streamResponse([
+            '{"agent":"claude","type":"start","runId":"wrong-agent","repository":"appwrite/cloud","number":102}\n',
+          ]),
+        ),
+    );
+
+    await expect(
+      (async () => {
+        for await (const _event of streamAgentRun({
+          ...request,
+          agent: "codex",
+          source: "manual",
+        })) {
+          // Consume the validated stream.
+        }
+      })(),
+    ).rejects.toThrow("different agent or pull request");
+  });
+
+  it("attributes malformed neutral stream events to the selected agent", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(tokenResponse())
+        .mockResolvedValueOnce(
+          streamResponse([
+            '{"agent":"codex","type":"start","runId":"run-codex","repository":"appwrite/cloud","number":102}\n',
+            '{"type":"complete","exitCode":"zero"}\n',
+          ]),
+        ),
+    );
+
+    await expect(
+      (async () => {
+        for await (const _event of streamAgentRun({
+          ...request,
+          agent: "codex",
+          source: "manual",
+        })) {
+          // Consume the validated stream.
+        }
+      })(),
+    ).rejects.toThrow("Codex returned an invalid stream event.");
+  });
+});
+
 describe("cancelClaudeRun", () => {
   it("uses the cached action token and URL-encodes the run id", async () => {
     const fetchMock = vi
@@ -513,6 +610,24 @@ describe("cancelClaudeRun", () => {
         headers: expect.objectContaining({ "X-Action-Token": "action-token" }),
         method: "DELETE",
       }),
+    );
+  });
+});
+
+describe("cancelAgentRun", () => {
+  it("cancels through the provider-neutral endpoint", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(tokenResponse())
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await cancelAgentRun("run/codex");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/agents/runs/run%2Fcodex",
+      expect.objectContaining({ method: "DELETE" }),
     );
   });
 });

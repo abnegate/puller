@@ -86,12 +86,56 @@ describe("shared run scheduler", () => {
     controller.abort();
     await expect(waiting).rejects.toMatchObject({
       code: "run_cancelled",
+      message: "The queued agent run was cancelled.",
       status: 499,
     });
     expect(scheduler.queuedCount()).toBe(0);
 
     first.release();
     expect(() => scheduler.reserveRun(options("waiting"))).not.toThrow();
+  });
+
+  it("uses provider-neutral capacity and workspace errors", () => {
+    const limited = createRunCoordinator({ limit: 1 });
+    const active = limited.reserveRun(options("codex-active"));
+    expect(() => limited.reserveRun(options("claude-active"))).toThrowError(
+      expect.objectContaining({
+        code: "run_limit",
+        message: "1 agent run is already active.",
+      }),
+    );
+    active.release();
+
+    const shared = createRunCoordinator({ limit: 2 });
+    const codex = shared.reserveRun(options("codex"));
+    const claude = shared.reserveRun(options("claude"));
+    codex.reserveWorkspace("/trusted/worktree");
+    expect(() => claude.reserveWorkspace("/trusted/worktree")).toThrowError(
+      expect.objectContaining({
+        code: "workspace_running",
+        message: "An agent run is already active in this worktree.",
+      }),
+    );
+    codex.release();
+    claude.release();
+  });
+
+  it("uses key reservations for atomic non-run exclusion without consuming capacity", () => {
+    const scheduler = createRunScheduler({
+      coordinator: createRunCoordinator({ limit: 1 }),
+    });
+    const lock = scheduler.reserveKey(options("same"));
+
+    expect(scheduler.activeCount()).toBe(0);
+    expect(() => scheduler.reserveRun(options("same"))).toThrowError(
+      expect.objectContaining({ code: "duplicate" }),
+    );
+    const unrelated = scheduler.reserveRun(options("other"));
+    expect(scheduler.activeCount()).toBe(1);
+
+    unrelated.release();
+    lock.release();
+    expect(() => scheduler.reserveRun(options("same"))).not.toThrow();
   });
 
   it("rejects queued work during shutdown and leaves no key reserved", async () => {

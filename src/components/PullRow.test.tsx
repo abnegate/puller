@@ -6,13 +6,20 @@ import {
   act,
   cleanup,
   fireEvent,
-  render,
+  render as renderBase,
   renderHook,
   screen,
   waitFor,
   within,
 } from "@testing-library/react";
-import { type MouseEvent, useCallback, useState } from "react";
+import {
+  type MouseEvent,
+  type ReactElement,
+  type ReactNode,
+  useCallback,
+  useLayoutEffect,
+  useState,
+} from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const motionSettings = vi.hoisted(() => ({ reduced: false }));
@@ -27,6 +34,8 @@ vi.mock("motion/react", async (importOriginal) => {
 
 vi.mock("../api", () => ({
   getCheckLog: vi.fn(),
+  getPullCommitDiff: vi.fn(),
+  getPullCommits: vi.fn(),
   getPullDiff: vi.fn(),
   mergePull: vi.fn(),
   parseGitHubActionsJobUrl: vi.fn(() => null),
@@ -40,9 +49,25 @@ vi.mock("../api", () => ({
       this.name = "PullDiffHttpError";
     }
   },
+  PullCommitsHttpError: class extends Error {
+    constructor(
+      public readonly status: number,
+      public readonly code: string,
+      message: string,
+    ) {
+      super(message);
+      this.name = "PullCommitsHttpError";
+    }
+  },
 }));
 
-import { getPullDiff, mergePull, PullDiffHttpError } from "../api";
+import {
+  getPullCommitDiff,
+  getPullCommits,
+  getPullDiff,
+  mergePull,
+  PullDiffHttpError,
+} from "../api";
 import {
   EMPTY_VIEWED_FILES,
   EMPTY_VIEWED_FILES_BY_PULL,
@@ -53,33 +78,103 @@ import {
 import { getPullKey, type PullSectionItem } from "../preferences";
 import type { PullMovement } from "../movements";
 import {
+  PullRowContinuityProvider,
+  usePullRowContinuity,
+} from "../row-continuity";
+import {
   IDLE_RUN_STATE,
   type PullRuns,
+  type RunHistoryEntry,
   type RunStartOutcome,
   type RunState,
 } from "../runs";
 import { createPendingPull, createPullsResponse } from "../test/fixtures";
-import type { PullDiff, PullReadiness } from "../types";
+import type {
+  PullCommit,
+  PullCommitDiff,
+  PullCommits,
+  PullDiff,
+  PullReadiness,
+} from "../types";
 import PullRow, { useDiffDisclosure } from "./PullRow";
 import ReadinessSection from "./ReadinessSection";
 
+const render = (ui: ReactElement) =>
+  renderBase(ui, {
+    wrapper: ({ children }: { children: ReactNode }) => (
+      <PullRowContinuityProvider>{children}</PullRowContinuityProvider>
+    ),
+  });
+
 type Controls = Pick<
   PullRuns,
-  "cancel" | "observeRepair" | "setMessage" | "start"
+  | "cancel"
+  | "clearReviewRetry"
+  | "loadTranscript"
+  | "observeRepair"
+  | "setMessage"
+  | "start"
 >;
 
 const getBlockedPull = (): PullReadiness => createPullsResponse().notReady[0]!;
 const getReadyPull = (): PullReadiness => createPullsResponse().ready[0]!;
 const VIEWER_LOGIN = "jake";
 const ARTIFACT_EPOCH = 1;
+const transcripts = new Map<string, string>();
 
 const createRun = (change: Partial<RunState> = {}): RunState => ({
   ...IDLE_RUN_STATE,
   ...change,
 });
 
+const deferred = <Value,>() => {
+  let resolve!: (value: Value | PromiseLike<Value>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<Value>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, reject, resolve };
+};
+
+const createHistoryEntry = ({
+  transcriptText = "Checked the affected path.\nValidation passed.",
+  ...change
+}: Partial<RunHistoryEntry> & {
+  transcriptText?: string;
+} = {}): RunHistoryEntry => {
+  const entry: RunHistoryEntry = {
+    agent: "claude",
+    finishedAt: new Date(Date.now() - 5 * 60 * 1_000).toISOString(),
+    headRefOid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    id: "previous-fix",
+    instructions: {
+      kind: "manual",
+      text: "Fix the stale readiness evidence.",
+    },
+    source: "manual",
+    status: "completed",
+    transcript: {
+      availability: "available",
+      bytes: new TextEncoder().encode(transcriptText).byteLength,
+      key: `transcript:${change.id ?? "previous-fix"}`,
+    },
+    ...change,
+  };
+  if (entry.transcript.availability === "available") {
+    transcripts.set(entry.transcript.key, transcriptText);
+  }
+  return entry;
+};
+
 const createControls = (): Controls => ({
   cancel: vi.fn(async (_key: string) => undefined),
+  clearReviewRetry: vi.fn(),
+  loadTranscript: vi.fn(async (entry) =>
+    entry.transcript.availability === "available"
+      ? (transcripts.get(entry.transcript.key) ?? null)
+      : null,
+  ),
   observeRepair: vi.fn(async () => undefined),
   setMessage: vi.fn((_key: string, _message: string) => undefined),
   start: vi.fn(
@@ -157,8 +252,10 @@ function ControlledRow({
       <PullRow
         artifactEpoch={ARTIFACT_EPOCH}
         cancelRun={controls.cancel}
+        clearReviewRetry={controls.clearReviewRetry}
         favorite={favorite}
         hidePull={hidePull}
+        loadTranscript={controls.loadTranscript}
         movement={movement}
         onMutationComplete={onMutationComplete}
         onToggleViewed={onToggleViewed}
@@ -179,6 +276,36 @@ function ControlledRow({
       />
     </ul>
   );
+}
+
+function SeededCommitsRow({
+  persistence,
+  pull,
+}: {
+  persistence: unknown;
+  pull: PullReadiness;
+}) {
+  const { ensureDiffKey, update } = usePullRowContinuity(getPullKey(pull));
+  const [seeded, setSeeded] = useState(false);
+  const diffKey = getPullDiffKey(pull, VIEWER_LOGIN, ARTIFACT_EPOCH);
+
+  useLayoutEffect(() => {
+    ensureDiffKey(diffKey, "ready");
+    update({
+      commits: { persistence },
+      commitsExpanded: true,
+    });
+    setSeeded(true);
+  }, [diffKey, ensureDiffKey, persistence, update]);
+
+  return seeded ? (
+    <ControlledRow
+      controls={createControls()}
+      pull={pull}
+      run={createRun()}
+      variant="ready"
+    />
+  ) : null;
 }
 
 const row = (
@@ -244,6 +371,42 @@ const pullDiff = (pull: PullReadiness): PullDiff => ({
   warning: null,
 });
 
+const pullCommit = (
+  pull: PullReadiness,
+  sha = "1111111111111111111111111111111111111111",
+): PullCommit => ({
+  authorLogin: "jake",
+  authorName: "Jake",
+  authoredAt: "2026-07-17T10:00:00.000Z",
+  message: "Keep commit history visible",
+  sha,
+  url: `https://github.com/${pull.repository}/commit/${sha}`,
+});
+
+const pullCommits = (
+  pull: PullReadiness,
+  commits = [pullCommit(pull)],
+): PullCommits => {
+  return {
+    baseRefOid: pull.baseRefOid,
+    commits,
+    complete: true,
+    count: commits.length,
+    headRefOid: pull.headRefOid,
+    number: pull.number,
+    repository: pull.repository,
+    warning: null,
+  };
+};
+
+const pullCommitDiff = (
+  pull: PullReadiness,
+  commit = pullCommit(pull),
+): PullCommitDiff => ({
+  ...pullDiff(pull),
+  commitSha: commit.sha,
+});
+
 const pullItem = (pull: PullReadiness, favorite = false): PullSectionItem => ({
   favorite,
   identity: getPullKey(pull),
@@ -252,9 +415,60 @@ const pullItem = (pull: PullReadiness, favorite = false): PullSectionItem => ({
   pull,
 });
 
+function ContinuitySections({
+  blocked = [],
+  progress = [],
+  ready = [],
+  runs,
+}: {
+  blocked?: readonly PullSectionItem[];
+  progress?: readonly PullSectionItem[];
+  ready?: readonly PullSectionItem[];
+  runs: PullRuns;
+}) {
+  const visibleItemKeys = new Set(
+    [...ready, ...progress, ...blocked].map(({ key }) => key),
+  );
+
+  return (
+    <>
+      <ReadinessSection
+        {...sectionViewing}
+        emptyMessage="Nothing ready"
+        items={ready}
+        runs={runs}
+        title="Ready"
+        variant="ready"
+        visibleItemKeys={visibleItemKeys}
+      />
+      <ReadinessSection
+        {...sectionViewing}
+        emptyMessage="Nothing running"
+        items={progress}
+        runs={runs}
+        title="In progress"
+        variant="progress"
+        visibleItemKeys={visibleItemKeys}
+      />
+      <ReadinessSection
+        {...sectionViewing}
+        emptyMessage="Nothing blocked"
+        items={blocked}
+        runs={runs}
+        title="Not ready"
+        variant="blocked"
+        visibleItemKeys={visibleItemKeys}
+      />
+    </>
+  );
+}
+
 afterEach(() => {
   cleanup();
+  transcripts.clear();
   motionSettings.reduced = false;
+  vi.mocked(getPullCommitDiff).mockReset();
+  vi.mocked(getPullCommits).mockReset();
   vi.mocked(getPullDiff).mockReset();
   vi.mocked(mergePull).mockReset();
   vi.restoreAllMocks();
@@ -281,6 +495,7 @@ describe("PullRow ready presentation", () => {
       "[data-slot='pull-actions-trigger']",
     );
     const files = screen.getByRole("button", { name: "Files changed" });
+    const commits = screen.getByRole("button", { name: "Commits" });
     const merge = screen.getByRole("button", { name: "Merge" });
     const controls = container.querySelector<HTMLElement>(
       "[data-ready-controls]",
@@ -296,6 +511,7 @@ describe("PullRow ready presentation", () => {
       screen.getByRole("link", { name: /Open Greptile review/ }),
     );
     expect(trigger).not.toContainElement(files);
+    expect(trigger).not.toContainElement(commits);
     expect(trigger).not.toContainElement(merge);
     expect(controls).toHaveClass(
       "sm:self-stretch",
@@ -304,6 +520,7 @@ describe("PullRow ready presentation", () => {
       "sm:justify-between",
     );
     expect(controls).toContainElement(screen.getByText("All checks passed"));
+    expect(actions).toContainElement(commits);
     expect(actions).toContainElement(files);
     expect(actions).toContainElement(merge);
     expect(
@@ -311,6 +528,7 @@ describe("PullRow ready presentation", () => {
     ).not.toBeInTheDocument();
     expect(screen.getByLabelText("Favourite pull request")).toBeInTheDocument();
 
+    fireEvent.contextMenu(commits);
     fireEvent.contextMenu(files);
     fireEvent.contextMenu(merge);
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
@@ -349,6 +567,7 @@ describe("PullRow ready presentation", () => {
       container.querySelector("[data-ready-summary]")?.querySelectorAll("svg"),
     ).toHaveLength(1);
     expect(screen.getByRole("button", { name: "Files changed" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Commits" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Merge" })).toBeEnabled();
     expect(container.querySelectorAll("a")).toHaveLength(1);
     expect(container.querySelector('[data-status-icon="ready"]')).toHaveClass(
@@ -363,6 +582,127 @@ describe("PullRow ready presentation", () => {
       "dateTime",
       pull.updatedAt,
     );
+  });
+
+  it.each([
+    ["ready", getReadyPull()],
+    ["progress", createPendingPull()],
+    ["blocked", getBlockedPull()],
+  ] as const)(
+    "shows independently controlled commit and file panels for %s rows",
+    async (variant, pull) => {
+      vi.mocked(getPullCommits).mockResolvedValue(pullCommits(pull));
+      vi.mocked(getPullCommitDiff).mockResolvedValue(pullCommitDiff(pull));
+      vi.mocked(getPullDiff).mockResolvedValue(pullDiff(pull));
+      renderRow(pull, variant);
+
+      const commits = screen.getByRole("button", { name: "Commits" });
+      const files = screen.getByRole("button", { name: "Files changed" });
+      expect(commits).toHaveAttribute("aria-expanded", "false");
+      expect(files).toHaveAttribute("aria-expanded", "false");
+      expect(getPullCommits).not.toHaveBeenCalled();
+
+      fireEvent.click(commits);
+      expect(commits).toHaveAttribute("aria-expanded", "true");
+      expect(files).toHaveAttribute("aria-expanded", "false");
+      expect(
+        await screen.findByRole("region", {
+          name: `Commits for ${pull.repository} pull request ${pull.number}`,
+        }),
+      ).toBeInTheDocument();
+      await waitFor(() =>
+        expect(getPullCommitDiff).toHaveBeenCalledWith(
+          expect.objectContaining({
+            headRefOid: pull.headRefOid,
+            number: pull.number,
+            repository: pull.repository,
+          }),
+          "1111111111111111111111111111111111111111",
+          expect.any(AbortSignal),
+        ),
+      );
+
+      fireEvent.click(files);
+      expect(
+        await screen.findByRole("region", {
+          name: `Files changed for ${pull.repository} pull request ${pull.number}`,
+        }),
+      ).toBeInTheDocument();
+      expect(commits).toHaveAttribute("aria-expanded", "true");
+
+      fireEvent.click(commits);
+      expect(commits).toHaveAttribute("aria-expanded", "false");
+      expect(files).toHaveAttribute("aria-expanded", "true");
+      expect(
+        screen.queryByRole("region", {
+          name: `Commits for ${pull.repository} pull request ${pull.number}`,
+        }),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    ["missing visibility", undefined, "first"],
+    ["boolean visibility", false, "first"],
+    ["invalid visibility", "false", "second"],
+  ] as const)(
+    "accepts commit continuity with %s only when the visibility value is boolean",
+    async (_case, listVisible, expected) => {
+      const pull = getReadyPull();
+      const first = pullCommit(
+        pull,
+        "1111111111111111111111111111111111111111",
+      );
+      const second = pullCommit(
+        pull,
+        "2222222222222222222222222222222222222222",
+      );
+      vi.mocked(getPullCommits).mockResolvedValue(
+        pullCommits(pull, [first, second]),
+      );
+      vi.mocked(getPullCommitDiff).mockImplementation(async (_identity, sha) =>
+        pullCommitDiff(pull, sha === first.sha ? first : second),
+      );
+      const persistence = {
+        diffs: {},
+        selectedSha: first.sha,
+        viewed: {},
+        ...(listVisible === undefined ? {} : { listVisible }),
+      };
+
+      render(<SeededCommitsRow persistence={persistence} pull={pull} />);
+
+      const selected = expected === "first" ? first : second;
+      expect(
+        await screen.findByRole("region", {
+          name: `Files changed for ${pull.repository} pull request ${pull.number}`,
+        }),
+      ).toHaveTextContent(selected.sha.slice(0, 7));
+      expect(
+        screen.getByRole("list", { name: "Pull request commits" }),
+      ).toBeVisible();
+      expect(
+        screen.queryByRole("button", { name: /^(Hide|Show) commits$/ }),
+      ).not.toBeInTheDocument();
+      expect(getPullCommitDiff).toHaveBeenLastCalledWith(
+        expect.any(Object),
+        selected.sha,
+        expect.any(AbortSignal),
+      );
+    },
+  );
+
+  it("shows review preparation truthfully and disables merge until the run is accepted", () => {
+    const pull = getReadyPull();
+    renderRow(
+      pull,
+      "ready",
+      createRun({ source: "review", status: "preparing" }),
+    );
+
+    expect(screen.getByText("Review fix preparing")).toBeInTheDocument();
+    expect(screen.queryByText("All checks passed")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Merge" })).toBeDisabled();
   });
 
   it("keeps completed Fix output outside the ready review link", () => {
@@ -443,7 +783,8 @@ describe("PullRow ready presentation", () => {
         name: `Files changed for ${pull.repository} pull request ${pull.number}`,
       }),
     ).toBeInTheDocument();
-    expect(screen.getAllByText("src/ready.ts")).toHaveLength(2);
+    expect(screen.getByText("src/ready.ts")).toBeInTheDocument();
+    expect(screen.getByText("ready.ts")).toBeInTheDocument();
     expect(getPullDiff).toHaveBeenCalledTimes(2);
   });
 
@@ -497,7 +838,7 @@ describe("PullRow ready presentation", () => {
     expect(getPullDiff).toHaveBeenCalledTimes(2);
   });
 
-  it("preserves viewed files when the same diff is collapsed and reopened", async () => {
+  it("preserves viewed files while releasing the raw diff on collapse", async () => {
     const pull = getReadyPull();
     vi.mocked(getPullDiff).mockResolvedValue(pullDiff(pull));
     renderRow(pull, "ready");
@@ -522,6 +863,35 @@ describe("PullRow ready presentation", () => {
       await screen.findByRole("checkbox", { name: "Viewed src/ready.ts" }),
     ).toHaveAttribute("aria-checked", "true");
     expect(screen.getByText("1 of 1 files viewed")).toBeInTheDocument();
+    expect(getPullDiff).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves compact diff feedback while refetching raw diff data", async () => {
+    const pull = getReadyPull();
+    vi.mocked(getPullDiff).mockResolvedValue(pullDiff(pull));
+    renderRow(pull, "ready");
+    const disclosure = screen.getByRole("button", { name: "Files changed" });
+    fireEvent.click(disclosure);
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Give Claude feedback on new line 1",
+      }),
+    );
+    fireEvent.change(
+      screen.getByRole("textbox", {
+        name: "Claude feedback on new line 1",
+      }),
+      { target: { value: "Keep this compact draft." } },
+    );
+
+    fireEvent.click(disclosure);
+    fireEvent.click(disclosure);
+
+    expect(
+      await screen.findByRole("textbox", {
+        name: "Claude feedback on new line 1",
+      }),
+    ).toHaveValue("Keep this compact draft.");
     expect(getPullDiff).toHaveBeenCalledTimes(2);
   });
 
@@ -558,13 +928,13 @@ describe("PullRow ready presentation", () => {
   });
 
   it.each([
-    ["repository", { repository: "appwrite-labs/cloud" }],
-    ["number", { number: 4242 }],
-    ["base", { baseRefOid: "ffffffffffffffffffffffffffffffffffffffff" }],
-    ["head", { headRefOid: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" }],
+    ["repository", { repository: "appwrite-labs/cloud" }, true],
+    ["number", { number: 4242 }, true],
+    ["base", { baseRefOid: "ffffffffffffffffffffffffffffffffffffffff" }, false],
+    ["head", { headRefOid: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" }, false],
   ] as const)(
     "resets viewed files atomically when the pull %s changes",
-    async (_field, change) => {
+    async (_field, change, identityChanged) => {
       const pull = getReadyPull();
       const changed = { ...pull, ...change };
       vi.mocked(getPullDiff)
@@ -581,6 +951,12 @@ describe("PullRow ready presentation", () => {
       view.rerender(row(changed, "ready", createRun(), view.controls));
 
       expect(screen.queryByText("1 of 1 files viewed")).not.toBeInTheDocument();
+      if (identityChanged) {
+        expect(
+          screen.getByRole("button", { name: "Files changed" }),
+        ).toHaveAttribute("aria-expanded", "false");
+        fireEvent.click(screen.getByRole("button", { name: "Files changed" }));
+      }
       expect(
         await screen.findByRole("region", {
           name: `Files changed for ${changed.repository} pull request ${changed.number}`,
@@ -617,6 +993,7 @@ describe("PullRow ready presentation", () => {
     await waitFor(() => expect(getPullDiff).toHaveBeenCalledOnce());
 
     view.rerender(row(changed, "ready", createRun(), view.controls));
+    fireEvent.click(screen.getByRole("button", { name: "Files changed" }));
     await waitFor(() => expect(getPullDiff).toHaveBeenCalledTimes(2));
 
     await act(async () => {
@@ -679,6 +1056,7 @@ describe("PullRow ready presentation", () => {
     expect(controls).toHaveClass("flex-wrap");
     expect(controls).toHaveClass("relative", "z-20", "ml-auto", "justify-end");
     expect(panel).toHaveClass("w-full", "min-w-0");
+    expect(panel).not.toHaveClass("z-20");
     expect(icon).toHaveClass("self-center", "text-emerald-600");
   });
 
@@ -714,6 +1092,7 @@ describe("PullRow ready presentation", () => {
     await waitFor(() => {
       expect(mergePull).toHaveBeenCalledWith(
         {
+          agent: "claude",
           expectedHeadRefOid: pull.headRefOid,
           number: pull.number,
           repository: pull.repository,
@@ -799,6 +1178,346 @@ describe("PullRow controlled Fix presentation", () => {
   });
 });
 
+describe("PullRow previous fixes", () => {
+  it.each([
+    ["Ready", "ready", getReadyPull],
+    ["In progress", "progress", createPendingPull],
+    ["Not ready", "blocked", getBlockedPull],
+  ] as const)(
+    "keeps %s history collapsed and inert until its accessible disclosure opens",
+    async (_section, variant, getPull) => {
+      const pull = getPull();
+      const entry = createHistoryEntry();
+      const controls = createControls();
+      const { container } = renderRow(
+        pull,
+        variant,
+        createRun({ history: [entry] }),
+        controls,
+      );
+      const disclosure = screen.getByRole("button", {
+        name: "Previous fixes, 1 run",
+      });
+      const contentId = disclosure.getAttribute("aria-controls");
+
+      expect(disclosure).toHaveAttribute("aria-expanded", "false");
+      expect(contentId).toBeTruthy();
+      expect(within(disclosure).getByText("1")).toHaveAttribute(
+        "aria-hidden",
+        "true",
+      );
+      expect(
+        container.querySelector("[data-run-history-entry]"),
+      ).not.toBeInTheDocument();
+      expect(
+        container.querySelector("[data-run-history-transcript]"),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByText("Fix the stale readiness evidence."),
+      ).not.toBeInTheDocument();
+
+      fireEvent.click(disclosure);
+
+      expect(disclosure).toHaveAttribute("aria-expanded", "true");
+      const region = screen.getByRole("region", {
+        name: `Previous fixes for ${pull.repository} pull request ${pull.number}`,
+      });
+      expect(region).toHaveAttribute("id", contentId);
+      expect(within(region).getByText("Claude manual fix")).toBeInTheDocument();
+      expect(within(region).getByText("Completed")).toBeInTheDocument();
+      expect(within(region).getByText("5 mins ago")).toHaveAttribute(
+        "dateTime",
+        entry.finishedAt,
+      );
+      expect(region).toHaveTextContent("Fix the stale readiness evidence.");
+      expect(controls.loadTranscript).not.toHaveBeenCalled();
+      expect(
+        region.querySelector("[data-run-history-transcript]"),
+      ).not.toBeInTheDocument();
+
+      fireEvent.click(
+        within(region).getByRole("button", {
+          name: "Show transcript for Claude manual fix completed from 5 mins ago",
+        }),
+      );
+
+      expect(controls.loadTranscript).toHaveBeenCalledOnce();
+      const transcript = await within(region).findByLabelText(
+        "Claude manual fix transcript from 5 mins ago",
+      );
+      expect(transcript).toHaveTextContent(
+        "Checked the affected path. Validation passed.",
+      );
+      expect(transcript).toHaveClass(
+        "max-h-56",
+        "max-w-full",
+        "overflow-auto",
+        "whitespace-pre-wrap",
+      );
+      expect(transcript).not.toHaveAttribute("aria-live");
+      expect(region.querySelector("[aria-live]")).toBeNull();
+    },
+  );
+
+  it("renders immutable history order newest first with exact transcripts and effective instructions", () => {
+    const pull = getBlockedPull();
+    const newer = createHistoryEntry({
+      finishedAt: new Date(Date.now() - 5 * 60 * 1_000).toISOString(),
+      id: "newer-review",
+      instructions: {
+        feedback: {
+          body: "Keep retries bounded.",
+          line: 42,
+          path: "src/retry.ts",
+          side: "RIGHT",
+        },
+        kind: "review",
+        message: "Cover the timeout branch too.",
+      },
+      transcriptText: "newer line one\n  newer indented line\n",
+      source: "review",
+      status: "failed",
+    });
+    const older = createHistoryEntry({
+      finishedAt: new Date(Date.now() - 2 * 60 * 60 * 1_000).toISOString(),
+      id: "older-auto",
+      instructions: {
+        kind: "auto",
+        message: "",
+        triggers: [],
+      },
+      transcriptText: "older transcript",
+      source: "auto",
+      status: "cancelled",
+    });
+    const { container } = renderRow(
+      pull,
+      "blocked",
+      createRun({ history: [newer, older] }),
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Previous fixes, 2 runs",
+      }),
+    );
+
+    const entries = container.querySelectorAll("[data-run-history-entry]");
+    expect(entries).toHaveLength(2);
+    expect(entries[0]).toHaveAttribute("data-run-history-entry", newer.id);
+    expect(entries[1]).toHaveAttribute("data-run-history-entry", older.id);
+    expect(
+      within(entries[0] as HTMLElement).getByText("Claude review fix"),
+    ).toBeInTheDocument();
+    expect(
+      within(entries[0] as HTMLElement).getByText("Failed"),
+    ).toBeInTheDocument();
+    expect(entries[0]).toHaveTextContent(
+      "Keep retries bounded. Additional context: Cover the timeout branch too.",
+    );
+    expect(
+      transcripts.get(
+        newer.transcript.availability === "available"
+          ? newer.transcript.key
+          : "",
+      ),
+    ).toBe("newer line one\n  newer indented line\n");
+    expect(
+      within(entries[1] as HTMLElement).getByText("Claude auto fix"),
+    ).toBeInTheDocument();
+    expect(
+      within(entries[1] as HTMLElement).getByText("Cancelled"),
+    ).toBeInTheDocument();
+    expect(entries[1]).toHaveTextContent(
+      "Fix every current readiness blocker.",
+    );
+    expect(
+      transcripts.get(
+        older.transcript.availability === "available"
+          ? older.transcript.key
+          : "",
+      ),
+    ).toBe("older transcript");
+  });
+
+  it("suppresses a stale transcript response after collapse and loads the newest request", async () => {
+    const pull = getBlockedPull();
+    const entry = createHistoryEntry({ transcriptText: "Stored transcript." });
+    const first = deferred<string | null>();
+    const second = deferred<string | null>();
+    const controls = createControls();
+    vi.mocked(controls.loadTranscript)
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    renderRow(pull, "blocked", createRun({ history: [entry] }), controls);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Previous fixes, 1 run" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Show transcript for Claude manual fix completed from 5 mins ago",
+      }),
+    );
+    expect(screen.getByText("Loading transcript…")).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Hide transcript for Claude manual fix completed from 5 mins ago",
+      }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Show transcript for Claude manual fix completed from 5 mins ago",
+      }),
+    );
+
+    await act(async () => first.resolve("Stale transcript."));
+    expect(screen.queryByText("Stale transcript.")).not.toBeInTheDocument();
+    expect(screen.getByText("Loading transcript…")).toBeInTheDocument();
+
+    await act(async () => second.resolve("Fresh transcript."));
+    expect(await screen.findByText("Fresh transcript.")).toBeInTheDocument();
+    expect(controls.loadTranscript).toHaveBeenCalledTimes(2);
+  });
+
+  it("renders explicit unavailable transcript metadata without attempting a load", () => {
+    const pull = getBlockedPull();
+    const controls = createControls();
+    const entry = createHistoryEntry({
+      transcript: {
+        availability: "unavailable",
+        bytes: 42,
+        code: "indexeddb_write_failed",
+        message: "Browser storage rejected this transcript.",
+      },
+    });
+    renderRow(pull, "blocked", createRun({ history: [entry] }), controls);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Previous fixes, 1 run" }),
+    );
+
+    expect(screen.getByText("Transcript unavailable")).toBeInTheDocument();
+    expect(
+      screen.getByText("Browser storage rejected this transcript."),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /transcript for/ })).toBeNull();
+    expect(controls.loadTranscript).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["progress", createPendingPull],
+    ["blocked", getBlockedPull],
+  ] as const)(
+    "keeps %s history below the fresh composer and outside row action boundaries",
+    (variant, getPull) => {
+      const pull = getPull();
+      const { container } = render(
+        <ControlledRow
+          controls={createControls()}
+          hidePull={vi.fn()}
+          pull={pull}
+          run={createRun({ history: [createHistoryEntry()] })}
+          setFavorite={vi.fn()}
+          variant={variant}
+        />,
+      );
+      const actionBoundary = container.querySelector<HTMLElement>(
+        "[data-slot='pull-actions-trigger']",
+      );
+      const controls = container.querySelector<HTMLElement>(
+        "[data-pull-controls]",
+      );
+      const input = screen.getByRole("textbox");
+      const history = screen.getByRole("button", { name: /Previous fixes/ });
+
+      expect(actionBoundary).not.toContainElement(history);
+      expect(controls).not.toContainElement(history);
+      expect(
+        input.compareDocumentPosition(history) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      fireEvent.contextMenu(history);
+      expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    },
+  );
+
+  it("keeps ready history outside the row link, context menu, and action controls", () => {
+    const pull = getReadyPull();
+    const { container } = render(
+      <ControlledRow
+        controls={createControls()}
+        hidePull={vi.fn()}
+        pull={pull}
+        run={createRun({ history: [createHistoryEntry()] })}
+        setFavorite={vi.fn()}
+        variant="ready"
+      />,
+    );
+    const history = screen.getByRole("button", { name: /Previous fixes/ });
+    const contextBoundary = container.querySelector<HTMLElement>(
+      "[data-slot='pull-actions-trigger']",
+    );
+    const link = container.querySelector<HTMLElement>("[data-row-link]");
+    const controls = container.querySelector<HTMLElement>(
+      "[data-ready-controls]",
+    );
+
+    expect(contextBoundary).not.toContainElement(history);
+    expect(link).not.toContainElement(history);
+    expect(controls).not.toContainElement(history);
+    fireEvent.contextMenu(history);
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("keeps active output live and separate from non-live historical transcripts", async () => {
+    const pull = createPendingPull();
+    const entry = createHistoryEntry({
+      transcriptText: "Archived output only.",
+    });
+    const controls = createControls();
+    renderRow(
+      pull,
+      "progress",
+      createRun({
+        history: [entry],
+        output: "Current output only.",
+        status: "running",
+      }),
+      controls,
+    );
+
+    const current = screen.getByRole("log", {
+      name: `Claude output for ${pull.repository} pull request ${pull.number}`,
+    });
+    expect(current).toHaveAttribute("aria-live", "polite");
+    expect(current).toHaveTextContent("Current output only.");
+    expect(current).not.toHaveTextContent("Archived output only.");
+
+    const disclosure = screen.getByRole("button", {
+      name: /Previous fixes/,
+    });
+    expect(disclosure.querySelector("svg")).toHaveClass(
+      "motion-reduce:transition-none",
+    );
+    fireEvent.click(disclosure);
+    expect(controls.loadTranscript).not.toHaveBeenCalled();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Show transcript for Claude manual fix completed from 5 mins ago",
+      }),
+    );
+    const transcript = await screen.findByLabelText(
+      "Claude manual fix transcript from 5 mins ago",
+    );
+    expect(transcript).toHaveTextContent("Archived output only.");
+    expect(transcript).not.toHaveTextContent("Current output only.");
+    expect(transcript).not.toHaveAttribute("aria-live");
+    expect(transcript).not.toHaveAttribute("role", "log");
+  });
+});
+
 describe("PullRow progress and blocker presentation", () => {
   it("keeps diff controls and content, details, fix input, and terminal output outside the action boundary", async () => {
     const pull = getBlockedPull();
@@ -824,13 +1543,16 @@ describe("PullRow progress and blocker presentation", () => {
     const input = screen.getByRole("textbox");
     const terminal = screen.getByRole("log");
     const files = screen.getByRole("button", { name: "Files changed" });
+    const commits = screen.getByRole("button", { name: "Commits" });
 
     expect(trigger).not.toBeNull();
     expect(trigger).not.toContainElement(details);
+    expect(trigger).not.toContainElement(commits);
     expect(trigger).not.toContainElement(files);
     expect(trigger).not.toContainElement(input);
     expect(trigger).not.toContainElement(terminal);
 
+    fireEvent.contextMenu(commits);
     fireEvent.contextMenu(files);
     fireEvent.contextMenu(details);
     fireEvent.contextMenu(input);
@@ -879,11 +1601,13 @@ describe("PullRow progress and blocker presentation", () => {
         },
         expect.any(AbortSignal),
       );
-      expect(
-        await screen.findByRole("region", {
-          name: `Files changed for ${pull.repository} pull request ${pull.number}`,
-        }),
-      ).toBeInTheDocument();
+      const panel = await screen.findByRole("region", {
+        name: `Files changed for ${pull.repository} pull request ${pull.number}`,
+      });
+      const card = panel.closest<HTMLElement>("[data-slot='card']");
+      expect(panel).toBeInTheDocument();
+      expect(card).toHaveClass("overflow-visible");
+      expect(card).not.toHaveClass("overflow-hidden");
 
       fireEvent.click(disclosure);
       expect(disclosure).toHaveAttribute("aria-expanded", "false");
@@ -904,7 +1628,7 @@ describe("PullRow progress and blocker presentation", () => {
     expect(title.querySelector("svg")).toBeNull();
   });
 
-  it("shows a disabled diff control when the viewer identity is unavailable", () => {
+  it("disables artifact controls when the viewer identity is unavailable", () => {
     const pull = createPendingPull();
     render(
       <ControlledRow
@@ -922,7 +1646,9 @@ describe("PullRow progress and blocker presentation", () => {
     expect(
       screen.getByRole("button", { name: "Show blocker details" }),
     ).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Commits" })).toBeDisabled();
     expect(getPullDiff).not.toHaveBeenCalled();
+    expect(getPullCommits).not.toHaveBeenCalled();
   });
 
   it("keeps an expanded diff and viewed state when the same row changes variant", async () => {
@@ -974,7 +1700,7 @@ describe("PullRow progress and blocker presentation", () => {
     expect(getPullDiff).toHaveBeenCalledTimes(2);
   });
 
-  it("shows a centered spinning yellow progress icon and passed/total CI counts", () => {
+  it("shows a centered spinning yellow progress icon and exact CI counts", () => {
     const pull = createPendingPull();
     const { container } = renderRow(pull, "progress");
 
@@ -988,7 +1714,9 @@ describe("PullRow progress and blocker presentation", () => {
     );
     expect(icon).toHaveAttribute("data-status-active", "false");
     expect(screen.getByText("CI running")).toBeInTheDocument();
-    expect(screen.getByText("1 of 2 checks passed")).toBeInTheDocument();
+    expect(
+      screen.getByText("0 in progress · 1 queued · 1 successful · 0 failed"),
+    ).toBeInTheDocument();
     const blockerList = screen.getByRole("list", { name: "Blockers" });
     expect(blockerList.querySelector("svg")).toHaveClass("text-amber-600");
     expect(
@@ -1009,8 +1737,10 @@ describe("PullRow progress and blocker presentation", () => {
     );
 
     expect(screen.getAllByText("Claude running").length).toBeGreaterThan(0);
-    expect(screen.getByText(/1 of 2 checks passed/)).toHaveTextContent(
-      "1 of 2 checks passed · Claude running",
+    expect(
+      screen.getByText(/0 in progress · 1 queued · 1 successful · 0 failed/),
+    ).toHaveTextContent(
+      "0 in progress · 1 queued · 1 successful · 0 failed · Claude running",
     );
     expect(screen.getByRole("log")).toHaveTextContent("Still working.");
     expect(
@@ -1029,6 +1759,124 @@ describe("PullRow progress and blocker presentation", () => {
     );
   });
 
+  it("uses the server's in-progress, queued, successful, failed, and incomplete counts", () => {
+    const current = createPendingPull();
+    const pull = {
+      ...current,
+      ci: {
+        ...current.ci,
+        complete: false,
+        failed: 1,
+        inProgress: 2,
+        passed: 4,
+        queued: 3,
+        total: 12,
+        unknown: 2,
+      },
+    };
+    renderRow(pull, "progress");
+
+    expect(
+      screen.getByText(
+        "2 in progress · 3 queued · 4 successful · 1 failed · 2 unknown",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows subdued CI counts including failures on blocked rows", () => {
+    const pull = getBlockedPull();
+    const { container } = renderRow(pull, "blocked");
+
+    const overview = screen.getByText(
+      "0 in progress · 0 queued · 1 successful · 1 failed",
+    );
+    expect(overview).toHaveClass("text-muted-foreground");
+    expect(overview).not.toHaveClass(
+      "text-amber-800",
+      "dark:text-amber-300",
+      "text-destructive",
+    );
+    expect(container.querySelector("[data-ci-progress]")).toBe(overview);
+    expect(screen.getByRole("list", { name: "Blockers" })).toHaveTextContent(
+      "CI checks failed",
+    );
+  });
+
+  it("uses authoritative incomplete CI counts on blocked rows", () => {
+    const current = getBlockedPull();
+    const pull = {
+      ...current,
+      ci: {
+        ...current.ci,
+        complete: false,
+        failed: 1,
+        inProgress: 2,
+        passed: 4,
+        queued: 3,
+        total: 12,
+        unknown: 2,
+      },
+    };
+    renderRow(pull, "blocked");
+
+    expect(
+      screen.getByText(
+        "2 in progress · 3 queued · 4 successful · 1 failed · 2 unknown",
+      ),
+    ).toHaveClass("text-muted-foreground");
+  });
+
+  it("shows the no-checks message on blocked rows", () => {
+    const current = getBlockedPull();
+    const pull = {
+      ...current,
+      ci: {
+        ...current.ci,
+        checks: [],
+        complete: true,
+        failed: 0,
+        inProgress: 0,
+        passed: 0,
+        queued: 0,
+        running: 0,
+        state: "none" as const,
+        total: 0,
+        unknown: 0,
+      },
+    };
+    renderRow(pull, "blocked");
+
+    expect(screen.getByText("No CI checks reported")).toHaveClass(
+      "text-muted-foreground",
+    );
+  });
+
+  it("keeps active-run CI semantics on progress rows and hides the overview on ready rows", () => {
+    const run = createRun({
+      message: "Finish the active run.",
+      status: "running",
+    });
+    const progress = renderRow(createPendingPull(), "progress", run);
+
+    expect(progress.container.querySelector("[data-ci-progress]")).toHaveClass(
+      "text-amber-800",
+      "dark:text-amber-300",
+    );
+    expect(
+      screen.getByText(/0 in progress · 1 queued · 1 successful · 0 failed/),
+    ).toHaveTextContent(
+      "0 in progress · 1 queued · 1 successful · 0 failed · Claude running",
+    );
+    expect(screen.getByText("Claude is active")).toHaveAttribute(
+      "role",
+      "status",
+    );
+
+    progress.unmount();
+    const ready = renderRow(getReadyPull(), "ready", run);
+    expect(ready.container.querySelector("[data-ci-progress]")).toBeNull();
+  });
+
   it("labels an automatic run as Auto fix without changing manual terminology", () => {
     const pull = createPendingPull();
     renderRow(
@@ -1041,10 +1889,12 @@ describe("PullRow progress and blocker presentation", () => {
       }),
     );
 
-    expect(screen.getAllByText("Auto fix running").length).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText("Claude auto fix running").length,
+    ).toBeGreaterThan(0);
     expect(
       screen.getByRole("log", {
-        name: `Auto fix output for ${pull.repository} pull request ${pull.number}`,
+        name: `Claude auto fix output for ${pull.repository} pull request ${pull.number}`,
       }),
     ).toHaveTextContent("Addressing the automatic trigger.");
     expect(screen.queryByText("Claude running")).not.toBeInTheDocument();
@@ -1063,15 +1913,40 @@ describe("PullRow progress and blocker presentation", () => {
       }),
     );
 
-    expect(screen.getAllByText("Review fix running").length).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText("Claude review fix running").length,
+    ).toBeGreaterThan(0);
     expect(
       screen.getByRole("log", {
-        name: `Review fix output for ${pull.repository} pull request ${pull.number}`,
+        name: `Claude review fix output for ${pull.repository} pull request ${pull.number}`,
       }),
     ).toHaveTextContent("Addressing selected diff feedback.");
     expect(
-      screen.getByText("Review fix", { selector: "span" }),
+      screen.getByText("Claude review fix", { selector: "span" }),
     ).toBeInTheDocument();
+  });
+
+  it("labels review preflight as preparation while CI is already in progress", () => {
+    const pull = createPendingPull();
+    const { container } = renderRow(
+      pull,
+      "progress",
+      createRun({ source: "review", status: "preparing" }),
+    );
+
+    expect(
+      screen.getAllByText("Claude review fix preparing").length,
+    ).toBeGreaterThan(0);
+    expect(screen.getByText("Claude review fix is preparing")).toHaveAttribute(
+      "role",
+      "status",
+    );
+    expect(
+      screen.getByRole("button", { name: "Preparing review fix" }),
+    ).toBeDisabled();
+    expect(
+      container.querySelector('[data-status-icon="progress"]'),
+    ).toHaveAttribute("data-status-active", "true");
   });
 
   it("spins the primary progress icon for an active conflict repair", () => {
@@ -1108,6 +1983,7 @@ describe("PullRow progress and blocker presentation", () => {
       const details = screen.getByRole("button", {
         name: "Show blocker details",
       });
+      const commits = screen.getByRole("button", { name: "Commits" });
       const files = screen.getByRole("button", { name: "Files changed" });
       const badge =
         variant === "progress"
@@ -1127,9 +2003,14 @@ describe("PullRow progress and blocker presentation", () => {
       expect(controls).toContainElement(badge);
       expect(controls).toContainElement(actions as HTMLElement);
       expect(actions).toContainElement(details);
+      expect(actions).toContainElement(commits);
       expect(actions).toContainElement(files);
       expect(
-        details.compareDocumentPosition(files) &
+        details.compareDocumentPosition(commits) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      expect(
+        commits.compareDocumentPosition(files) &
           Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy();
       expect(
@@ -1292,6 +2173,557 @@ describe("PullRow progress and blocker presentation", () => {
 });
 
 describe("ReadinessSection controlled reparenting", () => {
+  it("keeps blocker details open and restores exact internal focus while the exiting row is inert", async () => {
+    const pull = getBlockedPull();
+    const target = pullItem(pull);
+    const unrelatedPull = {
+      ...createPendingPull(),
+      number: pull.number + 1,
+      title: "Unrelated in-progress pull",
+      url: `https://github.com/${pull.repository}/pull/${pull.number + 1}`,
+    };
+    const unrelated = pullItem(unrelatedPull);
+    const controls = createControls();
+    const runs = createRuns(new Map(), controls);
+    const view = render(
+      <ContinuitySections
+        blocked={[target]}
+        progress={[unrelated]}
+        runs={runs}
+      />,
+    );
+    const blocked = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="blocked"]',
+    )!;
+    const source = blocked.querySelector<HTMLElement>(
+      `[data-pull-identity="${target.identity}"]`,
+    )!;
+    const details = within(source).getByRole("button", {
+      name: "Show blocker details",
+    });
+
+    fireEvent.click(details);
+    const thread = within(source).getAllByRole("link", {
+      name: "Open thread",
+    })[0]!;
+    thread.focus();
+    expect(thread).toHaveFocus();
+    expect(details).toHaveAttribute("aria-expanded", "true");
+
+    view.rerender(
+      <ContinuitySections progress={[unrelated, target]} runs={runs} />,
+    );
+
+    const progress = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="progress"]',
+    )!;
+    const destination = progress.querySelector<HTMLElement>(
+      `[data-pull-identity="${target.identity}"]`,
+    )!;
+    const restored = within(destination).getAllByRole("link", {
+      name: "Open thread",
+    })[0]!;
+    const unrelatedRow = progress.querySelector<HTMLElement>(
+      `[data-pull-identity="${unrelated.identity}"]`,
+    )!;
+
+    expect(destination).not.toHaveAttribute("aria-hidden");
+    expect(destination).not.toHaveAttribute("inert");
+    await waitFor(() => expect(restored).toHaveFocus());
+    expect(restored).toBeEnabled();
+    expect(
+      within(destination).getByRole("button", {
+        name: "Hide blocker details",
+      }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(
+      destination.querySelector("[data-blocker-panel]"),
+    ).toBeInTheDocument();
+    expect(unrelatedRow.contains(document.activeElement)).toBe(false);
+  });
+
+  it("makes an overlapping source row inert while its destination stays interactive", async () => {
+    const pull = getBlockedPull();
+    const item = pullItem(pull);
+    const controls = createControls();
+    const runs = createRuns(new Map(), controls);
+    const visibleItemKeys = new Set([item.key]);
+    const view = render(
+      <>
+        <ReadinessSection
+          {...sectionViewing}
+          emptyMessage="Nothing blocked"
+          items={[item]}
+          runs={runs}
+          title="Not ready"
+          variant="blocked"
+          visibleItemKeys={visibleItemKeys}
+        />
+        <ReadinessSection
+          {...sectionViewing}
+          emptyMessage="Nothing running"
+          items={[item]}
+          runs={runs}
+          title="In progress"
+          variant="progress"
+          visibleItemKeys={visibleItemKeys}
+        />
+      </>,
+    );
+    const source = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="blocked"] [data-pull-identity]',
+    )!;
+    const destination = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="progress"] [data-pull-identity]',
+    )!;
+
+    expect(
+      view.container.querySelectorAll(
+        `[data-pull-identity="${item.identity}"]`,
+      ),
+    ).toHaveLength(2);
+    await waitFor(() => expect(source).toHaveAttribute("inert"));
+    expect(source).toHaveAttribute("aria-hidden", "true");
+    expect(destination).not.toHaveAttribute("inert");
+    expect(destination).not.toHaveAttribute("aria-hidden");
+    expect(
+      within(destination).getByRole("button", { name: "Files changed" }),
+    ).toBeEnabled();
+  });
+
+  it("falls back from a removed blocker control to the blocker trigger after a move", async () => {
+    const pull = getBlockedPull();
+    const sourceItem = pullItem(pull);
+    const destinationItem = pullItem({
+      ...pull,
+      unresolvedThreads: [],
+    });
+    const controls = createControls();
+    const runs = createRuns(new Map(), controls);
+    const view = render(
+      <ContinuitySections blocked={[sourceItem]} runs={runs} />,
+    );
+    const source = view.container.querySelector<HTMLElement>(
+      `[data-pull-identity="${sourceItem.identity}"]`,
+    )!;
+    fireEvent.click(
+      within(source).getByRole("button", { name: "Show blocker details" }),
+    );
+    const thread = within(source).getAllByRole("link", {
+      name: "Open thread",
+    })[0]!;
+    thread.focus();
+    expect(thread).toHaveFocus();
+
+    view.rerender(
+      <ContinuitySections progress={[destinationItem]} runs={runs} />,
+    );
+
+    const progress = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="progress"]',
+    )!;
+    const destination = progress.querySelector<HTMLElement>(
+      `[data-pull-identity="${destinationItem.identity}"]`,
+    )!;
+    const fallback = within(destination).getByRole("button", {
+      name: "Hide blocker details",
+    });
+    await waitFor(() => expect(fallback).toHaveFocus());
+    expect(
+      within(destination).queryByRole("link", { name: "Open thread" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not steal focus after focus leaves a pull before it moves", async () => {
+    const pull = getBlockedPull();
+    const item = pullItem(pull);
+    const controls = createControls();
+    const runs = createRuns(new Map(), controls);
+    const view = render(
+      <>
+        <button type="button">Outside pull</button>
+        <ContinuitySections blocked={[item]} runs={runs} />
+      </>,
+    );
+    const source = view.container.querySelector<HTMLElement>(
+      `[data-pull-identity="${item.identity}"]`,
+    )!;
+    fireEvent.click(
+      within(source).getByRole("button", { name: "Show blocker details" }),
+    );
+    const thread = within(source).getAllByRole("link", {
+      name: "Open thread",
+    })[0]!;
+    thread.focus();
+    const outside = screen.getByRole("button", { name: "Outside pull" });
+    outside.focus();
+    await act(async () => Promise.resolve());
+    expect(outside).toHaveFocus();
+
+    view.rerender(
+      <>
+        <button type="button">Outside pull</button>
+        <ContinuitySections progress={[item]} runs={runs} />
+      </>,
+    );
+
+    const destination = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="progress"] [data-pull-identity]',
+    )!;
+    await act(async () => Promise.resolve());
+    expect(outside).toHaveFocus();
+    expect(destination.contains(document.activeElement)).toBe(false);
+  });
+
+  it("keeps an open diff, selection, draft, and exact focus through progress and blocked moves", async () => {
+    const pull = getReadyPull();
+    const item = pullItem(pull);
+    const controls = createControls();
+    const runs = createRuns(new Map(), controls);
+    vi.mocked(getPullDiff).mockResolvedValue(pullDiff(pull));
+    const view = render(<ContinuitySections ready={[item]} runs={runs} />);
+    const ready = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="ready"]',
+    )!;
+    const source = ready.querySelector<HTMLElement>(
+      `[data-pull-identity="${item.identity}"]`,
+    )!;
+
+    fireEvent.click(
+      within(source).getByRole("button", { name: "Files changed" }),
+    );
+    const composer = await within(source).findByRole("button", {
+      name: "Give Claude feedback on new line 1",
+    });
+    fireEvent.click(composer);
+    const input = within(source).getByRole("textbox", {
+      name: "Claude feedback on new line 1",
+    });
+    fireEvent.change(input, {
+      target: { value: "Keep this exact unsaved diff feedback." },
+    });
+    input.focus();
+    expect(input).toHaveFocus();
+
+    view.rerender(<ContinuitySections progress={[item]} runs={runs} />);
+
+    const progress = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="progress"]',
+    )!;
+    const progressRow = progress.querySelector<HTMLElement>(
+      `[data-pull-identity="${item.identity}"]`,
+    )!;
+    const progressInput = within(progressRow).getByRole("textbox", {
+      name: "Claude feedback on new line 1",
+    });
+    await waitFor(() => expect(progressInput).toHaveFocus());
+    expect(progressInput).toHaveValue("Keep this exact unsaved diff feedback.");
+    expect(
+      within(progressRow).getByRole("button", { name: "Files changed" }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(
+      progressRow.querySelectorAll("[data-comment-selected]"),
+    ).toHaveLength(1);
+
+    view.rerender(<ContinuitySections blocked={[item]} runs={runs} />);
+
+    const blocked = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="blocked"]',
+    )!;
+    const blockedRow = blocked.querySelector<HTMLElement>(
+      `[data-pull-identity="${item.identity}"]`,
+    )!;
+    const blockedInput = within(blockedRow).getByRole("textbox", {
+      name: "Claude feedback on new line 1",
+    });
+    await waitFor(() => expect(blockedInput).toHaveFocus());
+    expect(blockedInput).toHaveValue("Keep this exact unsaved diff feedback.");
+    expect(
+      within(blockedRow).getByRole("button", { name: "Files changed" }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(blockedRow.querySelectorAll("[data-comment-selected]")).toHaveLength(
+      1,
+    );
+    expect(getPullDiff).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the selected commit panel and exact commit focus through a section move", async () => {
+    const pull = getReadyPull();
+    const item = pullItem(pull);
+    const controls = createControls();
+    const runs = createRuns(new Map(), controls);
+    const first = pullCommit(pull, "1111111111111111111111111111111111111111");
+    const second = {
+      ...pullCommit(pull, "2222222222222222222222222222222222222222"),
+      message: "Keep exact commit focus",
+    };
+    vi.mocked(getPullCommits).mockResolvedValue(
+      pullCommits(pull, [first, second]),
+    );
+    vi.mocked(getPullCommitDiff).mockImplementation(async (_identity, sha) =>
+      pullCommitDiff(pull, sha === first.sha ? first : second),
+    );
+    const view = render(<ContinuitySections ready={[item]} runs={runs} />);
+    const ready = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="ready"]',
+    )!;
+    const source = ready.querySelector<HTMLElement>(
+      `[data-pull-identity="${item.identity}"]`,
+    )!;
+
+    fireEvent.click(within(source).getByRole("button", { name: "Commits" }));
+    const selected = await within(source).findByRole("button", {
+      name: /Keep exact commit focus, commit 2222222/,
+    });
+    selected.focus();
+    expect(selected).toHaveFocus();
+
+    view.rerender(<ContinuitySections progress={[item]} runs={runs} />);
+
+    const progress = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="progress"]',
+    )!;
+    const destination = progress.querySelector<HTMLElement>(
+      `[data-pull-identity="${item.identity}"]`,
+    )!;
+    const restored = await within(destination).findByRole("button", {
+      name: /Keep exact commit focus, commit 2222222/,
+    });
+    await waitFor(() => expect(restored).toHaveFocus());
+    expect(restored).toHaveAttribute("aria-pressed", "true");
+    expect(
+      within(destination).getByRole("button", { name: "Commits" }),
+    ).toHaveAttribute("aria-expanded", "true");
+
+    const outgoing = ready.querySelector<HTMLElement>(
+      `[data-pull-identity="${item.identity}"]`,
+    );
+    if (outgoing) {
+      expect(outgoing).toHaveAttribute("inert");
+      expect(outgoing).toHaveAttribute("aria-hidden", "true");
+    }
+  });
+
+  it("keeps the selected commit focused and the rail visible after a section move", async () => {
+    const pull = getReadyPull();
+    const item = pullItem(pull);
+    const controls = createControls();
+    const runs = createRuns(new Map(), controls);
+    const commit = pullCommit(pull);
+    vi.mocked(getPullCommits).mockResolvedValue(pullCommits(pull, [commit]));
+    vi.mocked(getPullCommitDiff).mockResolvedValue(
+      pullCommitDiff(pull, commit),
+    );
+    const view = render(<ContinuitySections ready={[item]} runs={runs} />);
+    const source = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="ready"] [data-pull-identity]',
+    )!;
+
+    fireEvent.click(within(source).getByRole("button", { name: "Commits" }));
+    const selected = await within(source).findByRole("button", {
+      name: /Keep commit history visible, commit 1111111/,
+    });
+    selected.focus();
+    expect(selected).toHaveFocus();
+
+    view.rerender(<ContinuitySections progress={[item]} runs={runs} />);
+
+    const destination = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="progress"] [data-pull-identity]',
+    )!;
+    const restored = await within(destination).findByRole("button", {
+      name: /Keep commit history visible, commit 1111111/,
+    });
+    await waitFor(() => expect(restored).toHaveFocus());
+    expect(
+      within(destination).getByRole("list", {
+        name: "Pull request commits",
+      }),
+    ).toBeVisible();
+    expect(
+      within(destination).queryByRole("button", {
+        name: /^(Hide|Show) commits$/,
+      }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the selected file focused and the tree visible after a section move", async () => {
+    const pull = getReadyPull();
+    const item = pullItem(pull);
+    const controls = createControls();
+    const runs = createRuns(new Map(), controls);
+    vi.mocked(getPullDiff).mockResolvedValue(pullDiff(pull));
+    const view = render(<ContinuitySections ready={[item]} runs={runs} />);
+    const source = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="ready"] [data-pull-identity]',
+    )!;
+
+    fireEvent.click(
+      within(source).getByRole("button", { name: "Files changed" }),
+    );
+    const selected = await within(source).findByRole("button", {
+      name: /^ready\.ts/,
+    });
+    selected.focus();
+    expect(selected).toHaveFocus();
+
+    view.rerender(<ContinuitySections progress={[item]} runs={runs} />);
+
+    const destination = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="progress"] [data-pull-identity]',
+    )!;
+    const restored = await within(destination).findByRole("button", {
+      name: /^ready\.ts/,
+    });
+    await waitFor(() => expect(restored).toHaveFocus());
+    expect(
+      within(destination).getByRole("navigation", {
+        name: "Changed files",
+      }),
+    ).toBeVisible();
+    expect(
+      within(destination).queryByRole("button", {
+        name: /^(Hide|Show) files$/,
+      }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the selected commit and visible rail through outer collapse and a section move", async () => {
+    const pull = getReadyPull();
+    const item = pullItem(pull);
+    const controls = createControls();
+    const runs = createRuns(new Map(), controls);
+    const first = pullCommit(pull, "1111111111111111111111111111111111111111");
+    const second = pullCommit(pull, "2222222222222222222222222222222222222222");
+    vi.mocked(getPullCommits).mockResolvedValue(
+      pullCommits(pull, [first, second]),
+    );
+    vi.mocked(getPullCommitDiff).mockImplementation(async (_identity, sha) =>
+      pullCommitDiff(pull, sha === first.sha ? first : second),
+    );
+    const view = render(<ContinuitySections ready={[item]} runs={runs} />);
+    const source = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="ready"] [data-pull-identity]',
+    )!;
+    const outer = within(source).getByRole("button", { name: "Commits" });
+
+    fireEvent.click(outer);
+    await within(source).findByTitle(second.sha);
+    const firstCommit = within(source).getByRole("button", {
+      name: /Keep commit history visible, commit 1111111/,
+    });
+    firstCommit.focus();
+    fireEvent.click(firstCommit);
+    expect(firstCommit).toHaveFocus();
+    expect(await within(source).findByTitle(first.sha)).toHaveAttribute(
+      "data-diff-revision",
+      "",
+    );
+
+    fireEvent.click(outer);
+    expect(outer).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(outer);
+    const reopened = await within(source).findByRole("button", {
+      name: /Keep commit history visible, commit 1111111/,
+    });
+    expect(outer).toHaveAttribute("aria-expanded", "true");
+    expect(reopened).toHaveAttribute("aria-pressed", "true");
+    expect(await within(source).findByTitle(first.sha)).toHaveAttribute(
+      "data-diff-revision",
+      "",
+    );
+    reopened.focus();
+    expect(reopened).toHaveFocus();
+
+    view.rerender(<ContinuitySections progress={[item]} runs={runs} />);
+
+    const destination = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="progress"] [data-pull-identity]',
+    )!;
+    const restored = await within(destination).findByRole("button", {
+      name: /Keep commit history visible, commit 1111111/,
+    });
+    await waitFor(() => expect(restored).toHaveFocus());
+    expect(restored).toHaveAttribute("aria-pressed", "true");
+    expect(
+      within(destination).getByRole("list", {
+        name: "Pull request commits",
+      }),
+    ).toBeVisible();
+    expect(
+      within(destination).queryByRole("button", {
+        name: /^(Hide|Show) commits$/,
+      }),
+    ).not.toBeInTheDocument();
+    expect(await within(destination).findByTitle(first.sha)).toHaveAttribute(
+      "data-diff-revision",
+      "",
+    );
+    expect(
+      within(destination).getByRole("button", { name: "Commits" }),
+    ).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("restores a commit-diff control instead of the matching main-diff control after a move", async () => {
+    const pull = getReadyPull();
+    const item = pullItem(pull);
+    const controls = createControls();
+    const runs = createRuns(new Map(), controls);
+    const commit = pullCommit(pull);
+    vi.mocked(getPullCommits).mockResolvedValue(pullCommits(pull, [commit]));
+    vi.mocked(getPullCommitDiff).mockResolvedValue(
+      pullCommitDiff(pull, commit),
+    );
+    vi.mocked(getPullDiff).mockResolvedValue(pullDiff(pull));
+    const view = render(<ContinuitySections ready={[item]} runs={runs} />);
+    const source = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="ready"] [data-pull-identity]',
+    )!;
+
+    fireEvent.click(within(source).getByRole("button", { name: "Commits" }));
+    const commitsPanel = source.querySelector<HTMLElement>(
+      "[data-commits-panel]",
+    )!;
+    const commitViewed = await within(commitsPanel).findByRole("checkbox", {
+      name: "Viewed src/ready.ts",
+    });
+    fireEvent.click(
+      within(source).getByRole("button", { name: "Files changed" }),
+    );
+    const diffPanel = source.querySelector<HTMLElement>("[data-diff-panel]")!;
+    await within(diffPanel).findByRole("checkbox", {
+      name: "Viewed src/ready.ts",
+    });
+    commitViewed.focus();
+    expect(commitViewed).toHaveFocus();
+
+    view.rerender(<ContinuitySections progress={[item]} runs={runs} />);
+
+    const destination = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="progress"] [data-pull-identity]',
+    )!;
+    const destinationCommits = destination.querySelector<HTMLElement>(
+      "[data-commits-panel]",
+    )!;
+    const destinationDiff =
+      destination.querySelector<HTMLElement>("[data-diff-panel]")!;
+    const restored = await within(destinationCommits).findByRole("checkbox", {
+      name: "Viewed src/ready.ts",
+    });
+    const collision = await within(destinationDiff).findByRole("checkbox", {
+      name: "Viewed src/ready.ts",
+    });
+
+    await waitFor(() => expect(restored).toHaveFocus());
+    expect(collision).not.toHaveFocus();
+    expect(
+      within(destination).getByRole("button", { name: "Commits" }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(
+      within(destination).getByRole("button", { name: "Files changed" }),
+    ).toHaveAttribute("aria-expanded", "true");
+  });
+
   it("preserves message and output when a row moves into progress", () => {
     const pull = getBlockedPull();
     const item = pullItem(pull);

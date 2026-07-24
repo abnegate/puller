@@ -316,15 +316,18 @@ const isCurrentGreptileReview = (pull: PullReadiness): boolean => {
 };
 
 const DetailLink = memo(function DetailLink({
+  focusToken,
   href,
   label,
 }: {
+  focusToken: string;
   href: string;
   label: string;
 }) {
   return (
     <a
       className="inline-flex min-h-8 items-center gap-1 rounded-md px-1 text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      data-pull-focus-token={focusToken}
       href={href}
       rel="noopener noreferrer"
       target="_blank"
@@ -378,6 +381,7 @@ const FailedCheck = memo(function FailedCheck({
   viewerLogin: string | null;
 }) {
   const { check, job } = entry;
+  const focusToken = `blocker:check:${check.id}`;
   const [attempt, setAttempt] = useState(0);
   const [visibleLines, setVisibleLines] = useState(CHECK_LOG_LINE_BATCH_SIZE);
   const [state, setState] = useState<CheckLogState | null>(null);
@@ -474,7 +478,11 @@ const FailedCheck = memo(function FailedCheck({
           </span>
         )}
         {check.detailsUrl && (
-          <DetailLink href={check.detailsUrl} label="Open check" />
+          <DetailLink
+            focusToken={`${focusToken}:open`}
+            href={check.detailsUrl}
+            label="Open check"
+          />
         )}
       </div>
 
@@ -488,6 +496,7 @@ const FailedCheck = memo(function FailedCheck({
           <pre
             aria-label={`${check.name} logs`}
             className="max-h-72 w-full max-w-full overflow-auto rounded-lg border border-border/70 bg-zinc-950 p-3 font-mono text-[11px] leading-5 text-zinc-100 shadow-inner dark:bg-black/60"
+            data-pull-focus-token={`${focusToken}:log`}
             role="region"
             tabIndex={0}
           >
@@ -498,6 +507,7 @@ const FailedCheck = memo(function FailedCheck({
               {hiddenLines > 0 && (
                 <Button
                   aria-label={`Show ${revealLines} earlier ${check.name} log lines`}
+                  data-pull-focus-token={`${focusToken}:reveal`}
                   onClick={reveal}
                   size="xs"
                   type="button"
@@ -525,6 +535,7 @@ const FailedCheck = memo(function FailedCheck({
           </span>
           <Button
             aria-label={`Retry ${check.name} logs`}
+            data-pull-focus-token={`${focusToken}:retry`}
             onClick={retry}
             size="xs"
             type="button"
@@ -610,7 +621,11 @@ const Thread = memo(function Thread({ thread }: { thread: ReviewThread }) {
         {location && <code className="min-w-0 wrap-anywhere">{location}</code>}
         {thread.outdated && <Badge variant="outline">Outdated</Badge>}
         <span className="ml-auto">
-          <DetailLink href={thread.url} label="Open thread" />
+          <DetailLink
+            focusToken={`blocker:thread:${thread.id}:${thread.path ?? "conversation"}:open`}
+            href={thread.url}
+            label="Open thread"
+          />
         </span>
       </div>
       <p className="m-0 max-h-40 overflow-auto whitespace-pre-wrap wrap-anywhere text-xs leading-relaxed text-foreground">
@@ -714,6 +729,7 @@ const GreptileReview = memo(function GreptileReview({
         </p>
         {pull.greptile.commentUrl ? (
           <DetailLink
+            focusToken={`blocker:greptile:${pull.greptile.commentId ?? pull.greptile.reviewedSha ?? pull.headRefOid}:open`}
             href={pull.greptile.commentUrl}
             label="Open Greptile comment"
           />

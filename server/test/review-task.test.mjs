@@ -56,6 +56,7 @@ function feedback(overrides = {}) {
 
 function input(overrides = {}) {
   return {
+    agent: "claude",
     expectedBaseRefOid: BASE,
     expectedHeadRefOid: HEAD,
     feedback: feedback(),

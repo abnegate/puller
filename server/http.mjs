@@ -6,6 +6,7 @@ import { extname, relative, resolve, sep } from "node:path";
 import { SnapshotError } from "./cache.mjs";
 import { CheckLogsError } from "./check-logs.mjs";
 import { ACTION_LIMITS, ActionError, actionError } from "./claude.mjs";
+import { CommitsError } from "./commits.mjs";
 import { DiffError } from "./diff.mjs";
 import { ExecutorError } from "./executor.mjs";
 import { TaskError } from "./task.mjs";
@@ -157,6 +158,13 @@ function sendServiceError(response, error, fallback = {}) {
     });
     return;
   }
+  if (error instanceof CommitsError) {
+    sendJson(response, error.status, {
+      error: error.message,
+      code: error.code,
+    });
+    return;
+  }
   if (error instanceof ExecutorError) {
     sendJson(response, error.status, {
       error: error.message,
@@ -260,9 +268,10 @@ function decodeSegment(value) {
 }
 
 function pullRoute(pathname) {
-  const match = /^\/api\/pulls\/([^/]+)\/([^/]+)\/([^/]+)\/(diff|merge)$/.exec(
-    pathname,
-  );
+  const match =
+    /^\/api\/pulls\/([^/]+)\/([^/]+)\/([^/]+)\/(commits|diff|merge)$/.exec(
+      pathname,
+    );
   if (!match) return null;
   const owner = decodeSegment(match[1]);
   const name = decodeSegment(match[2]);
@@ -291,6 +300,47 @@ function pullRoute(pathname) {
     );
   }
   return { action: match[4], number, repository: `${owner}/${name}` };
+}
+
+function pullCommitRoute(pathname) {
+  const match =
+    /^\/api\/pulls\/([^/]+)\/([^/]+)\/([^/]+)\/commits\/([^/]+)$/.exec(
+      pathname,
+    );
+  if (!match) return null;
+  const owner = decodeSegment(match[1]);
+  const name = decodeSegment(match[2]);
+  const numberValue = decodeSegment(match[3]);
+  const commitSha = decodeSegment(match[4]);
+  if (
+    !/^[A-Za-z0-9_.-]+$/.test(owner) ||
+    !/^[A-Za-z0-9_.-]+$/.test(name) ||
+    owner === "." ||
+    owner === ".." ||
+    name === "." ||
+    name === ".." ||
+    !/^[1-9]\d*$/.test(numberValue) ||
+    !/^[a-f0-9]{40}$/i.test(commitSha)
+  ) {
+    throw new ActionError(
+      400,
+      "invalid_path",
+      "The pull request commit path is invalid.",
+    );
+  }
+  const number = Number(numberValue);
+  if (!Number.isSafeInteger(number)) {
+    throw new ActionError(
+      400,
+      "invalid_number",
+      "The pull request number is invalid.",
+    );
+  }
+  return {
+    commitSha: commitSha.toLowerCase(),
+    number,
+    repository: `${owner}/${name}`,
+  };
 }
 
 function repairRoute(pathname) {
@@ -407,6 +457,15 @@ function diffIdentity(url) {
     "base",
     "head",
     "The pull request diff identity query is invalid.",
+  );
+}
+
+function commitsIdentity(url) {
+  return identityQuery(
+    url,
+    "base",
+    "head",
+    "The pull request commits identity query is invalid.",
   );
 }
 
@@ -693,6 +752,7 @@ export function createApiHandler({
   runManager = null,
   taskManager = null,
   checkLogsService = null,
+  commitsService = null,
   diffService = null,
   mergeService = null,
   repairManager = null,
@@ -815,7 +875,7 @@ export function createApiHandler({
           );
         }
         const body = await readJson(request);
-        if (!exactKeys(body, ["id", "repository", "base", "prompt"])) {
+        if (!exactKeys(body, ["agent", "id", "repository", "base", "prompt"])) {
           throw new ActionError(
             400,
             "invalid_request",
@@ -903,7 +963,10 @@ export function createApiHandler({
       return true;
     }
 
-    if (url.pathname === "/api/claude/runs") {
+    if (
+      url.pathname === "/api/agents/runs" ||
+      url.pathname === "/api/claude/runs"
+    ) {
       if (!methodAllowed(request, response, "POST")) {
         return true;
       }
@@ -919,23 +982,26 @@ export function createApiHandler({
       }
       try {
         const body = await readJson(request);
+        const input =
+          url.pathname === "/api/claude/runs"
+            ? { ...body, agent: "claude" }
+            : body;
         const channel = responseChannel(request, response);
-        await runManager.start(body, channel);
+        await runManager.start(input, channel);
       } catch (error) {
         if (!response.headersSent) {
           sendActionError(response, error);
         } else if (!response.writableEnded) {
           response.end(
-            `${JSON.stringify({ type: "error", message: "The Claude Code run failed." })}\n`,
+            `${JSON.stringify({ type: "error", message: "The agent run failed." })}\n`,
           );
         }
       }
       return true;
     }
 
-    const cancellation = /^\/api\/claude\/runs\/([A-Za-z0-9-]+)$/.exec(
-      url.pathname,
-    );
+    const cancellation =
+      /^\/api\/(?:agents|claude)\/runs\/([A-Za-z0-9-]+)$/.exec(url.pathname);
     if (cancellation) {
       if (!methodAllowed(request, response, "DELETE")) {
       } else if (
@@ -969,6 +1035,7 @@ export function createApiHandler({
         const body = await readJson(request);
         if (
           !exactKeys(body, [
+            "agent",
             "headSha",
             "pullNumber",
             "pullUrl",
@@ -990,7 +1057,7 @@ export function createApiHandler({
           sendActionError(response, error);
         } else if (!response.writableEnded) {
           response.end(
-            `${JSON.stringify({ type: "error", message: "Claude verification could not start." })}\n`,
+            `${JSON.stringify({ type: "error", message: "Verification could not start." })}\n`,
           );
         }
       }
@@ -1050,7 +1117,7 @@ export function createApiHandler({
           );
         }
         const body = await readJson(request);
-        if (!exactKeys(body, ["releaseId", "repository", "tag"])) {
+        if (!exactKeys(body, ["agent", "releaseId", "repository", "tag"])) {
           throw new ActionError(
             400,
             "invalid_request",
@@ -1153,6 +1220,31 @@ export function createApiHandler({
       return true;
     }
 
+    if (url.pathname === "/api/releases/pipelines") {
+      if (!methodAllowed(request, response, "GET")) return true;
+      if (!releaseService || typeof releaseService.getPipelines !== "function") {
+        sendJson(response, 503, {
+          error: "Release pipelines are unavailable.",
+          code: "release_service_unavailable",
+        });
+        return true;
+      }
+      try {
+        sendJson(
+          response,
+          200,
+          await releaseService.getPipelines({ refresh: refreshQuery(url) }),
+        );
+      } catch (error) {
+        sendServiceError(response, error, {
+          code: "release_pipelines_unavailable",
+          message: "Release pipelines could not be loaded.",
+          status: 503,
+        });
+      }
+      return true;
+    }
+
     if (url.pathname === "/api/releases") {
       if (!methodAllowed(request, response, "POST")) return true;
       if (
@@ -1166,7 +1258,14 @@ export function createApiHandler({
         return true;
       try {
         const body = await readJson(request);
-        if (!exactKeys(body, ["expectedLatestTag", "repository", "tag"])) {
+        if (
+          !exactKeys(body, [
+            "expectedLatestTag",
+            "prerelease",
+            "repository",
+            "tag",
+          ])
+        ) {
           throw new ActionError(
             400,
             "invalid_request",
@@ -1184,10 +1283,12 @@ export function createApiHandler({
     }
 
     let checkLogs;
+    let commit;
     let repair;
     let route;
     try {
       checkLogs = checkLogsRoute(url.pathname);
+      commit = pullCommitRoute(url.pathname);
       repair = repairRoute(url.pathname);
       route = pullRoute(url.pathname);
     } catch (error) {
@@ -1300,6 +1401,50 @@ export function createApiHandler({
       }
       return true;
     }
+    if (commit || route?.action === "commits") {
+      if (!methodAllowed(request, response, "GET")) return true;
+      if (!commitsService) {
+        sendJson(response, 503, {
+          error: "Pull request commits are unavailable.",
+          code: "commits_service_unavailable",
+        });
+        return true;
+      }
+      let identity;
+      try {
+        identity = commitsIdentity(url);
+      } catch (error) {
+        sendServiceError(response, error);
+        return true;
+      }
+      const target = commit ?? route;
+      const result = await serviceResult(request, response, (signal) =>
+        commit
+          ? commitsService.loadCommitDiff({
+              ...identity,
+              commitSha: commit.commitSha,
+              number: commit.number,
+              repository: commit.repository,
+              signal,
+            })
+          : commitsService.load({
+              ...identity,
+              number: target.number,
+              repository: target.repository,
+              signal,
+            }),
+      );
+      if (result.closed || serviceClosed(request, response)) return true;
+      if (result.error) {
+        sendServiceError(response, result.error, {
+          code: "commits_unavailable",
+          message: "The pull request commits could not be loaded.",
+        });
+      } else {
+        sendJson(response, 200, result.value);
+      }
+      return true;
+    }
     if (route?.action === "diff") {
       if (!methodAllowed(request, response, "GET")) return true;
       if (!diffService) {
@@ -1355,7 +1500,7 @@ export function createApiHandler({
           );
         }
         const body = await readJson(request);
-        if (!exactKeys(body, ["expectedHeadRefOid"])) {
+        if (!exactKeys(body, ["agent", "expectedHeadRefOid"])) {
           throw new ActionError(
             400,
             "invalid_request",
@@ -1366,6 +1511,7 @@ export function createApiHandler({
           response,
           200,
           await mergeService.merge({
+            agent: body.agent,
             expectedHeadRefOid: body.expectedHeadRefOid,
             number: route.number,
             repository: route.repository,

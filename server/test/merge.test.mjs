@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { createRunCoordinator } from "../claude.mjs";
 import {
   confirmedConflict,
   createMergeService,
@@ -59,7 +60,12 @@ function fresh(overrides = {}) {
   };
 }
 
-const input = { repository: "owner/repo", number: 7, expectedHeadRefOid: SHA };
+const input = {
+  agent: "claude",
+  repository: "owner/repo",
+  number: 7,
+  expectedHeadRefOid: SHA,
+};
 
 function conflict(overrides = {}) {
   return {
@@ -107,7 +113,7 @@ describe("merge service", () => {
       refetch,
     });
 
-    await expect(service.merge(input)).resolves.toEqual({
+    await expect(service.merge({ ...input, agent: "codex" })).resolves.toEqual({
       mergeCommitOid: null,
       merged: true,
       number: 7,
@@ -263,6 +269,72 @@ describe("merge service", () => {
     await first;
   });
 
+  it("refuses a merge while a Claude run owns the pull request key", async () => {
+    const coordinator = createRunCoordinator({ limit: 1 });
+    const run = coordinator.reserveRun({
+      duplicateCode: "pull_running",
+      duplicateMessage: "Run active.",
+      key: "fix:owner/repo#7",
+    });
+    const loadPull = vi.fn(async () => fresh());
+    const service = createMergeService({
+      coordinator,
+      executor: { action: vi.fn() },
+      loadPull,
+    });
+
+    await expect(service.merge(input)).rejects.toMatchObject({
+      code: "pull_running",
+    });
+    expect(loadPull).not.toHaveBeenCalled();
+    expect(coordinator.activeCount()).toBe(1);
+    run.release();
+  });
+
+  it("atomically excludes a new Claude run without consuming run parallelism while merging", async () => {
+    const coordinator = createRunCoordinator({ limit: 1 });
+    let releaseLoad;
+    const waiting = new Promise((resolve) => {
+      releaseLoad = resolve;
+    });
+    const service = createMergeService({
+      coordinator,
+      executor: { action: vi.fn(async () => undefined) },
+      loadPull: vi.fn(async () => {
+        await waiting;
+        return fresh();
+      }),
+    });
+
+    const merging = service.merge(input);
+    await vi.waitFor(() => expect(service.activeCount()).toBe(1));
+    expect(coordinator.activeCount()).toBe(0);
+    expect(() =>
+      coordinator.reserveRun({
+        duplicateCode: "pull_running",
+        duplicateMessage: "Run active.",
+        key: "fix:owner/repo#7",
+      }),
+    ).toThrowError(expect.objectContaining({ code: "pull_running" }));
+
+    const unrelated = coordinator.reserveRun({
+      duplicateCode: "pull_running",
+      duplicateMessage: "Run active.",
+      key: "fix:owner/other#8",
+    });
+    expect(coordinator.activeCount()).toBe(1);
+    unrelated.release();
+    releaseLoad();
+    await merging;
+
+    const retry = coordinator.reserveRun({
+      duplicateCode: "pull_running",
+      duplicateMessage: "Run active.",
+      key: "fix:owner/repo#7",
+    });
+    retry.release();
+  });
+
   it("classifies only a fresh exact-identity conflict with green checks", () => {
     expect(confirmedConflict(conflict(), input)).toMatchObject({
       baseRefName: "main",
@@ -309,6 +381,7 @@ describe("merge service", () => {
     const repairManager = {
       enqueue: vi.fn(() => ({
         accepted: true,
+        agent: "claude",
         deduplicated: false,
         id: "repair-1",
         state: "repair_queued",
@@ -321,8 +394,9 @@ describe("merge service", () => {
       repairManager,
     });
 
-    await expect(service.merge(input)).resolves.toEqual({
+    await expect(service.merge({ ...input, agent: "codex" })).resolves.toEqual({
       action: {
+        agent: "claude",
         deduplicated: false,
         id: "repair-1",
         state: "repair_queued",
@@ -340,6 +414,7 @@ describe("merge service", () => {
     );
     expect(repairManager.enqueue).toHaveBeenCalledWith(
       expect.objectContaining({
+        agent: "codex",
         expectedHeadRefOid: SHA,
         headRepository: "owner/repo",
         isCrossRepository: false,

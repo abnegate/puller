@@ -8,7 +8,7 @@ import {
 } from "react";
 import { ExternalLink, LoaderCircle, Rocket } from "lucide-react";
 
-import { createRelease, getReleaseOptions } from "@/api";
+import { createRelease } from "@/api";
 import type {
   CreateReleaseResponse,
   ReleaseOptions,
@@ -25,6 +25,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -37,10 +38,12 @@ import {
 import { Label } from "@/components/ui/label";
 import ReleaseTagPicker from "@/components/ReleaseTagPicker";
 import RepositoryPicker from "@/components/RepositoryPicker";
+import { useReleaseOptions } from "@/release-options";
 import { formatRelativeTime } from "@/time";
 
 type ReleaseDialogProps = {
   onCreated: (release: CreateReleaseResponse) => Promise<void> | void;
+  viewerLogin: string | null;
 };
 
 const errorText = (error: unknown): string =>
@@ -77,74 +80,90 @@ const formatTimestamp = (value: string): string | undefined => {
     : timestampFormatter.format(date);
 };
 
-export default function ReleaseDialog({ onCreated }: ReleaseDialogProps) {
+const canonicalViewer = (viewerLogin: string | null): string | null => {
+  const viewer = viewerLogin?.trim().toLowerCase() ?? "";
+  return viewer || null;
+};
+
+export default function ReleaseDialog(props: ReleaseDialogProps) {
+  const viewerLogin = canonicalViewer(props.viewerLogin);
+  return (
+    <ReleaseDialogContent
+      key={viewerLogin ?? "anonymous"}
+      {...props}
+      viewerLogin={viewerLogin}
+    />
+  );
+}
+
+function ReleaseDialogContent({ onCreated, viewerLogin }: ReleaseDialogProps) {
   const [open, setOpen] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
-  const [options, setOptions] = useState<ReleaseOptions | null>(null);
   const [repository, setRepository] = useState("");
   const [tag, setTag] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [prerelease, setPrerelease] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [created, setCreated] = useState<CreateReleaseResponse | null>(null);
+  const [createdPrerelease, setCreatedPrerelease] = useState<boolean | null>(
+    null,
+  );
+  const {
+    error: loadError,
+    forceRefresh,
+    loading,
+    options,
+    refreshing,
+  } = useReleaseOptions(viewerLogin, open);
+  const prereleaseDescriptionId = useId();
   const tagDescriptionId = useId();
   const tagErrorId = useId();
-  const hasOpened = useRef(false);
-  const optionsController = useRef<AbortController | null>(null);
   const repositoryRef = useRef(repository);
+  const requestRevision = useRef(0);
   const submitController = useRef<AbortController | null>(null);
   const submitPending = useRef(false);
   const tagRevision = useRef(0);
+  const wasLoading = useRef(false);
 
-  const loadOptions = useCallback(async (refresh = false) => {
-    optionsController.current?.abort();
-    const controller = new AbortController();
-    const revision = tagRevision.current;
-    optionsController.current = controller;
-    setLoading(true);
-    setLoadError(null);
+  const forceRefreshOptions =
+    useCallback((): Promise<ReleaseOptions | null> => {
+      requestRevision.current = tagRevision.current;
+      return forceRefresh();
+    }, [forceRefresh]);
 
-    try {
-      const next = await getReleaseOptions(refresh, controller.signal);
-      if (optionsController.current !== controller) return;
-
-      setOptions(next);
-      const currentRepository = repositoryRef.current;
-      const selected =
-        findRepository(next, currentRepository) ?? next.repositories[0] ?? null;
-      const repositoryChanged =
-        selected !== null &&
-        selected.repository.toLowerCase() !== currentRepository.toLowerCase();
-
-      repositoryRef.current = selected?.repository ?? "";
-      setRepository(selected?.repository ?? "");
-      if (
-        selected === null ||
-        repositoryChanged ||
-        tagRevision.current === revision
-      ) {
-        setTag(selected?.nextTag ?? "");
-      }
-    } catch (error) {
-      if (
-        optionsController.current === controller &&
-        !(error instanceof DOMException && error.name === "AbortError")
-      ) {
-        setLoadError(errorText(error));
-      }
-    } finally {
-      if (optionsController.current === controller) {
-        optionsController.current = null;
-        setLoading(false);
-      }
+  useEffect(() => {
+    const busy = loading || refreshing;
+    if (busy && !wasLoading.current) {
+      requestRevision.current = tagRevision.current;
     }
-  }, []);
+    wasLoading.current = busy;
+  }, [loading, refreshing]);
+
+  useEffect(() => {
+    if (options === null) return;
+
+    const currentRepository = repositoryRef.current;
+    const selected =
+      findRepository(options, currentRepository) ??
+      options.repositories[0] ??
+      null;
+    const repositoryChanged =
+      selected !== null &&
+      selected.repository.toLowerCase() !== currentRepository.toLowerCase();
+
+    repositoryRef.current = selected?.repository ?? "";
+    setRepository(selected?.repository ?? "");
+    if (
+      selected === null ||
+      repositoryChanged ||
+      tagRevision.current === requestRevision.current
+    ) {
+      setTag(selected?.nextTag ?? "");
+    }
+  }, [options]);
 
   useEffect(() => {
     return () => {
-      optionsController.current?.abort();
-      optionsController.current = null;
       submitController.current?.abort();
       submitController.current = null;
     };
@@ -167,14 +186,10 @@ export default function ReleaseDialog({ onCreated }: ReleaseDialogProps) {
 
   const handleOpenChange = (next: boolean) => {
     if (!next && submitting) return;
-    if (next) {
-      const refresh = hasOpened.current;
-      hasOpened.current = true;
-      void loadOptions(refresh);
-    }
     setOpen(next);
     if (next) {
       setCreated(null);
+      setCreatedPrerelease(null);
       setSubmitError(null);
     } else {
       setConfirmOpen(false);
@@ -193,7 +208,7 @@ export default function ReleaseDialog({ onCreated }: ReleaseDialogProps) {
   };
 
   const reloadAfterConflict = () => {
-    void loadOptions(true);
+    void forceRefreshOptions();
   };
 
   const submit = async () => {
@@ -205,11 +220,13 @@ export default function ReleaseDialog({ onCreated }: ReleaseDialogProps) {
     submitController.current = controller;
     setSubmitting(true);
     setSubmitError(null);
+    const submittedPrerelease = prerelease;
 
     try {
       const result = await createRelease(
         {
           expectedLatestTag: selected.latestTag,
+          prerelease: submittedPrerelease,
           repository: selected.repository,
           tag: normalizedTag,
         },
@@ -218,9 +235,11 @@ export default function ReleaseDialog({ onCreated }: ReleaseDialogProps) {
       if (submitController.current !== controller) return;
 
       setCreated(result);
+      setCreatedPrerelease(submittedPrerelease);
+      setPrerelease(false);
       setConfirmOpen(false);
       void Promise.resolve(onCreated(result)).catch(() => undefined);
-      void loadOptions(true);
+      void forceRefreshOptions();
     } catch (error) {
       if (
         submitController.current === controller &&
@@ -257,7 +276,11 @@ export default function ReleaseDialog({ onCreated }: ReleaseDialogProps) {
 
           {created ? (
             <div className="rounded-lg border bg-muted/35 p-3" role="status">
-              <p className="text-sm font-medium">{created.tag} is published.</p>
+              <p className="text-sm font-medium">
+                {createdPrerelease
+                  ? `${created.tag} is published as a pre-release.`
+                  : `${created.tag} is published.`}
+              </p>
               <a
                 className="mt-1 inline-flex items-center gap-1 text-sm text-muted-foreground underline underline-offset-4 hover:text-foreground"
                 href={created.url}
@@ -336,6 +359,34 @@ export default function ReleaseDialog({ onCreated }: ReleaseDialogProps) {
                     That tag already exists.
                   </p>
                 )}
+                <div
+                  className="flex items-center gap-2.5 rounded-lg border bg-muted/25 px-3 py-2"
+                  data-slot="release-prerelease-option"
+                >
+                  <Checkbox
+                    aria-describedby={prereleaseDescriptionId}
+                    checked={prerelease}
+                    disabled={submitting}
+                    id="release-prerelease"
+                    onCheckedChange={(checked) =>
+                      setPrerelease(checked === true)
+                    }
+                  />
+                  <div className="grid gap-0.5">
+                    <Label
+                      className="cursor-pointer text-sm leading-4"
+                      htmlFor="release-prerelease"
+                    >
+                      Pre-release
+                    </Label>
+                    <p
+                      className="text-xs leading-4 text-muted-foreground"
+                      id={prereleaseDescriptionId}
+                    >
+                      Mark this release as not ready for production.
+                    </p>
+                  </div>
+                </div>
               </div>
 
               {options && (
@@ -371,7 +422,7 @@ export default function ReleaseDialog({ onCreated }: ReleaseDialogProps) {
                 <div className="space-y-2" role="alert">
                   <p className="text-sm text-destructive">{loadError}</p>
                   <Button
-                    onClick={() => void loadOptions(options !== null)}
+                    onClick={() => void forceRefreshOptions()}
                     size="sm"
                     type="button"
                     variant="outline"
@@ -388,7 +439,7 @@ export default function ReleaseDialog({ onCreated }: ReleaseDialogProps) {
               )}
 
               <DialogFooter className="mt-1">
-                <Button disabled={!valid || loading} type="submit">
+                <Button disabled={!valid} type="submit">
                   Review release
                 </Button>
               </DialogFooter>
@@ -414,9 +465,14 @@ export default function ReleaseDialog({ onCreated }: ReleaseDialogProps) {
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Publish {normalizedTag}?</AlertDialogTitle>
+            <AlertDialogTitle>
+              {prerelease
+                ? `Publish ${normalizedTag} as a pre-release?`
+                : `Publish ${normalizedTag}?`}
+            </AlertDialogTitle>
             <AlertDialogDescription>
-              This publishes <strong>{normalizedTag}</strong> in{" "}
+              This publishes <strong>{normalizedTag}</strong>
+              {prerelease ? " as a pre-release" : ""} in{" "}
               <strong>{repository}</strong> using GitHub&apos;s auto-generated
               release notes. GitHub will reject a release with no new commits.
             </AlertDialogDescription>
@@ -435,12 +491,14 @@ export default function ReleaseDialog({ onCreated }: ReleaseDialogProps) {
             <AlertDialogCancel disabled={submitting}>Cancel</AlertDialogCancel>
             {submitError && (
               <Button
-                disabled={submitting || loading}
+                disabled={submitting || options === null}
                 onClick={reloadAfterConflict}
                 type="button"
                 variant="outline"
               >
-                {loading ? "Reloading options…" : "Reload options"}
+                {loading || refreshing
+                  ? "Reloading options…"
+                  : "Reload options"}
               </Button>
             )}
             <AlertDialogAction
@@ -453,7 +511,11 @@ export default function ReleaseDialog({ onCreated }: ReleaseDialogProps) {
               {submitting && (
                 <LoaderCircle aria-hidden="true" className="animate-spin" />
               )}
-              {submitting ? "Publishing…" : "Publish release"}
+              {submitting
+                ? "Publishing…"
+                : prerelease
+                  ? "Publish pre-release"
+                  : "Publish release"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

@@ -1,4 +1,5 @@
 import { ActionError } from "./claude.mjs";
+import { validateAgent } from "./agent.mjs";
 import { ExecutorError } from "./executor.mjs";
 import { assessPull } from "./readiness.mjs";
 
@@ -202,6 +203,7 @@ export function validateMergeInput(value) {
     );
   }
   return {
+    agent: validateAgent(value.agent),
     repository,
     number: value.number,
     expectedHeadRefOid: value.expectedHeadRefOid.toLowerCase(),
@@ -209,6 +211,7 @@ export function validateMergeInput(value) {
 }
 
 export function createMergeService({
+  coordinator = null,
   executor,
   loadPull,
   repairManager = null,
@@ -220,6 +223,9 @@ export function createMergeService({
   }
   if (typeof loadPull !== "function") {
     throw new TypeError("A fresh pull request loader is required.");
+  }
+  if (coordinator !== null && typeof coordinator.reserveKey !== "function") {
+    throw new TypeError("A run coordinator with key reservations is required.");
   }
 
   const active = new Set();
@@ -236,8 +242,15 @@ export function createMergeService({
         );
       }
       active.add(key);
+      let reservation = null;
 
       try {
+        reservation = coordinator?.reserveKey({
+          duplicateCode: "pull_running",
+          duplicateMessage:
+            "An agent run is being prepared or is active for this pull request.",
+          key: `fix:${key}`,
+        });
         let result;
         try {
           result = await loadPull({
@@ -334,9 +347,13 @@ export function createMergeService({
                 input,
               );
               if (conflict) {
-                const repair = repairManager.enqueue(conflict);
+                const repair = repairManager.enqueue({
+                  ...conflict,
+                  agent: input.agent,
+                });
                 if (
                   repair?.accepted === true &&
+                  (repair.agent === "claude" || repair.agent === "codex") &&
                   typeof repair.id === "string" &&
                   repair.id !== "" &&
                   typeof repair.token === "string" &&
@@ -346,6 +363,7 @@ export function createMergeService({
                 ) {
                   return {
                     action: {
+                      agent: repair.agent,
                       deduplicated: repair.deduplicated === true,
                       id: repair.id,
                       state: repair.state,
@@ -392,6 +410,7 @@ export function createMergeService({
           url: expectedUrl,
         };
       } finally {
+        reservation?.release();
         active.delete(key);
       }
     },

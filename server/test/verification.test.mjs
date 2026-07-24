@@ -13,6 +13,7 @@ import {
   VERIFICATION_SYSTEM_PROMPT,
   verificationArguments,
 } from "../verification.mjs";
+import { CodexError } from "../codex.mjs";
 
 const SHA = "abcdef0123456789abcdef0123456789abcdef01";
 const RELEASE_SHA = "1234567890abcdef1234567890abcdef12345678";
@@ -26,6 +27,7 @@ const ENVIRONMENT = {
   USER: "test",
 };
 const input = {
+  agent: "claude",
   headSha: SHA,
   pullNumber: 7,
   pullUrl: "https://github.com/owner/repo/pull/7",
@@ -276,13 +278,20 @@ describe("verification request policy", () => {
   it("validates only server-resolvable release identities for verify all", () => {
     expect(
       validateReleaseVerificationInput({
+        agent: "claude",
         releaseId: "10",
         repository: "owner/repo",
         tag: "v1.2.4",
       }),
-    ).toEqual({ releaseId: "10", repository: "owner/repo", tag: "v1.2.4" });
+    ).toEqual({
+      agent: "claude",
+      releaseId: "10",
+      repository: "owner/repo",
+      tag: "v1.2.4",
+    });
     expect(() =>
       validateReleaseVerificationInput({
+        agent: "claude",
         releaseId: "release-10",
         repository: "owner/repo",
         tag: "v1.2.4",
@@ -292,6 +301,152 @@ describe("verification request policy", () => {
 });
 
 describe("verification run manager", () => {
+  it("allows Codex inspection commands and requires a completed turn", async () => {
+    const codexCleanup = vi.fn(async () => undefined);
+    const prepareCodex = vi.fn(async () => ({
+      args: ["exec", "--json", "-"],
+      cleanup: codexCleanup,
+      command: "/opt/homebrew/bin/codex",
+      cwd: "/protected/control",
+      environment: { PATH: "/usr/bin:/bin" },
+      prompt: "trusted codex prompt",
+    }));
+    const context = manager({ prepareCodex });
+    const output = channel();
+    const run = await context.value.start(
+      { ...input, agent: "codex" },
+      output.value,
+    );
+    expect(context.spawn).toHaveBeenCalledWith(
+      "/opt/homebrew/bin/codex",
+      ["exec", "--json", "-"],
+      expect.objectContaining({
+        cwd: "/protected/control",
+        stdio: ["pipe", "pipe", "pipe"],
+      }),
+    );
+    expect(context.child.stdin.end).toHaveBeenCalledWith(
+      "trusted codex prompt",
+    );
+    context.child.stdout.write(
+      '{"type":"item.started","item":{"type":"command_execution","command":"rg feature src","status":"in_progress"}}\n',
+    );
+    context.child.stdout.write(
+      `{"type":"item.completed","item":{"type":"agent_message","text":"Verified. ${verificationMarker()}"}}\n`,
+    );
+    context.child.stdout.write('{"type":"turn.completed"}\n');
+    context.child.emit("close", 0, null);
+    await run.done;
+    expect(output.events).toContainEqual(
+      expect.objectContaining({
+        name: "rg feature src",
+        status: "started",
+        type: "tool",
+      }),
+    );
+    expect(output.events.at(-1)).toEqual({ type: "complete", exitCode: 0 });
+    expect(codexCleanup).toHaveBeenCalledOnce();
+  });
+
+  it("reports a Codex cleanup refusal instead of claiming verification succeeded", async () => {
+    const codexCleanup = vi.fn(async () => {
+      throw new CodexError(
+        500,
+        "codex_cleanup_unsafe",
+        "Puller refused to remove a replaced Codex runtime directory.",
+      );
+    });
+    const context = manager({
+      prepareCodex: vi.fn(async () => ({
+        args: ["exec", "--json", "-"],
+        cleanup: codexCleanup,
+        command: "/opt/homebrew/bin/codex",
+        cwd: "/protected/control",
+        environment: { PATH: "/usr/bin:/bin" },
+        prompt: "trusted codex prompt",
+      })),
+    });
+    const output = channel();
+    const run = await context.value.start(
+      { ...input, agent: "codex" },
+      output.value,
+    );
+    context.child.stdout.write('{"type":"turn.completed"}\n');
+    context.child.emit("close", 0, null);
+    await run.done;
+
+    expect(output.events.at(-1)).toEqual({
+      type: "error",
+      message:
+        "Codex verification completed, but its isolated runtime could not be removed safely.",
+    });
+    expect(codexCleanup).toHaveBeenCalledOnce();
+  });
+
+  it("escalates Codex verification cancellation from SIGINT through SIGTERM to SIGKILL", async () => {
+    const timers = [];
+    const codexCleanup = vi.fn(async () => undefined);
+    const context = manager({
+      clearTimer: vi.fn((timer) => {
+        if (timer) timer.cleared = true;
+      }),
+      prepareCodex: vi.fn(async () => ({
+        args: ["exec", "--json", "-"],
+        cleanup: codexCleanup,
+        command: "/opt/homebrew/bin/codex",
+        cwd: "/protected/control",
+        environment: {},
+        prompt: "trusted codex prompt",
+      })),
+      setTimer(callback, delay) {
+        const timer = { callback, cleared: false, delay, unref: vi.fn() };
+        timers.push(timer);
+        return timer;
+      },
+    });
+    const run = await context.value.start(
+      { ...input, agent: "codex" },
+      channel().value,
+    );
+
+    context.value.cancel("verify-1");
+    expect(context.kill.mock.calls.map(([, signal]) => signal)).toEqual([
+      "SIGINT",
+    ]);
+    timers.findLast((timer) => timer.delay === 10).callback();
+    expect(context.kill.mock.calls.map(([, signal]) => signal)).toEqual([
+      "SIGINT",
+      "SIGTERM",
+    ]);
+    timers.findLast((timer) => timer.delay === 10).callback();
+    expect(context.kill.mock.calls.map(([, signal]) => signal)).toEqual([
+      "SIGINT",
+      "SIGTERM",
+      "SIGKILL",
+    ]);
+
+    context.child.emit("close", null, "SIGKILL");
+    await run.done;
+    expect(codexCleanup).toHaveBeenCalledOnce();
+  });
+
+  it("preserves a safe Codex preflight error", async () => {
+    const error = new CodexError(
+      503,
+      "codex_version_unsupported",
+      "Puller supports Codex 0.144.6.",
+    );
+    const context = manager({
+      prepareCodex: vi.fn(async () => {
+        throw error;
+      }),
+    });
+    await expect(
+      context.value.start({ ...input, agent: "codex" }, channel().value),
+    ).rejects.toBe(error);
+    expect(context.cleanup).toHaveBeenCalledOnce();
+  });
+
   it("resolves exact release evidence, prepares an isolated tag, and streams read-only Claude", async () => {
     const context = manager({ loadContext: async () => "diff evidence" });
     const output = channel();
@@ -608,7 +763,7 @@ describe("verification run manager", () => {
       context.value.start(input, channel().value),
     ).rejects.toMatchObject({
       code: "verification_failed",
-      message: "Claude verification could not be started.",
+      message: "Agent verification could not be started.",
     });
     expect(context.cleanup).toHaveBeenCalledOnce();
   });
@@ -697,6 +852,7 @@ describe("release verification manager", () => {
   }
 
   const releaseInput = {
+    agent: "claude",
     releaseId: "10",
     repository: "owner/repo",
     tag: "v1.2.4",
@@ -776,6 +932,58 @@ describe("release verification manager", () => {
       batchId: "batch-1",
       totals: { complete: 1, error: 0, existing: 1, total: 2 },
     });
+  });
+
+  it("propagates the captured Codex provider to every Verify-all child", async () => {
+    const verifications = [];
+    const verifier = {
+      cancel: vi.fn(),
+      startQueued: vi.fn(async (verification, output) => {
+        verifications.push(verification);
+        output.write({
+          type: "start",
+          runId: `verify-${verification.pullNumber}`,
+          ...verification,
+        });
+        output.write({ type: "complete", exitCode: 0 });
+        return { done: Promise.resolve() };
+      }),
+    };
+    const output = channel();
+    const manager = createReleaseVerificationManager({
+      createId: () => "batch-codex",
+      resolveRelease: async () =>
+        snapshot([
+          snapshot().pulls[0],
+          {
+            headSha: "1111111111111111111111111111111111111111",
+            number: 8,
+            repository: "owner/repo",
+            url: "https://github.com/owner/repo/pull/8",
+          },
+        ]),
+      verifier,
+    });
+    const run = await manager.start(
+      { ...releaseInput, agent: "codex" },
+      output.value,
+    );
+    await run.done;
+
+    expect(verifications).toHaveLength(2);
+    expect(verifications.every(({ agent }) => agent === "codex")).toBe(true);
+    expect(output.events[0]).toMatchObject({
+      agent: "codex",
+      batchId: "batch-codex",
+      type: "batch-start",
+    });
+    const nestedStarts = output.events.filter(
+      (event) => event.type === "verification" && event.event?.type === "start",
+    );
+    expect(nestedStarts).toHaveLength(2);
+    expect(nestedStarts.every((event) => event.event.agent === "codex")).toBe(
+      true,
+    );
   });
 
   it("maps nested technical limits to the documented safe error state", async () => {

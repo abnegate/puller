@@ -1,20 +1,28 @@
 import {
   ArrowRight,
+  ChevronRight,
   CircleAlert,
   CircleCheck,
   FileCode2,
   FileWarning,
+  FolderClosed,
+  FolderOpen,
   LoaderCircle,
   MessageSquare,
 } from "lucide-react";
 import { useReducedMotion } from "motion/react";
 import {
+  Fragment,
   memo,
+  type CSSProperties,
   type KeyboardEvent,
   type MouseEvent,
+  type PointerEvent,
+  type ReactNode,
   useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -28,11 +36,15 @@ import { Textarea } from "@/components/ui/textarea";
 
 import {
   isRunActive,
+  isRunPreparing,
   type PullRuns,
+  type ReviewRetryContext,
   type RunStartOutcome,
   type RunState,
+  type RunTerminalStatus,
 } from "../runs";
 import type {
+  Agent,
   DiffLineKind,
   PullDiff as PullDiffData,
   PullDiffFile,
@@ -42,9 +54,14 @@ import type {
   ReviewCommentSide,
 } from "../types";
 
-type PullDiffProps = {
+export type PullDiffProps = {
+  agent?: Agent;
+  clearReviewRetry: PullRuns["clearReviewRetry"];
   diff: PullDiffData;
+  onPersistenceChange?: (persistence: PullDiffPersistence) => void;
+  persistence?: PullDiffPersistence;
   pull: PullReadiness;
+  readOnly?: boolean;
   run: RunState;
   startRun: PullRuns["start"];
   toggleViewed: (path: string) => void;
@@ -53,7 +70,26 @@ type PullDiffProps = {
 
 const FILE_BATCH_SIZE = 20;
 
-type CommentAnchor = {
+type FeedbackAgentCopy = {
+  feedback: string;
+  name: string;
+  run: string;
+};
+
+const feedbackAgentCopy: Record<Agent, FeedbackAgentCopy> = {
+  claude: {
+    feedback: "Claude feedback",
+    name: "Claude",
+    run: "Claude Code run",
+  },
+  codex: {
+    feedback: "Codex feedback",
+    name: "Codex",
+    run: "Codex run",
+  },
+};
+
+export type PullDiffCommentAnchor = {
   hunkIndex: number;
   line: number;
   lineIndex: number;
@@ -61,14 +97,43 @@ type CommentAnchor = {
   side: ReviewCommentSide;
 };
 
-type CommentSelection = {
-  end: CommentAnchor;
-  origin: CommentAnchor;
-  start: CommentAnchor;
+export type PullDiffCommentSelection = {
+  end: PullDiffCommentAnchor;
+  origin: PullDiffCommentAnchor;
+  start: PullDiffCommentAnchor;
 };
 
+export type PullDiffPersistence = Readonly<{
+  collapsedDirectories: readonly string[];
+  draft: string;
+  navigationScrollLeft: number;
+  navigationScrollTop: number;
+  navigationVisible: boolean;
+  navigationWidth: number;
+  patchScrollLeft: Readonly<Record<string, number>>;
+  selectedPath: string | null;
+  selection: PullDiffCommentSelection | null;
+  visibleCount: number;
+}>;
+
+const NAVIGATION_DEFAULT_WIDTH = 224;
+const NAVIGATION_MAX_WIDTH = 420;
+const NAVIGATION_MIN_WIDTH = 176;
+const SPLIT_LAYOUT_QUERY = "(min-width: 64rem)";
+
+const splitLayoutActive = (): boolean =>
+  typeof window.matchMedia !== "function" ||
+  window.matchMedia(SPLIT_LAYOUT_QUERY).matches;
+
+type CommentAnchor = PullDiffCommentAnchor;
+type CommentSelection = PullDiffCommentSelection;
+
 type ComposerState =
-  | { kind: "editing"; message: string | null }
+  | {
+      kind: "editing";
+      message: string | null;
+      tone: "error" | "information" | null;
+    }
   | { kind: "submitting" }
   | { kind: "started"; message: string };
 
@@ -196,6 +261,279 @@ const selectedAnchor = (
   anchor.line >= selection.start.line &&
   anchor.line <= selection.end.line;
 
+const sameAnchor = (left: CommentAnchor, right: CommentAnchor): boolean =>
+  left.hunkIndex === right.hunkIndex &&
+  left.line === right.line &&
+  left.lineIndex === right.lineIndex &&
+  left.path === right.path &&
+  left.side === right.side;
+
+const sameSelection = (
+  left: CommentSelection | null,
+  right: CommentSelection | null,
+): boolean =>
+  left === right ||
+  (left !== null &&
+    right !== null &&
+    sameAnchor(left.start, right.start) &&
+    sameAnchor(left.end, right.end) &&
+    sameAnchor(left.origin, right.origin));
+
+const validSelection = (
+  diff: PullDiffData,
+  selection: CommentSelection | null,
+): CommentSelection | null => {
+  if (selection === null) return null;
+  const file = diff.files.find(({ path }) => path === selection.start.path);
+  if (
+    !file ||
+    file.truncated ||
+    !sameAnchorScope(selection.start, selection.end) ||
+    !sameAnchorScope(selection.start, selection.origin)
+  ) {
+    return null;
+  }
+
+  const hunk = file.hunks[selection.origin.hunkIndex];
+  if (!hunk) return null;
+  const anchors = sideAnchors(
+    file,
+    hunk,
+    selection.origin.hunkIndex,
+    selection.origin.side,
+  );
+  const origin = anchors.find((anchor) => sameAnchor(anchor, selection.origin));
+  const start = anchors.find((anchor) => sameAnchor(anchor, selection.start));
+  const end = anchors.find((anchor) => sameAnchor(anchor, selection.end));
+  if (!origin || !start || !end) return null;
+
+  const target = sameAnchor(origin, start) ? end : start;
+  const restored = extendSelection(
+    { end: origin, origin, start: origin },
+    target,
+    file,
+  );
+  return sameSelection(restored, selection) ? selection : null;
+};
+
+const scrollOffset = (value: unknown): number =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+
+const navigationWidth = (value: unknown): number =>
+  typeof value === "number" && Number.isFinite(value)
+    ? Math.min(NAVIGATION_MAX_WIDTH, Math.max(NAVIGATION_MIN_WIDTH, value))
+    : NAVIGATION_DEFAULT_WIDTH;
+
+type FileTreeDirectory = {
+  directories: Map<string, FileTreeDirectory>;
+  files: { file: PullDiffFile; index: number }[];
+  name: string;
+  path: string;
+};
+
+const createFileTree = (files: PullDiffFile[]): FileTreeDirectory => {
+  const root: FileTreeDirectory = {
+    directories: new Map(),
+    files: [],
+    name: "",
+    path: "",
+  };
+
+  files.forEach((file, index) => {
+    const parts = file.path.split("/");
+    parts.pop();
+    let directory = root;
+    for (const part of parts) {
+      const path = directory.path === "" ? part : `${directory.path}/${part}`;
+      let child = directory.directories.get(part);
+      if (!child) {
+        child = { directories: new Map(), files: [], name: part, path };
+        directory.directories.set(part, child);
+      }
+      directory = child;
+    }
+    directory.files.push({ file, index });
+  });
+
+  return root;
+};
+
+const treeDirectories = (
+  directory: FileTreeDirectory,
+): FileTreeDirectory[] =>
+  [...directory.directories.values()].sort((left, right) =>
+    left.name.localeCompare(right.name),
+  );
+
+const treeFiles = (files: PullDiffFile[]): PullDiffFile[] => {
+  const ordered: PullDiffFile[] = [];
+  const append = (directory: FileTreeDirectory): void => {
+    treeDirectories(directory).forEach(append);
+    ordered.push(...directory.files.map(({ file }) => file));
+  };
+  append(createFileTree(files));
+  return ordered;
+};
+
+const directoriesFor = (diff: PullDiffData): Set<string> => {
+  const directories = new Set<string>();
+  for (const file of diff.files) {
+    const parts = file.path.split("/");
+    for (let index = 1; index < parts.length; index += 1) {
+      directories.add(parts.slice(0, index).join("/"));
+    }
+  }
+  return directories;
+};
+
+export const createPullDiffPersistence = (
+  diff: PullDiffData,
+): PullDiffPersistence => ({
+  collapsedDirectories: [],
+  draft: "",
+  navigationScrollLeft: 0,
+  navigationScrollTop: 0,
+  navigationVisible: true,
+  navigationWidth: NAVIGATION_DEFAULT_WIDTH,
+  patchScrollLeft: {},
+  selectedPath: treeFiles(diff.files)[0]?.path ?? null,
+  selection: null,
+  visibleCount: Math.min(FILE_BATCH_SIZE, diff.files.length),
+});
+
+export const normalizePullDiffPersistence = (
+  diff: PullDiffData,
+  persistence: PullDiffPersistence,
+): PullDiffPersistence => {
+  const paths = new Set(diff.files.map(({ path }) => path));
+  const directories = directoriesFor(diff);
+  const selection = validSelection(diff, persistence.selection);
+  const selectedPath = selection
+    ? selection.start.path
+    : persistence.selectedPath !== null && paths.has(persistence.selectedPath)
+      ? persistence.selectedPath
+      : (treeFiles(diff.files)[0]?.path ?? null);
+  const minimum = Math.min(FILE_BATCH_SIZE, diff.files.length);
+  const visibleCount =
+    diff.files.length === 0
+      ? 0
+      : Math.min(
+          diff.files.length,
+          Math.max(
+            minimum,
+            Number.isInteger(persistence.visibleCount)
+              ? persistence.visibleCount
+              : minimum,
+          ),
+        );
+  const patchScrollLeft = Object.fromEntries(
+    Object.entries(persistence.patchScrollLeft)
+      .filter(([path]) => paths.has(path))
+      .map(([path, value]) => [path, scrollOffset(value)]),
+  );
+
+  return {
+    collapsedDirectories: [
+      ...new Set(
+        Array.isArray(persistence.collapsedDirectories)
+          ? persistence.collapsedDirectories.filter(
+              (path): path is string =>
+                typeof path === "string" && directories.has(path),
+            )
+          : [],
+      ),
+    ].sort(),
+    draft: selection === null ? "" : persistence.draft,
+    navigationScrollLeft: scrollOffset(persistence.navigationScrollLeft),
+    navigationScrollTop: scrollOffset(persistence.navigationScrollTop),
+    navigationVisible: true,
+    navigationWidth: navigationWidth(persistence.navigationWidth),
+    patchScrollLeft,
+    selectedPath,
+    selection,
+    visibleCount,
+  };
+};
+
+const samePatchScroll = (
+  left: Readonly<Record<string, number>>,
+  right: Readonly<Record<string, number>>,
+): boolean => {
+  const leftEntries = Object.entries(left);
+  return (
+    leftEntries.length === Object.keys(right).length &&
+    leftEntries.every(([path, value]) => right[path] === value)
+  );
+};
+
+const samePersistence = (
+  left: PullDiffPersistence,
+  right: PullDiffPersistence,
+): boolean => {
+  const leftDirectories = Array.isArray(left.collapsedDirectories)
+    ? left.collapsedDirectories
+    : [];
+  const rightDirectories = Array.isArray(right.collapsedDirectories)
+    ? right.collapsedDirectories
+    : [];
+  return (
+    leftDirectories.length === rightDirectories.length &&
+    leftDirectories.every((path, index) => path === rightDirectories[index]) &&
+    left.draft === right.draft &&
+    left.navigationScrollLeft === right.navigationScrollLeft &&
+    left.navigationScrollTop === right.navigationScrollTop &&
+    left.navigationVisible === right.navigationVisible &&
+    left.navigationWidth === right.navigationWidth &&
+    left.selectedPath === right.selectedPath &&
+    left.visibleCount === right.visibleCount &&
+    sameSelection(left.selection, right.selection) &&
+    samePatchScroll(left.patchScrollLeft, right.patchScrollLeft)
+  );
+};
+
+const selectionForRetry = (
+  diff: PullDiffData,
+  retry: ReviewRetryContext,
+): CommentSelection | null => {
+  if (
+    diff.baseRefOid.toLowerCase() !== retry.baseRefOid.toLowerCase() ||
+    diff.headRefOid.toLowerCase() !== retry.headRefOid.toLowerCase()
+  ) {
+    return null;
+  }
+
+  const file = diff.files.find(({ path }) => path === retry.feedback.path);
+  if (!file || file.truncated) return null;
+  const side = retry.feedback.side;
+  const startSide = retry.feedback.startSide ?? side;
+  if (startSide !== side) return null;
+  const startLine = retry.feedback.startLine ?? retry.feedback.line;
+  const endLine = retry.feedback.line;
+  if (startLine > endLine) return null;
+
+  for (const [hunkIndex, hunk] of file.hunks.entries()) {
+    const anchors = sideAnchors(file, hunk, hunkIndex, side);
+    const startIndex = anchors.findIndex(({ line }) => line === startLine);
+    const endIndex = anchors.findIndex(({ line }) => line === endLine);
+    if (startIndex < 0 || endIndex < startIndex) continue;
+    const range = anchors.slice(startIndex, endIndex + 1);
+    if (
+      range.length !== endLine - startLine + 1 ||
+      range.some(
+        (anchor, index) =>
+          index > 0 && anchor.line !== range[index - 1]!.line + 1,
+      )
+    ) {
+      continue;
+    }
+
+    const start = range[0]!;
+    return { end: range.at(-1)!, origin: start, start };
+  }
+
+  return null;
+};
+
 const errorMessage = (error: unknown): string => {
   if (!(error instanceof Error)) return "The review fix could not be started.";
   return (
@@ -204,10 +542,18 @@ const errorMessage = (error: unknown): string => {
   );
 };
 
-const runErrorMessage = (outcome: RunStartOutcome): string | null =>
-  outcome.kind === "accepted" || outcome.kind === "accepted-equivalent"
-    ? null
-    : outcome.message;
+const terminalMessage = (
+  status: Exclude<RunTerminalStatus, "completed">,
+  agent: Agent,
+): string => {
+  if (status === "cancelled") {
+    return "The review fix was cancelled. Retry this feedback when you are ready.";
+  }
+  if (status === "limited") {
+    return `The review fix reached its run limit. Review the ${feedbackAgentCopy[agent].name} output, then retry this feedback.`;
+  }
+  return `The review fix failed. Review the ${feedbackAgentCopy[agent].name} output, then retry this feedback.`;
+};
 
 const FilePlaceholder = memo(function FilePlaceholder({
   file,
@@ -228,7 +574,7 @@ const FilePlaceholder = memo(function FilePlaceholder({
   }
 
   return (
-    <div className="flex min-h-24 items-center justify-center gap-2 px-4 py-8 text-center text-xs text-muted-foreground">
+    <div className="flex min-h-24 flex-1 items-center justify-center gap-2 px-4 py-8 text-center text-xs text-muted-foreground">
       <FileWarning aria-hidden="true" className="size-4 shrink-0" />
       <span>{message}</span>
     </div>
@@ -236,93 +582,141 @@ const FilePlaceholder = memo(function FilePlaceholder({
 });
 
 function ReviewComposer({
+  agent,
   diff,
+  draft,
+  focusRequest,
   onCancel,
+  onDraftChange,
   pull,
+  retryStatus,
   run,
   selection,
   startRun,
 }: {
+  agent: Agent;
   diff: PullDiffData;
+  draft: string;
+  focusRequest: number;
   onCancel: () => void;
+  onDraftChange: (draft: string) => void;
   pull: PullReadiness;
+  retryStatus: Exclude<RunTerminalStatus, "completed"> | null;
   run: RunState;
   selection: CommentSelection;
   startRun: PullRuns["start"];
 }) {
+  const copy = feedbackAgentCopy[agent];
   const inputId = useId();
+  const input = useRef<HTMLTextAreaElement>(null);
   const pending = useRef(false);
   const mounted = useRef(true);
+  const submission = useRef(0);
   const active = isRunActive(run);
-  const [body, setBody] = useState("");
+  const preparing = isRunPreparing(run);
   const [state, setState] = useState<ComposerState>({
     kind: "editing",
-    message: null,
+    message: retryStatus === null ? null : terminalMessage(retryStatus, agent),
+    tone: retryStatus === null ? null : "error",
   });
 
   useEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
+      submission.current += 1;
     };
   }, []);
+
+  useLayoutEffect(() => {
+    if (focusRequest === 0) return;
+    input.current?.focus({ preventScroll: true });
+  }, [focusRequest]);
 
   const submit = async () => {
     if (
       pending.current ||
       active ||
-      body.trim() === "" ||
+      draft.trim() === "" ||
       state.kind === "started"
     ) {
       return;
     }
 
     pending.current = true;
+    const token = ++submission.current;
+    const submittedDraft = draft;
+    const submittedSelection: CommentSelection = {
+      end: { ...selection.end },
+      origin: { ...selection.origin },
+      start: { ...selection.start },
+    };
     setState({ kind: "submitting" });
+    let outcome: RunStartOutcome;
     try {
-      const outcome = await startRun(pull, {
+      outcome = await startRun(pull, {
+        draft: submittedDraft,
         expectedBaseRefOid: diff.baseRefOid,
         feedback: {
-          body: body.trim(),
-          line: selection.end.line,
-          path: selection.start.path,
-          side: selection.start.side,
-          ...(selection.start.line === selection.end.line
+          body: submittedDraft.trim(),
+          line: submittedSelection.end.line,
+          path: submittedSelection.start.path,
+          side: submittedSelection.start.side,
+          ...(submittedSelection.start.line === submittedSelection.end.line
             ? {}
             : {
-                startLine: selection.start.line,
-                startSide: selection.start.side,
+                startLine: submittedSelection.start.line,
+                startSide: submittedSelection.start.side,
               }),
         },
         source: "review",
       });
-      if (!mounted.current) return;
-
-      const message = runErrorMessage(outcome);
-      if (message !== null) {
-        setState({ kind: "editing", message });
-        return;
-      }
-
-      setState({
-        kind: "started",
-        message:
-          outcome.kind === "accepted-equivalent"
-            ? outcome.message
-            : "Claude is addressing this feedback, then will commit and push it to the existing pull request.",
-      });
     } catch (error) {
-      if (!mounted.current) return;
-      setState({ kind: "editing", message: errorMessage(error) });
+      if (mounted.current && submission.current === token) {
+        onDraftChange(submittedDraft);
+        setState({
+          kind: "editing",
+          message: errorMessage(error),
+          tone: "error",
+        });
+      }
+      return;
     } finally {
-      pending.current = false;
+      if (submission.current === token) pending.current = false;
     }
+
+    if (!mounted.current || submission.current !== token) return;
+
+    if (outcome.kind === "accepted-equivalent") {
+      onDraftChange(submittedDraft);
+      setState({
+        kind: "editing",
+        message: outcome.message,
+        tone: "information",
+      });
+      return;
+    }
+
+    if (outcome.kind !== "accepted") {
+      onDraftChange(submittedDraft);
+      setState({
+        kind: "editing",
+        message: outcome.message,
+        tone: "error",
+      });
+      return;
+    }
+
+    setState({
+      kind: "started",
+      message: `${copy.name} is addressing this feedback, then will commit and push it to the existing pull request.`,
+    });
   };
 
   if (state.kind === "started") {
     return (
       <div
-        className="space-y-2 border-t bg-emerald-50/70 px-3 py-3 text-xs dark:bg-emerald-950/25"
+        className="box-border w-full min-w-0 space-y-2 border-t bg-emerald-50/70 px-3 py-3 text-xs dark:bg-emerald-950/25"
         role="status"
       >
         <div className="flex flex-wrap items-center gap-2 text-emerald-800 dark:text-emerald-300">
@@ -348,7 +742,7 @@ function ReviewComposer({
   const submitting = state.kind === "submitting";
   return (
     <form
-      className="space-y-2 border-t bg-muted/20 px-3 py-3"
+      className="box-border w-full min-w-0 space-y-2 border-t bg-muted/20 px-3 py-3"
       data-review-fix-composer=""
       onSubmit={(event) => {
         event.preventDefault();
@@ -361,43 +755,54 @@ function ReviewComposer({
           className="size-3.5 text-muted-foreground"
         />
         <label className="font-medium" htmlFor={inputId}>
-          Claude feedback on {selectionLabel(selection)}
+          {copy.feedback} on {selectionLabel(selection)}
         </label>
         <code className="min-w-0 truncate text-[11px] text-muted-foreground">
           {selection.start.path}
         </code>
       </div>
       <Textarea
-        autoFocus
+        className="box-border w-full min-w-0 max-w-full"
+        data-pull-focus-token="feedback-composer"
         disabled={submitting}
         id={inputId}
         onChange={(event) => {
-          setBody(event.target.value);
+          onDraftChange(event.target.value);
           if (state.kind === "editing" && state.message !== null) {
-            setState({ kind: "editing", message: null });
+            setState({ kind: "editing", message: null, tone: null });
           }
         }}
-        placeholder="Tell Claude what to change…"
+        placeholder={`Tell ${copy.name} what to change…`}
+        ref={input}
         required
         rows={3}
-        value={body}
+        value={draft}
       />
       {state.kind === "editing" && state.message !== null && (
-        <p className="m-0 text-xs text-destructive" role="alert">
+        <p
+          className={`m-0 text-xs ${
+            state.tone === "information"
+              ? "text-muted-foreground"
+              : "text-destructive"
+          }`}
+          role={state.tone === "information" ? "status" : "alert"}
+        >
           {state.message}
         </p>
       )}
-      {active && (
+      {active && !submitting && (
         <p
           className="m-0 text-xs text-amber-700 dark:text-amber-300"
           role="status"
         >
-          A Claude Code run is already active for this pull request. Wait for it
-          to finish before starting another review fix.
+          {preparing
+            ? "Another review fix is being prepared for this pull request. Wait for preparation to finish before starting another."
+            : `Another ${copy.run} is already active for this pull request. Wait for it to finish before starting another review fix.`}
         </p>
       )}
       <div className="flex justify-end gap-2">
         <Button
+          data-pull-focus-token="feedback-cancel"
           disabled={submitting}
           onClick={onCancel}
           size="sm"
@@ -407,7 +812,8 @@ function ReviewComposer({
           Cancel
         </Button>
         <Button
-          disabled={active || submitting || body.trim() === ""}
+          data-pull-focus-token="feedback-submit"
+          disabled={active || submitting || draft.trim() === ""}
           size="sm"
           type="submit"
         >
@@ -417,7 +823,7 @@ function ReviewComposer({
               className="motion-safe:animate-spin"
             />
           )}
-          {submitting ? "Starting review fix" : "Run review fix"}
+          {submitting ? "Preparing review fix" : "Run review fix"}
         </Button>
       </div>
     </form>
@@ -425,12 +831,14 @@ function ReviewComposer({
 }
 
 function DiffGutter({
+  agent,
   anchor,
   gutter,
   onSelect,
   selected,
   value,
 }: {
+  agent: Agent;
   anchor: CommentAnchor | null;
   gutter: "new" | "old";
   onSelect: (anchor: CommentAnchor, shift: boolean) => void;
@@ -457,15 +865,16 @@ function DiffGutter({
 
   return (
     <button
-      aria-label={`Give Claude feedback on ${gutter} line ${anchor.line}`}
+      aria-label={`Give ${feedbackAgentCopy[agent].name} feedback on ${gutter} line ${anchor.line}`}
       aria-pressed={selected}
       className={`${classes} cursor-pointer outline-none hover:bg-blue-200/70 focus-visible:bg-blue-200 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-500 dark:hover:bg-blue-900/60 dark:focus-visible:bg-blue-900 ${selected ? "bg-blue-200 text-blue-950 dark:bg-blue-900 dark:text-blue-100" : ""}`}
       data-comment-gutter={gutter}
       data-gutter={gutter}
+      data-pull-focus-token={`feedback:${anchor.path}:${anchor.side}:${anchor.line}`}
       onClick={(event: MouseEvent<HTMLButtonElement>) =>
         onSelect(anchor, event.shiftKey)
       }
-      title="Click to give Claude feedback. Shift-click to select a range."
+      title={`Click to give ${feedbackAgentCopy[agent].name} feedback. Shift-click to select a range.`}
       type="button"
     >
       {anchor.line}
@@ -474,79 +883,156 @@ function DiffGutter({
 }
 
 const FilePatch = memo(function FilePatch({
+  agent,
+  composer,
   file,
   onSelect,
+  onScrollLeftChange,
+  readOnly,
+  scrollLeft,
   selection,
 }: {
+  agent: Agent;
+  composer: ReactNode;
   file: PullDiffFile;
   onSelect: (anchor: CommentAnchor, shift: boolean) => void;
+  onScrollLeftChange: (scrollLeft: number) => void;
+  readOnly: boolean;
+  scrollLeft: number;
   selection: CommentSelection | null;
 }) {
+  const patch = useRef<HTMLDivElement>(null);
+  const [viewportWidth, setViewportWidth] = useState<number | null>(null);
+
+  useLayoutEffect(() => {
+    if (patch.current && patch.current.scrollLeft !== scrollLeft) {
+      patch.current.scrollLeft = scrollLeft;
+    }
+  }, [scrollLeft]);
+
+  useLayoutEffect(() => {
+    const node = patch.current;
+    if (node === null) return;
+
+    const measure = (): void => {
+      const width = node.clientWidth;
+      if (width <= 0) return;
+      setViewportWidth((current) => (current === width ? current : width));
+    };
+
+    measure();
+    if (typeof ResizeObserver !== "undefined") {
+      const observer = new ResizeObserver(measure);
+      observer.observe(node);
+      return () => observer.disconnect();
+    }
+
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, []);
+
   if (file.hunks.length === 0) {
     return <FilePlaceholder file={file} />;
   }
 
-  return (
-    <div className="overflow-x-auto font-mono text-[11px] leading-5 sm:text-xs">
-      {file.hunks.map((hunk, hunkIndex) => (
-        <div key={`${hunk.header}-${hunkIndex}`}>
-          <div className="min-w-max border-y border-blue-200 bg-blue-50 px-3 py-1 text-blue-800 first:border-t-0 dark:border-blue-900/70 dark:bg-blue-950/45 dark:text-blue-300">
-            {hunk.header}
-          </div>
-          {hunk.lines.map((line, lineIndex) => {
-            const left = file.truncated
-              ? null
-              : anchorFor(file, hunkIndex, lineIndex, line, "LEFT");
-            const right = file.truncated
-              ? null
-              : anchorFor(file, hunkIndex, lineIndex, line, "RIGHT");
-            const lineSelected =
-              selectedAnchor(selection, left) ||
-              selectedAnchor(selection, right);
+  const composerStyle: CSSProperties | undefined =
+    viewportWidth === null
+      ? undefined
+      : { maxWidth: viewportWidth, width: viewportWidth };
 
-            return (
-              <div
-                className={`grid min-w-max grid-cols-[3rem_3rem_minmax(max-content,1fr)] ${lineStyles[line.kind]} ${lineSelected ? "outline-1 -outline-offset-1 outline-blue-500" : ""}`}
-                data-comment-selected={lineSelected ? "" : undefined}
-                data-line-kind={line.kind}
-                key={`${hunkIndex}-${lineIndex}-${line.oldLine ?? ""}-${line.newLine ?? ""}`}
-              >
-                <DiffGutter
-                  anchor={left}
-                  gutter="old"
-                  onSelect={onSelect}
-                  selected={selectedAnchor(selection, left)}
-                  value={line.oldLine}
-                />
-                <DiffGutter
-                  anchor={right}
-                  gutter="new"
-                  onSelect={onSelect}
-                  selected={selectedAnchor(selection, right)}
-                  value={line.newLine}
-                />
-                <code className="inline-block min-w-full whitespace-pre px-3">
-                  <span aria-hidden="true" className="mr-2 select-none">
-                    {lineMarker(line.kind)}
-                  </span>
-                  {line.content || "\u00a0"}
-                </code>
-              </div>
-            );
-          })}
-        </div>
-      ))}
+  return (
+    <div
+      className="min-h-0 w-full min-w-0 flex-1 overflow-x-auto font-mono text-[11px] leading-5 [container-type:inline-size] sm:text-xs"
+      data-diff-file-patch=""
+      onScroll={(event) => onScrollLeftChange(event.currentTarget.scrollLeft)}
+      ref={patch}
+    >
+      <div className="w-max min-w-full" data-diff-patch-canvas="">
+        {file.hunks.map((hunk, hunkIndex) => (
+          <div className="min-w-full" key={`${hunk.header}-${hunkIndex}`}>
+            <div className="w-full min-w-full border-y border-blue-200 bg-blue-50 px-3 py-1 text-blue-800 first:border-t-0 dark:border-blue-900/70 dark:bg-blue-950/45 dark:text-blue-300">
+              {hunk.header}
+            </div>
+            {hunk.lines.map((line, lineIndex) => {
+              const left =
+                file.truncated || readOnly
+                  ? null
+                  : anchorFor(file, hunkIndex, lineIndex, line, "LEFT");
+              const right =
+                file.truncated || readOnly
+                  ? null
+                  : anchorFor(file, hunkIndex, lineIndex, line, "RIGHT");
+              const lineSelected =
+                selectedAnchor(selection, left) ||
+                selectedAnchor(selection, right);
+
+              return (
+                <Fragment
+                  key={`${hunkIndex}-${lineIndex}-${line.oldLine ?? ""}-${line.newLine ?? ""}`}
+                >
+                  <div
+                    className={`grid w-full min-w-full grid-cols-[3rem_3rem_minmax(max-content,1fr)] ${lineStyles[line.kind]} ${lineSelected ? "outline-1 -outline-offset-1 outline-blue-500" : ""}`}
+                    data-comment-selected={lineSelected ? "" : undefined}
+                    data-line-kind={line.kind}
+                  >
+                    <DiffGutter
+                      agent={agent}
+                      anchor={left}
+                      gutter="old"
+                      onSelect={onSelect}
+                      selected={selectedAnchor(selection, left)}
+                      value={line.oldLine}
+                    />
+                    <DiffGutter
+                      agent={agent}
+                      anchor={right}
+                      gutter="new"
+                      onSelect={onSelect}
+                      selected={selectedAnchor(selection, right)}
+                      value={line.newLine}
+                    />
+                    <code className="inline-block min-w-full whitespace-pre px-3">
+                      <span aria-hidden="true" className="mr-2 select-none">
+                        {lineMarker(line.kind)}
+                      </span>
+                      {line.content || "\u00a0"}
+                    </code>
+                  </div>
+                  {composer !== null &&
+                    selection?.end.hunkIndex === hunkIndex &&
+                    selection.end.lineIndex === lineIndex && (
+                      <div
+                        className="sticky left-0 box-border w-[100cqw] min-w-0 max-w-[100cqw] border-y bg-card font-sans text-sm"
+                        data-inline-review-composer=""
+                        style={composerStyle}
+                      >
+                        {composer}
+                      </div>
+                    )}
+                </Fragment>
+              );
+            })}
+          </div>
+        ))}
+      </div>
     </div>
   );
 });
 
 const DiffFile = memo(function DiffFile({
+  agent,
+  composerFocusRequest,
   diff,
+  draft,
   file,
   id,
   onCancelComment,
+  onDraftChange,
+  onPatchScrollLeftChange,
   onSelectComment,
+  patchScrollLeft,
   pull,
+  readOnly,
   register,
   run,
   selection,
@@ -554,12 +1040,19 @@ const DiffFile = memo(function DiffFile({
   toggleViewed,
   viewed,
 }: {
+  agent: Agent;
+  composerFocusRequest: number;
   diff: PullDiffData;
+  draft: string;
   file: PullDiffFile;
   id: string;
   onCancelComment: () => void;
+  onDraftChange: (draft: string) => void;
+  onPatchScrollLeftChange: (path: string, scrollLeft: number) => void;
   onSelectComment: (anchor: CommentAnchor, shift: boolean) => void;
+  patchScrollLeft: number;
   pull: PullReadiness;
+  readOnly: boolean;
   register: (path: string, node: HTMLElement | null) => void;
   run: RunState;
   selection: CommentSelection | null;
@@ -577,77 +1070,117 @@ const DiffFile = memo(function DiffFile({
     () => toggleViewed(file.path),
     [file.path, toggleViewed],
   );
+  const handlePatchScrollLeftChange = useCallback(
+    (scrollLeft: number) => onPatchScrollLeftChange(file.path, scrollLeft),
+    [file.path, onPatchScrollLeftChange],
+  );
+  const composer =
+    !readOnly && selection !== null && selection.start.path === file.path ? (
+      <ReviewComposer
+        agent={agent}
+        diff={diff}
+        draft={draft}
+        focusRequest={composerFocusRequest}
+        key={`${selection.origin.hunkIndex}:${selection.origin.side}:${selection.origin.lineIndex}:${selection.start.line}:${selection.end.line}:${run.reviewRetry?.attemptToken ?? "new"}`}
+        onCancel={onCancelComment}
+        onDraftChange={onDraftChange}
+        pull={pull}
+        retryStatus={run.reviewRetry?.status ?? null}
+        run={run}
+        selection={selection}
+        startRun={startRun}
+      />
+    ) : null;
 
   return (
     <section
       aria-labelledby={`${id}-title`}
-      className="scroll-mt-3 overflow-hidden rounded-lg border bg-card outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+      className="flex w-full min-w-0 scroll-mt-0 flex-col rounded-lg border bg-card outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+      data-diff-file=""
       id={id}
       ref={registerSection}
       tabIndex={-1}
     >
-      <header className="flex min-h-10 flex-wrap items-center gap-2 border-b bg-muted/35 px-3 py-2">
-        <FileCode2
-          aria-hidden="true"
-          className="size-3.5 shrink-0 text-muted-foreground"
-        />
-        <h4
-          className="m-0 min-w-0 flex-1 overflow-x-auto whitespace-nowrap font-mono text-xs font-medium"
-          id={`${id}-title`}
-        >
-          {file.previousPath && file.previousPath !== file.path ? (
-            <span className="inline-flex items-center gap-1">
-              <span>{file.previousPath}</span>
-              <ArrowRight aria-hidden="true" className="size-3" />
-              <span>{file.path}</span>
-            </span>
-          ) : (
-            file.path
-          )}
-        </h4>
-        <Badge variant="outline">{statusLabels[file.status]}</Badge>
-        <span
-          aria-label={`${file.additions} additions and ${file.deletions} deletions`}
-          className="flex items-center gap-1 font-mono text-[11px] tabular-nums"
-        >
-          <span className="text-emerald-700 dark:text-emerald-400">
-            +{file.additions}
-          </span>
-          <span className="text-red-700 dark:text-red-400">
-            -{file.deletions}
-          </span>
-        </span>
-        {isSafeGitHubUrl(file.blobUrl) && (
-          <a
-            className="relative z-20 text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline focus-visible:rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            href={file.blobUrl}
-            rel="noopener noreferrer"
-            target="_blank"
-          >
-            View file
-          </a>
-        )}
-        <div className="flex shrink-0 items-center gap-1.5 border-l pl-2">
-          <Checkbox
-            aria-controls={viewed ? undefined : bodyId}
-            aria-label={`Viewed ${file.path}`}
-            checked={viewed}
-            id={checkboxId}
-            onCheckedChange={handleViewedChange}
+      <header
+        className={`sticky top-0 z-50 -mx-px w-[calc(100%+2px)] min-w-0 border-x border-b bg-card ${
+          viewed ? "rounded-lg" : "rounded-t-lg"
+        }`}
+        data-diff-file-header=""
+      >
+        <div className="flex min-h-10 w-full min-w-0 flex-wrap items-center gap-2 overflow-clip rounded-[inherit] bg-muted/35 px-3 py-2">
+          <FileCode2
+            aria-hidden="true"
+            className="size-3.5 shrink-0 text-muted-foreground"
           />
-          <Label
-            className="cursor-pointer text-xs font-normal text-muted-foreground"
-            htmlFor={checkboxId}
+          <h4
+            className="m-0 min-w-0 flex-1 overflow-x-auto whitespace-nowrap font-mono text-xs font-medium"
+            data-diff-file-name=""
+            id={`${id}-title`}
           >
-            Viewed
-          </Label>
+            {file.previousPath && file.previousPath !== file.path ? (
+              <span className="inline-flex items-center gap-1">
+                <span>{file.previousPath}</span>
+                <ArrowRight aria-hidden="true" className="size-3" />
+                <span>{file.path}</span>
+              </span>
+            ) : (
+              file.path
+            )}
+          </h4>
+          <Badge variant="outline">{statusLabels[file.status]}</Badge>
+          <span
+            aria-label={`${file.additions} additions and ${file.deletions} deletions`}
+            className="flex items-center gap-1 font-mono text-[11px] tabular-nums"
+          >
+            <span className="text-emerald-700 dark:text-emerald-400">
+              +{file.additions}
+            </span>
+            <span className="text-red-700 dark:text-red-400">
+              -{file.deletions}
+            </span>
+          </span>
+          {isSafeGitHubUrl(file.blobUrl) && (
+            <a
+              className="relative z-20 text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline focus-visible:rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              href={file.blobUrl}
+              rel="noopener noreferrer"
+              target="_blank"
+            >
+              View file
+            </a>
+          )}
+          <div className="flex shrink-0 items-center gap-1.5 border-l pl-2">
+            <Checkbox
+              aria-controls={viewed ? undefined : bodyId}
+              aria-label={`Viewed ${file.path}`}
+              checked={viewed}
+              data-pull-focus-token={`viewed:${file.path}`}
+              id={checkboxId}
+              onCheckedChange={handleViewedChange}
+            />
+            <Label
+              className="cursor-pointer text-xs font-normal text-muted-foreground"
+              htmlFor={checkboxId}
+            >
+              Viewed
+            </Label>
+          </div>
         </div>
       </header>
       {!viewed && (
-        <div id={bodyId}>
+        <div
+          className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-b-lg"
+          data-diff-file-body=""
+          id={bodyId}
+        >
           <FilePatch
+            agent={agent}
+            composer={composer}
             file={file}
             onSelect={onSelectComment}
+            onScrollLeftChange={handlePatchScrollLeftChange}
+            readOnly={readOnly}
+            scrollLeft={patchScrollLeft}
             selection={selection}
           />
           {file.truncated && file.hunks.length > 0 && (
@@ -655,17 +1188,6 @@ const DiffFile = memo(function DiffFile({
               <CircleAlert aria-hidden="true" className="size-3.5 shrink-0" />
               GitHub returned only part of this file's patch.
             </div>
-          )}
-          {selection !== null && selection.start.path === file.path && (
-            <ReviewComposer
-              diff={diff}
-              key={`${selection.origin.hunkIndex}:${selection.origin.side}:${selection.origin.lineIndex}:${selection.start.line}:${selection.end.line}`}
-              onCancel={onCancelComment}
-              pull={pull}
-              run={run}
-              selection={selection}
-              startRun={startRun}
-            />
           )}
         </div>
       )}
@@ -675,122 +1197,318 @@ const DiffFile = memo(function DiffFile({
 
 type FileNavigationProps = {
   activate: (path: string) => void;
+  collapsedDirectories: readonly string[];
   fileIds: readonly string[];
   files: PullDiffFile[];
   navigate: (path: string) => void;
+  onScrollChange: (scrollLeft: number, scrollTop: number) => void;
+  onToggleDirectory: (path: string) => void;
+  scrollLeft: number;
+  scrollTop: number;
   selected: string | null;
   visibleCount: number;
 };
 
 const FileNavigation = memo(function FileNavigation({
   activate,
+  collapsedDirectories,
   fileIds,
   files,
   navigate,
+  onScrollChange,
+  onToggleDirectory,
+  scrollLeft,
+  scrollTop,
   selected,
   visibleCount,
 }: FileNavigationProps) {
+  const navigation = useRef<HTMLElement>(null);
+  const tree = useMemo(() => createFileTree(files), [files]);
+  const collapsed = useMemo(
+    () => new Set(collapsedDirectories),
+    [collapsedDirectories],
+  );
+
+  useLayoutEffect(() => {
+    if (!navigation.current) return;
+    if (navigation.current.scrollLeft !== scrollLeft) {
+      navigation.current.scrollLeft = scrollLeft;
+    }
+    if (navigation.current.scrollTop !== scrollTop) {
+      navigation.current.scrollTop = scrollTop;
+    }
+  }, [scrollLeft, scrollTop]);
+
   const handleKeyDown = useCallback(
     (event: KeyboardEvent<HTMLElement>) => {
-      const button = (event.target as HTMLElement).closest<HTMLButtonElement>(
-        "button[data-file-index]",
+      const item = (event.target as HTMLElement).closest<HTMLButtonElement>(
+        "button[data-tree-item]",
       );
-      if (!button || !event.currentTarget.contains(button)) return;
-
-      const index = Number(button.dataset.fileIndex);
+      if (!item || !event.currentTarget.contains(item)) return;
+      const items = [
+        ...event.currentTarget.querySelectorAll<HTMLButtonElement>(
+          item.dataset.filePath
+            ? "button[data-file-index]"
+            : "button[data-tree-item]",
+        ),
+      ];
+      const index = items.indexOf(item);
       let next = index;
 
       if (event.key === "ArrowDown") {
-        next = Math.min(files.length - 1, index + 1);
+        next = Math.min(items.length - 1, index + 1);
       } else if (event.key === "ArrowUp") {
         next = Math.max(0, index - 1);
       } else if (event.key === "Home") {
         next = 0;
       } else if (event.key === "End") {
-        next = files.length - 1;
+        next = items.length - 1;
+      } else if (
+        (event.key === "ArrowLeft" || event.key === "ArrowRight") &&
+        item.dataset.directory
+      ) {
+        const isCollapsed =
+          item.parentElement?.getAttribute("aria-expanded") === "false";
+        if (
+          (event.key === "ArrowLeft" && !isCollapsed) ||
+          (event.key === "ArrowRight" && isCollapsed)
+        ) {
+          event.preventDefault();
+          item.click();
+        }
+        return;
       } else {
         return;
       }
 
       event.preventDefault();
-      const file = files[next];
-      if (!file) return;
-
-      navigate(file.path);
-      event.currentTarget
-        .querySelector<HTMLButtonElement>(`button[data-file-index="${next}"]`)
-        ?.focus();
+      const target = items[next];
+      if (!target) return;
+      const path = target.dataset.filePath;
+      if (path) navigate(path);
+      target.focus();
     },
-    [files, navigate],
+    [navigate],
   );
+
+  const renderDirectory = (
+    directory: FileTreeDirectory,
+    depth: number,
+  ): ReactNode => {
+    const directories = treeDirectories(directory);
+    const directoryFiles = directory.files;
+    const children = [
+      ...directories.map((child) => ({
+        key: `directory:${child.path}`,
+        node: (() => {
+          const closed = collapsed.has(child.path);
+          return (
+            <li
+              aria-expanded={!closed}
+              className="min-w-full"
+              key={child.path}
+              role="treeitem"
+            >
+              <button
+                className="flex min-h-9 w-max min-w-full items-center gap-1.5 rounded-md py-1 pr-2 text-left text-xs text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                data-directory={child.path}
+                data-tree-item=""
+                onClick={() => onToggleDirectory(child.path)}
+                style={{ paddingLeft: `${depth * 12 + 8}px` }}
+                type="button"
+              >
+                <ChevronRight
+                  aria-hidden="true"
+                  className={`size-3 shrink-0 transition-transform ${closed ? "" : "rotate-90"}`}
+                />
+                {closed ? (
+                  <FolderClosed aria-hidden="true" className="size-3.5" />
+                ) : (
+                  <FolderOpen aria-hidden="true" className="size-3.5" />
+                )}
+                <span className="whitespace-nowrap font-mono">
+                  {child.name}
+                </span>
+              </button>
+              {!closed && renderDirectory(child, depth + 1)}
+            </li>
+          );
+        })(),
+      })),
+      ...directoryFiles.map(({ file, index }) => {
+        const name = file.path.split("/").pop() ?? file.path;
+        return {
+          key: `file:${file.path}`,
+          node: (
+            <li
+              aria-selected={selected === file.path}
+              className="min-w-full"
+              key={file.path}
+              role="treeitem"
+            >
+              <button
+                aria-controls={
+                  index < visibleCount || selected === file.path
+                    ? fileIds[index]
+                    : undefined
+                }
+                aria-current={selected === file.path ? "true" : undefined}
+                className="flex min-h-11 w-max min-w-full items-center gap-2 rounded-md py-1.5 pr-2 text-left text-xs outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9 aria-[current=true]:bg-muted aria-[current=true]:text-foreground"
+                data-file-index={index}
+                data-file-path={file.path}
+                data-pull-focus-token={`file:${file.path}`}
+                data-tree-item=""
+                onClick={() => activate(file.path)}
+                style={{ paddingLeft: `${depth * 12 + 25}px` }}
+                tabIndex={selected === file.path ? 0 : -1}
+                type="button"
+              >
+                <FileCode2
+                  aria-hidden="true"
+                  className="size-3.5 shrink-0 text-muted-foreground"
+                />
+                <span className="flex-1 whitespace-nowrap font-mono">
+                  {name}
+                </span>
+                <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
+                  <span className="text-emerald-700 dark:text-emerald-400">
+                    +{file.additions}
+                  </span>{" "}
+                  <span className="text-red-700 dark:text-red-400">
+                    -{file.deletions}
+                  </span>
+                </span>
+              </button>
+            </li>
+          ),
+        };
+      }),
+    ];
+
+    return (
+      <ul
+        className="m-0 min-w-full list-none p-0"
+        role={depth === 0 ? "tree" : "group"}
+      >
+        {children.map(({ key, node }) => (
+          <Fragment key={key}>{node}</Fragment>
+        ))}
+      </ul>
+    );
+  };
 
   return (
     <nav
       aria-label="Changed files"
-      className="flex max-w-full gap-1 overflow-x-auto p-2 lg:max-h-[70vh] lg:flex-col lg:overflow-auto"
+      className="flex max-w-full gap-1 overflow-x-auto p-2 lg:max-h-[70vh] lg:flex-col lg:overflow-auto lg:[max-height:calc(100vh-3rem)]"
       onKeyDown={handleKeyDown}
+      onScroll={(event) =>
+        onScrollChange(
+          event.currentTarget.scrollLeft,
+          event.currentTarget.scrollTop,
+        )
+      }
+      ref={navigation}
     >
-      {files.map((file, index) => (
-        <button
-          aria-controls={
-            index < visibleCount || selected === file.path
-              ? fileIds[index]
-              : undefined
-          }
-          aria-current={selected === file.path ? "true" : undefined}
-          className="flex min-h-11 w-max min-w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring sm:min-h-9 aria-[current=true]:bg-muted aria-[current=true]:text-foreground"
-          data-file-index={index}
-          key={file.path}
-          onClick={() => activate(file.path)}
-          tabIndex={selected === file.path ? 0 : -1}
-          type="button"
-        >
-          <FileCode2
-            aria-hidden="true"
-            className="size-3.5 shrink-0 text-muted-foreground"
-          />
-          <span className="flex-1 whitespace-nowrap font-mono">
-            {file.path}
-          </span>
-          <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
-            <span className="text-emerald-700 dark:text-emerald-400">
-              +{file.additions}
-            </span>{" "}
-            <span className="text-red-700 dark:text-red-400">
-              -{file.deletions}
-            </span>
-          </span>
-        </button>
-      ))}
+      {renderDirectory(tree, 0)}
     </nav>
   );
 });
 
 function PullDiff({
+  agent = "claude",
+  clearReviewRetry,
   diff,
+  onPersistenceChange,
+  persistence,
   pull,
+  readOnly = false,
   run,
   startRun,
   toggleViewed,
   viewed,
 }: PullDiffProps) {
+  const retryAgent =
+    run.reviewRetry === null
+      ? null
+      : (run.history.find(({ id }) => id === run.reviewRetry?.runId)?.agent ??
+        null);
+  const feedbackAgent =
+    run.source === "review" && isRunActive(run)
+      ? run.agent
+      : (retryAgent ?? agent);
+  const copy = feedbackAgentCopy[feedbackAgent];
   const identifier = useId();
   const reducedMotion = useReducedMotion();
   const files = useRef(new Map<string, HTMLElement>());
+  const layout = useRef<HTMLDivElement>(null);
+  const resize = useRef<{
+    pointerId: number;
+    startWidth: number;
+    startX: number;
+  } | null>(null);
   const toggleViewedRef = useRef(toggleViewed);
-  const [selected, setSelected] = useState(diff.files[0]?.path ?? null);
-  const [commentSelection, setCommentSelection] =
-    useState<CommentSelection | null>(null);
-  const [selectionAnnouncement, setSelectionAnnouncement] = useState("");
-  const [visibleCount, setVisibleCount] = useState(() =>
-    Math.min(FILE_BATCH_SIZE, diff.files.length),
+  const [localPersistence, setLocalPersistence] = useState(() =>
+    createPullDiffPersistence(diff),
   );
+  const persistenceSource = persistence ?? localPersistence;
+  const currentPersistence = useMemo(
+    () => normalizePullDiffPersistence(diff, persistenceSource),
+    [diff, persistenceSource],
+  );
+  const persistenceRef = useRef(currentPersistence);
+  const normalizationNotice = useRef<PullDiffPersistence | null>(null);
+  const controlled = persistence !== undefined;
+  persistenceRef.current = currentPersistence;
+  const selected = currentPersistence.selectedPath;
+  const commentSelection = currentPersistence.selection;
+  const visibleCount = currentPersistence.visibleCount;
+  const [selectionAnnouncement, setSelectionAnnouncement] = useState("");
   const pendingSelection = useRef<string | null>(null);
+  const observedAttempt = useRef<string | null>(
+    readOnly ? null : run.reviewAttemptToken,
+  );
+  const [composerFocusRequest, setComposerFocusRequest] = useState(0);
   toggleViewedRef.current = toggleViewed;
+
+  const updatePersistence = useCallback(
+    (update: (current: PullDiffPersistence) => PullDiffPersistence): void => {
+      const previous = persistenceRef.current;
+      const next = normalizePullDiffPersistence(diff, update(previous));
+      if (samePersistence(previous, next)) return;
+
+      persistenceRef.current = next;
+      normalizationNotice.current = null;
+      if (!controlled) setLocalPersistence(next);
+      onPersistenceChange?.(next);
+    },
+    [controlled, diff, onPersistenceChange],
+  );
+
+  useEffect(() => {
+    if (samePersistence(persistenceSource, currentPersistence)) {
+      normalizationNotice.current = null;
+      return;
+    }
+    if (
+      normalizationNotice.current !== null &&
+      samePersistence(normalizationNotice.current, currentPersistence)
+    ) {
+      return;
+    }
+
+    persistenceRef.current = currentPersistence;
+    normalizationNotice.current = currentPersistence;
+    if (!controlled) setLocalPersistence(currentPersistence);
+    onPersistenceChange?.(currentPersistence);
+  }, [controlled, currentPersistence, onPersistenceChange, persistenceSource]);
+  const orderedFiles = useMemo(() => treeFiles(diff.files), [diff.files]);
   const fileIds = useMemo(
     () =>
-      diff.files.map((_file, index) => `pull-diff-${identifier}-file-${index}`),
-    [diff.files, identifier],
+      orderedFiles.map(
+        (_file, index) => `pull-diff-${identifier}-file-${index}`,
+      ),
+    [identifier, orderedFiles],
   );
   const totals = useMemo(
     () =>
@@ -811,64 +1529,152 @@ function PullDiff({
       ),
     [diff.files, viewed],
   );
+  const revision =
+    "commitSha" in diff && typeof diff.commitSha === "string"
+      ? diff.commitSha
+      : diff.headRefOid;
 
   useEffect(() => {
-    if (!diff.files.some(({ path }) => path === selected)) {
-      setSelected(diff.files[0]?.path ?? null);
-    }
-  }, [diff.files, selected]);
-
-  useEffect(() => {
-    if (commentSelection === null) return;
-    const current = diff.files.find(
-      ({ path }) => path === commentSelection.start.path,
-    );
-    if (!current || current.truncated) {
-      setCommentSelection(null);
+    if (readOnly) return;
+    const retry = run.reviewRetry;
+    if (!retry) return;
+    const restored = selectionForRetry(diff, retry);
+    if (restored === null) {
+      clearReviewRetry(pull.url, retry.attemptToken);
+      updatePersistence((current) => ({
+        ...current,
+        draft: "",
+        selection: null,
+      }));
       setSelectionAnnouncement(
-        "The selected Claude feedback lines are no longer available.",
+        `The saved ${copy.feedback} no longer matches this pull request diff.`,
       );
+      return;
     }
-  }, [commentSelection, diff.files]);
+
+    updatePersistence((current) => ({
+      ...current,
+      draft: retry.draft,
+      selectedPath: restored.start.path,
+      selection: restored,
+    }));
+    setSelectionAnnouncement(`Restored ${selectionLabel(restored)} for retry.`);
+  }, [
+    clearReviewRetry,
+    copy.feedback,
+    diff,
+    pull.url,
+    readOnly,
+    run.reviewRetry,
+    updatePersistence,
+  ]);
+
+  useEffect(() => {
+    if (readOnly) return;
+    if (run.reviewAttemptToken !== null) {
+      if (observedAttempt.current !== run.reviewAttemptToken) {
+        updatePersistence((current) => ({
+          ...current,
+          draft: "",
+          selection: null,
+        }));
+        setSelectionAnnouncement(
+          `${copy.name} is addressing the selected feedback.`,
+        );
+      }
+      observedAttempt.current = run.reviewAttemptToken;
+      return;
+    }
+    if (
+      observedAttempt.current !== null &&
+      !isRunActive(run) &&
+      run.reviewRetry === null
+    ) {
+      observedAttempt.current = null;
+      updatePersistence((current) => ({
+        ...current,
+        draft: "",
+        selection: null,
+      }));
+      setSelectionAnnouncement(`${copy.feedback} selection cleared.`);
+    }
+  }, [copy.feedback, copy.name, readOnly, run, updatePersistence]);
 
   const registerFile = useCallback((path: string, node: HTMLElement | null) => {
     if (node) files.current.set(path, node);
     else files.current.delete(path);
   }, []);
-  const handleToggleViewed = useCallback((path: string) => {
-    setCommentSelection((current) =>
-      current?.start.path === path ? null : current,
-    );
-    toggleViewedRef.current(path);
-  }, []);
+  const handleToggleViewed = useCallback(
+    (path: string) => {
+      if (readOnly) {
+        toggleViewedRef.current(path);
+        return;
+      }
+      const retry = run.reviewRetry;
+      if (retry?.feedback.path === path) {
+        clearReviewRetry(pull.url, retry.attemptToken);
+      }
+      updatePersistence((current) =>
+        current.selection?.start.path === path
+          ? { ...current, draft: "", selection: null }
+          : current,
+      );
+      toggleViewedRef.current(path);
+    },
+    [clearReviewRetry, pull.url, readOnly, run.reviewRetry, updatePersistence],
+  );
   const cancelComment = useCallback(() => {
-    setCommentSelection(null);
-    setSelectionAnnouncement("Claude feedback selection cleared.");
-  }, []);
+    if (readOnly) return;
+    if (run.reviewRetry) {
+      clearReviewRetry(pull.url, run.reviewRetry.attemptToken);
+    }
+    updatePersistence((current) => ({
+      ...current,
+      draft: "",
+      selection: null,
+    }));
+    setSelectionAnnouncement(`${copy.feedback} selection cleared.`);
+  }, [
+    clearReviewRetry,
+    copy.feedback,
+    pull.url,
+    readOnly,
+    run.reviewRetry,
+    updatePersistence,
+  ]);
   const selectComment = useCallback(
     (anchor: CommentAnchor, shift: boolean) => {
-      setSelected(anchor.path);
+      if (readOnly) return;
+      if (run.reviewRetry) {
+        clearReviewRetry(pull.url, run.reviewRetry.attemptToken);
+      }
       if (!shift || commentSelection === null) {
         const next = { end: anchor, origin: anchor, start: anchor };
-        setCommentSelection(next);
+        updatePersistence((current) => ({
+          ...current,
+          draft: "",
+          selectedPath: anchor.path,
+          selection: next,
+        }));
+        setComposerFocusRequest((request) => request + 1);
         setSelectionAnnouncement(`Selected ${selectionLabel(next)}.`);
         return;
       }
       if (commentSelection.origin.path !== anchor.path) {
         setSelectionAnnouncement(
-          "Keep the Claude feedback selection within one file.",
+          `Keep the ${copy.feedback} selection within one file.`,
         );
         return;
       }
       if (commentSelection.origin.hunkIndex !== anchor.hunkIndex) {
         setSelectionAnnouncement(
-          "Keep the Claude feedback selection within one diff hunk.",
+          `Keep the ${copy.feedback} selection within one diff hunk.`,
         );
         return;
       }
       if (commentSelection.origin.side !== anchor.side) {
         setSelectionAnnouncement(
-          "Keep the Claude feedback selection on the same side of the diff.",
+          `Keep the ${copy.feedback} selection on the same side of the diff.`,
         );
         return;
       }
@@ -883,10 +1689,24 @@ function PullDiff({
         );
         return;
       }
-      setCommentSelection(next);
+      updatePersistence((current) => ({
+        ...current,
+        selectedPath: anchor.path,
+        selection: next,
+      }));
+      setComposerFocusRequest((request) => request + 1);
       setSelectionAnnouncement(`Selected ${selectionLabel(next)}.`);
     },
-    [commentSelection, diff.files],
+    [
+      clearReviewRetry,
+      commentSelection,
+      copy.feedback,
+      diff.files,
+      pull.url,
+      readOnly,
+      run.reviewRetry,
+      updatePersistence,
+    ],
   );
   const focusFile = useCallback(
     (path: string) => {
@@ -904,49 +1724,242 @@ function PullDiff({
   );
   const selectFile = useCallback(
     (path: string) => {
-      setSelected(path);
-      setCommentSelection((current) =>
-        current?.start.path === path ? current : null,
-      );
+      updatePersistence((current) => {
+        const keepFeedback = current.selection?.start.path === path;
+        return {
+          ...current,
+          draft: keepFeedback ? current.draft : "",
+          selectedPath: path,
+          selection: keepFeedback ? current.selection : null,
+        };
+      });
       pendingSelection.current = null;
       if (focusFile(path)) return;
 
-      const index = diff.files.findIndex((file) => file.path === path);
+      const index = orderedFiles.findIndex((file) => file.path === path);
       if (index < 0) return;
 
       pendingSelection.current = path;
     },
-    [diff.files, focusFile],
+    [focusFile, orderedFiles, updatePersistence],
   );
-  const navigateFile = useCallback((path: string) => {
-    pendingSelection.current = null;
-    setSelected(path);
-    setCommentSelection((current) =>
-      current?.start.path === path ? current : null,
-    );
+  const navigateFile = useCallback(
+    (path: string) => {
+      pendingSelection.current = null;
+      updatePersistence((current) => {
+        const keepFeedback = current.selection?.start.path === path;
+        return {
+          ...current,
+          draft: keepFeedback ? current.draft : "",
+          selectedPath: path,
+          selection: keepFeedback ? current.selection : null,
+        };
+      });
+    },
+    [updatePersistence],
+  );
+  const changeDraft = useCallback(
+    (draft: string) => {
+      updatePersistence((current) => ({ ...current, draft }));
+    },
+    [updatePersistence],
+  );
+  const updatePersistenceRef = useRef(updatePersistence);
+  const pendingScroll = useRef<{
+    navigationScrollLeft?: number;
+    navigationScrollTop?: number;
+    patchScrollLeft: Record<string, number>;
+  }>({ patchScrollLeft: {} });
+  const scrollFrame = useRef<number | null>(null);
+  updatePersistenceRef.current = updatePersistence;
+  const flushScrollPersistence = useCallback(() => {
+    const pending = pendingScroll.current;
+    const patchScrollLeft = pending.patchScrollLeft;
+    if (
+      pending.navigationScrollLeft === undefined &&
+      pending.navigationScrollTop === undefined &&
+      Object.keys(patchScrollLeft).length === 0
+    ) {
+      return;
+    }
+
+    pendingScroll.current = { patchScrollLeft: {} };
+    updatePersistenceRef.current((current) => ({
+      ...current,
+      ...(pending.navigationScrollLeft === undefined
+        ? {}
+        : { navigationScrollLeft: pending.navigationScrollLeft }),
+      ...(pending.navigationScrollTop === undefined
+        ? {}
+        : { navigationScrollTop: pending.navigationScrollTop }),
+      patchScrollLeft:
+        Object.keys(patchScrollLeft).length === 0
+          ? current.patchScrollLeft
+          : { ...current.patchScrollLeft, ...patchScrollLeft },
+    }));
   }, []);
+  const scheduleScrollPersistence = useCallback(() => {
+    if (scrollFrame.current !== null) return;
+    scrollFrame.current = window.requestAnimationFrame(() => {
+      scrollFrame.current = null;
+      flushScrollPersistence();
+    });
+  }, [flushScrollPersistence]);
+  const changeNavigationScroll = useCallback(
+    (navigationScrollLeft: number, navigationScrollTop: number) => {
+      pendingScroll.current.navigationScrollLeft = navigationScrollLeft;
+      pendingScroll.current.navigationScrollTop = navigationScrollTop;
+      scheduleScrollPersistence();
+    },
+    [scheduleScrollPersistence],
+  );
+  const changePatchScrollLeft = useCallback(
+    (path: string, patchScrollLeft: number) => {
+      pendingScroll.current.patchScrollLeft[path] = patchScrollLeft;
+      scheduleScrollPersistence();
+    },
+    [scheduleScrollPersistence],
+  );
+  useEffect(
+    () => () => {
+      if (scrollFrame.current !== null) {
+        window.cancelAnimationFrame(scrollFrame.current);
+        scrollFrame.current = null;
+      }
+      flushScrollPersistence();
+    },
+    [flushScrollPersistence],
+  );
+  const showMoreFiles = useCallback(() => {
+    updatePersistence((current) => ({
+      ...current,
+      visibleCount: Math.min(
+        orderedFiles.length,
+        current.visibleCount + FILE_BATCH_SIZE,
+      ),
+    }));
+  }, [orderedFiles.length, updatePersistence]);
+  const toggleDirectory = useCallback(
+    (path: string) => {
+      updatePersistence((current) => {
+        const collapsed = new Set(current.collapsedDirectories);
+        if (collapsed.has(path)) collapsed.delete(path);
+        else collapsed.add(path);
+        return { ...current, collapsedDirectories: [...collapsed].sort() };
+      });
+    },
+    [updatePersistence],
+  );
+  const maximumNavigationWidth = useCallback((): number => {
+    const width = layout.current?.getBoundingClientRect().width ?? 0;
+    return width > 0
+      ? Math.max(
+          NAVIGATION_MIN_WIDTH,
+          Math.min(NAVIGATION_MAX_WIDTH, width - 320),
+        )
+      : NAVIGATION_MAX_WIDTH;
+  }, []);
+  const setNavigationWidth = useCallback(
+    (width: number) => {
+      const maximum = maximumNavigationWidth();
+      updatePersistence((current) => ({
+        ...current,
+        navigationWidth: Math.min(
+          maximum,
+          Math.max(NAVIGATION_MIN_WIDTH, width),
+        ),
+      }));
+    },
+    [maximumNavigationWidth, updatePersistence],
+  );
+  useLayoutEffect(() => {
+    const reclamp = (): void => {
+      if (!splitLayoutActive()) return;
+      setNavigationWidth(persistenceRef.current.navigationWidth);
+    };
+    reclamp();
+    window.addEventListener("resize", reclamp);
+    const observer =
+      typeof ResizeObserver === "undefined" || layout.current === null
+        ? null
+        : new ResizeObserver(reclamp);
+    if (observer && layout.current) observer.observe(layout.current);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", reclamp);
+    };
+  }, [setNavigationWidth]);
+  const beginNavigationResize = useCallback(
+    (event: PointerEvent<HTMLDivElement>) => {
+      resize.current = {
+        pointerId: event.pointerId,
+        startWidth: persistenceRef.current.navigationWidth,
+        startX: event.clientX,
+      };
+      event.currentTarget.setPointerCapture?.(event.pointerId);
+    },
+    [],
+  );
+  const resizeNavigation = useCallback(
+    (event: PointerEvent<HTMLDivElement>) => {
+      const current = resize.current;
+      if (!current || current.pointerId !== event.pointerId) return;
+      setNavigationWidth(current.startWidth + event.clientX - current.startX);
+    },
+    [setNavigationWidth],
+  );
+  const finishNavigationResize = useCallback(
+    (event: PointerEvent<HTMLDivElement>) => {
+      if (resize.current?.pointerId !== event.pointerId) return;
+      resize.current = null;
+      event.currentTarget.releasePointerCapture?.(event.pointerId);
+    },
+    [],
+  );
+  const handleSeparatorKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLDivElement>) => {
+      let width: number | null = null;
+      if (event.key === "ArrowLeft") {
+        width = persistenceRef.current.navigationWidth - 16;
+      } else if (event.key === "ArrowRight") {
+        width = persistenceRef.current.navigationWidth + 16;
+      } else if (event.key === "Home") {
+        width = NAVIGATION_MIN_WIDTH;
+      } else if (event.key === "End") {
+        width = maximumNavigationWidth();
+      } else {
+        return;
+      }
+      event.preventDefault();
+      setNavigationWidth(width);
+    },
+    [maximumNavigationWidth, setNavigationWidth],
+  );
 
   useEffect(() => {
     const path = pendingSelection.current;
     if (path && focusFile(path)) pendingSelection.current = null;
   }, [focusFile, selected, visibleCount]);
 
-  const shown = Math.min(visibleCount, diff.files.length);
-  const selectedIndex = diff.files.findIndex((file) => file.path === selected);
+  const shown = Math.min(visibleCount, orderedFiles.length);
+  const selectedIndex = orderedFiles.findIndex(
+    (file) => file.path === selected,
+  );
   const renderedCount =
     shown +
-    (selectedIndex >= shown && selectedIndex < diff.files.length ? 1 : 0);
-  const remaining = diff.files.length - renderedCount;
-  const nextShown = Math.min(diff.files.length, shown + FILE_BATCH_SIZE);
+    (selectedIndex >= shown && selectedIndex < orderedFiles.length ? 1 : 0);
+  const remaining = orderedFiles.length - renderedCount;
+  const nextShown = Math.min(orderedFiles.length, shown + FILE_BATCH_SIZE);
   const nextRenderedCount =
     nextShown +
-    (selectedIndex >= nextShown && selectedIndex < diff.files.length ? 1 : 0);
+    (selectedIndex >= nextShown && selectedIndex < orderedFiles.length ? 1 : 0);
   const revealCount = nextRenderedCount - renderedCount;
 
   return (
     <div
       aria-label={`Files changed for ${diff.repository} pull request ${diff.number}`}
-      className="mt-3 overflow-hidden rounded-xl border bg-background"
+      className="mt-3 w-full min-w-0 rounded-xl border bg-background"
+      data-pull-diff=""
       role="region"
     >
       {selectionAnnouncement !== "" && (
@@ -960,7 +1973,7 @@ function PullDiff({
           {selectionAnnouncement}
         </p>
       )}
-      <div className="flex flex-wrap items-center gap-2 border-b bg-muted/30 px-3 py-2 text-xs">
+      <div className="flex flex-wrap items-center gap-2 rounded-t-xl border-b bg-muted/30 px-3 py-2 text-xs">
         <span className="font-medium">
           {diff.files.length} {diff.files.length === 1 ? "file" : "files"}{" "}
           changed
@@ -978,8 +1991,12 @@ function PullDiff({
         >
           {viewedCount} of {diff.files.length} files viewed
         </span>
-        <code className="ml-auto text-[11px] text-muted-foreground">
-          {diff.headRefOid.slice(0, 7)}
+        <code
+          className="ml-auto text-[11px] text-muted-foreground"
+          data-diff-revision=""
+          title={revision}
+        >
+          {revision.slice(0, 7)}
         </code>
       </div>
 
@@ -1004,29 +2021,85 @@ function PullDiff({
           No changed files were returned for this pull request.
         </p>
       ) : (
-        <div className="grid min-w-0 lg:grid-cols-[14rem_minmax(0,1fr)]">
-          <aside className="min-w-0 border-b bg-muted/15 lg:sticky lg:top-3 lg:self-start lg:border-r lg:border-b-0">
-            <FileNavigation
-              activate={selectFile}
-              fileIds={fileIds}
-              files={diff.files}
-              navigate={navigateFile}
-              selected={selected}
-              visibleCount={shown}
-            />
-          </aside>
+        <div
+          className="grid w-full min-w-0"
+          data-diff-layout=""
+          data-navigation-visible="true"
+          ref={layout}
+          style={
+            {
+              "--diff-navigation-width": `${currentPersistence.navigationWidth}px`,
+            } as CSSProperties
+          }
+        >
+          <>
+            <div
+              className="min-w-0 self-stretch border-b bg-muted/15 lg:border-r lg:border-b-0"
+              data-diff-navigation-pane=""
+            >
+              <div
+                className="lg:sticky lg:top-0 lg:max-h-[calc(100vh-3rem)]"
+                data-diff-navigation-sticky=""
+              >
+                <aside data-diff-navigation="">
+                  <FileNavigation
+                    activate={selectFile}
+                    collapsedDirectories={
+                      currentPersistence.collapsedDirectories
+                    }
+                    fileIds={fileIds}
+                    files={orderedFiles}
+                    navigate={navigateFile}
+                    onScrollChange={changeNavigationScroll}
+                    onToggleDirectory={toggleDirectory}
+                    scrollLeft={currentPersistence.navigationScrollLeft}
+                    scrollTop={currentPersistence.navigationScrollTop}
+                    selected={selected}
+                    visibleCount={shown}
+                  />
+                </aside>
+              </div>
+            </div>
+            <div
+              aria-label="Resize changed files pane"
+              aria-orientation="vertical"
+              aria-valuemax={Math.round(maximumNavigationWidth())}
+              aria-valuemin={NAVIGATION_MIN_WIDTH}
+              aria-valuenow={Math.round(currentPersistence.navigationWidth)}
+              className="group relative hidden cursor-col-resize touch-none bg-border outline-none hover:bg-ring focus-visible:bg-ring lg:block"
+              data-diff-navigation-resizer=""
+              onKeyDown={handleSeparatorKeyDown}
+              onPointerCancel={finishNavigationResize}
+              onPointerDown={beginNavigationResize}
+              onPointerMove={resizeNavigation}
+              onPointerUp={finishNavigationResize}
+              role="separator"
+              tabIndex={0}
+            >
+              <span className="absolute inset-y-0 left-1/2 w-2 -translate-x-1/2" />
+            </div>
+          </>
 
-          <div className="min-w-0 space-y-3 p-2 sm:p-3">
-            {diff.files.map((file, index) =>
+          <div className="min-w-0 space-y-3 p-2 sm:p-3" data-diff-content="">
+            {orderedFiles.map((file, index) =>
               index < shown || file.path === selected ? (
                 <DiffFile
+                  composerFocusRequest={composerFocusRequest}
                   diff={diff}
+                  agent={feedbackAgent}
+                  draft={currentPersistence.draft}
                   file={file}
                   id={fileIds[index]!}
                   key={file.path}
                   onCancelComment={cancelComment}
+                  onDraftChange={changeDraft}
+                  onPatchScrollLeftChange={changePatchScrollLeft}
                   onSelectComment={selectComment}
+                  patchScrollLeft={
+                    currentPersistence.patchScrollLeft[file.path] ?? 0
+                  }
                   pull={pull}
+                  readOnly={readOnly}
                   register={registerFile}
                   run={run}
                   selection={
@@ -1044,11 +2117,7 @@ function PullDiff({
               <div className="flex justify-center py-1">
                 <Button
                   aria-label={`Show more changed files. ${renderedCount} of ${diff.files.length} shown.`}
-                  onClick={() =>
-                    setVisibleCount((count) =>
-                      Math.min(diff.files.length, count + FILE_BATCH_SIZE),
-                    )
-                  }
+                  onClick={showMoreFiles}
                   size="sm"
                   type="button"
                   variant="outline"

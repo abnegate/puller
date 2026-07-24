@@ -1,4 +1,6 @@
+import { agentLabel } from "./agent";
 import type {
+  Agent,
   CheckLog,
   CICheck,
   CICheckState,
@@ -9,6 +11,9 @@ import type {
   MergePullRequest,
   MergePullRepairResponse,
   MergePullResponse,
+  PullCommit,
+  PullCommitDiff,
+  PullCommits,
   PullDiff,
   PullDiffFile,
   PullDiffFileStatus,
@@ -22,6 +27,11 @@ import type {
   RepairEvent,
   RepairSnapshot,
   RepairState,
+  ReleasePipeline,
+  ReleasePipelineRelease,
+  ReleasePipelineRun,
+  ReleasePipelineRunState,
+  ReleasePipelinesResponse,
   ReleaseVerificationEvent,
   ReleaseVerificationPull,
   ReleaseVerificationRequest,
@@ -56,8 +66,22 @@ const TASK_ID = /^[A-Za-z0-9_-]{8,80}$/;
 const TASK_PROMPT_LIMIT = 32 * 1024;
 const SHA = /^[a-f0-9]{40}$/i;
 const DECIMAL_ID = /^[1-9][0-9]{0,19}$/;
+const RELEASE_PIPELINE_ID = /^[1-9][0-9]*$/;
 const GITHUB_ACTIONS_JOB_URL =
   /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/actions\/runs\/([1-9][0-9]{0,19})\/job\/([1-9][0-9]{0,19})$/;
+const RELEASE_PIPELINE_RUN_STATES = new Set<ReleasePipelineRunState>([
+  "action-required",
+  "cancelled",
+  "failed",
+  "neutral",
+  "queued",
+  "running",
+  "skipped",
+  "stale",
+  "succeeded",
+  "timed-out",
+  "unknown",
+]);
 const DIFF_LINE_KEYS = new Set(["content", "kind", "newLine", "oldLine"]);
 const DIFF_LINE_KINDS = new Set(["addition", "context", "deletion", "meta"]);
 const DIFF_HUNK_KEYS = new Set([
@@ -90,6 +114,25 @@ const DIFF_KEYS = new Set([
   "repository",
   "warning",
 ]);
+const COMMIT_KEYS = new Set([
+  "authorLogin",
+  "authorName",
+  "authoredAt",
+  "message",
+  "sha",
+  "url",
+]);
+const COMMITS_KEYS = new Set([
+  "baseRefOid",
+  "commits",
+  "complete",
+  "count",
+  "headRefOid",
+  "number",
+  "repository",
+  "warning",
+]);
+const COMMIT_DIFF_KEYS = new Set([...DIFF_KEYS, "commitSha"]);
 const CHECK_LOG_KEYS = new Set([
   "cached",
   "fetchedAt",
@@ -218,8 +261,16 @@ type SharedRequest<Value> = {
 };
 
 const diffCache = new ResponseCache<PullDiff>(RESPONSE_CACHE_BUDGET_BYTES);
+const commitsCache = new ResponseCache<PullCommits>(
+  RESPONSE_CACHE_BUDGET_BYTES,
+);
+const commitDiffCache = new ResponseCache<PullCommitDiff>(
+  RESPONSE_CACHE_BUDGET_BYTES,
+);
 const checkLogCache = new ResponseCache<CheckLog>(RESPONSE_CACHE_BUDGET_BYTES);
 const diffRequests = new Map<string, SharedRequest<PullDiff>>();
+const commitsRequests = new Map<string, SharedRequest<PullCommits>>();
+const commitDiffRequests = new Map<string, SharedRequest<PullCommitDiff>>();
 const checkLogRequests = new Map<string, SharedRequest<CheckLog>>();
 let artifactViewer: string | null | undefined;
 
@@ -231,6 +282,17 @@ export class PullDiffHttpError extends Error {
   ) {
     super(message);
     this.name = "PullDiffHttpError";
+  }
+}
+
+export class PullCommitsHttpError extends Error {
+  public constructor(
+    public readonly status: number,
+    public readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "PullCommitsHttpError";
   }
 }
 
@@ -471,6 +533,9 @@ const isRepository = (value: unknown): value is string =>
   REPOSITORY.test(value) &&
   value.split("/").every((part) => part !== "." && part !== "..");
 
+const isAgent = (value: unknown): value is Agent =>
+  value === "claude" || value === "codex";
+
 const isTaskId = (value: unknown): value is string =>
   typeof value === "string" && TASK_ID.test(value);
 
@@ -520,6 +585,7 @@ export const isTask = (value: unknown): value is Task => {
   if (
     !isRecord(value) ||
     !hasOnlyKeys(value, [
+      "agent",
       "base",
       "branch",
       "createdAt",
@@ -532,6 +598,7 @@ export const isTask = (value: unknown): value is Task => {
       "updatedAt",
       "worktree",
     ]) ||
+    (value.agent !== undefined && !isAgent(value.agent)) ||
     !isTaskBranch(value.base) ||
     !isValidDate(value.createdAt) ||
     !isTaskId(value.id) ||
@@ -634,6 +701,8 @@ const isCIState = (value: unknown): value is CIState =>
 const isCICheckState = (value: unknown): value is CICheckState =>
   value === "success" ||
   value === "pending" ||
+  value === "in_progress" ||
+  value === "queued" ||
   value === "failure" ||
   value === "neutral" ||
   value === "skipped" ||
@@ -650,9 +719,10 @@ const isCICheck = (value: unknown): value is CICheck =>
 
 const ciBucket = (
   state: CICheckState,
-): "failed" | "passed" | "running" | "unknown" => {
+): "failed" | "inProgress" | "passed" | "queued" | "unknown" => {
   if (state === "failure") return "failed";
-  if (state === "pending") return "running";
+  if (state === "in_progress") return "inProgress";
+  if (state === "pending" || state === "queued") return "queued";
   if (state === "unknown") return "unknown";
   return "passed";
 };
@@ -677,8 +747,15 @@ const isCI = (value: unknown): value is PullReadiness["ci"] => {
     return hasOnlyKeys(value, ["state"]);
   }
 
+  const hasInProgress = hasOwn(value, "inProgress");
+  const hasQueued = hasOwn(value, "queued");
+  if (hasInProgress !== hasQueued) return false;
+  const executionKeys = hasInProgress
+    ? (["inProgress", "queued"] as const)
+    : [];
+
   if (
-    !hasOnlyKeys(value, ["state", ...enrichedKeys]) ||
+    !hasOnlyKeys(value, ["state", ...enrichedKeys, ...executionKeys]) ||
     !Array.isArray(value.checks) ||
     !value.checks.every(isCICheck) ||
     typeof value.complete !== "boolean" ||
@@ -686,21 +763,29 @@ const isCI = (value: unknown): value is PullReadiness["ci"] => {
     !isInteger(value.passed) ||
     !isInteger(value.running) ||
     !isInteger(value.total) ||
-    !isInteger(value.unknown)
+    !isInteger(value.unknown) ||
+    (hasInProgress &&
+      (!isInteger(value.inProgress) ||
+        !isInteger(value.queued) ||
+        value.inProgress + value.queued !== value.running))
   ) {
     return false;
   }
 
+  const inProgress = hasInProgress ? Number(value.inProgress) : 0;
+  const queued = hasQueued ? Number(value.queued) : value.running;
   const counts = {
     failed: value.failed,
+    inProgress,
     passed: value.passed,
-    running: value.running,
+    queued,
     unknown: value.unknown,
   };
   const observed = {
     failed: 0,
+    inProgress: 0,
     passed: 0,
-    running: 0,
+    queued: 0,
     unknown: 0,
   };
 
@@ -715,7 +800,8 @@ const isCI = (value: unknown): value is PullReadiness["ci"] => {
   const observedFitCounts =
     observed.failed <= counts.failed &&
     observed.passed <= counts.passed &&
-    observed.running <= counts.running &&
+    observed.inProgress <= counts.inProgress &&
+    observed.queued <= counts.queued &&
     observed.unknown <= counts.unknown;
   const expectedState =
     value.total === 0
@@ -747,7 +833,8 @@ const isCI = (value: unknown): value is PullReadiness["ci"] => {
     value.state === expectedState &&
     observed.failed === counts.failed &&
     observed.passed === counts.passed &&
-    observed.running === counts.running
+    observed.inProgress === counts.inProgress &&
+    observed.queued === counts.queued
   );
 };
 
@@ -1098,6 +1185,90 @@ export const isPullDiff = (value: unknown): value is PullDiff => {
     : value.warning !== null;
 };
 
+const isCommitUrl = (
+  value: unknown,
+  repository: string,
+  sha: string,
+): value is string => {
+  if (typeof value !== "string") return false;
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      url.hostname === "github.com" &&
+      url.port === "" &&
+      url.username === "" &&
+      url.password === "" &&
+      url.search === "" &&
+      url.hash === "" &&
+      url.pathname.toLowerCase() ===
+        `/${repository}/commit/${sha}`.toLowerCase()
+    );
+  } catch {
+    return false;
+  }
+};
+
+const isPullCommit = (
+  value: unknown,
+  repository: string,
+): value is PullCommit =>
+  isRecord(value) &&
+  hasOnlyKeySet(value, COMMIT_KEYS) &&
+  (value.authorLogin === null || isNonEmptyString(value.authorLogin)) &&
+  isNonEmptyString(value.authorName) &&
+  isValidDate(value.authoredAt) &&
+  typeof value.message === "string" &&
+  isSha(value.sha) &&
+  isCommitUrl(value.url, repository, value.sha);
+
+export const isPullCommits = (value: unknown): value is PullCommits => {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeySet(value, COMMITS_KEYS) ||
+    !isSha(value.baseRefOid) ||
+    !Array.isArray(value.commits) ||
+    typeof value.complete !== "boolean" ||
+    !isInteger(value.count) ||
+    !isSha(value.headRefOid) ||
+    !isInteger(value.number, 1) ||
+    !isRepository(value.repository) ||
+    (value.warning !== null && !isNonEmptyString(value.warning))
+  ) {
+    return false;
+  }
+
+  const commits = value.commits;
+  const repository = value.repository;
+  if (
+    !commits.every((commit) => isPullCommit(commit, repository)) ||
+    new Set(commits.map((commit) => commit.sha.toLowerCase())).size !==
+      commits.length ||
+    commits.length > Math.min(value.count, 250)
+  ) {
+    return false;
+  }
+
+  return value.complete
+    ? value.count <= 250 &&
+        commits.length === value.count &&
+        value.warning === null
+    : value.warning !== null;
+};
+
+export const isPullCommitDiff = (value: unknown): value is PullCommitDiff => {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeySet(value, COMMIT_DIFF_KEYS) ||
+    !isSha(value.commitSha)
+  ) {
+    return false;
+  }
+
+  const { commitSha: _commitSha, ...diff } = value;
+  return isPullDiff(diff);
+};
+
 export const isCheckLog = (value: unknown): value is CheckLog =>
   isRecord(value) &&
   hasOnlyKeySet(value, CHECK_LOG_KEYS) &&
@@ -1168,40 +1339,164 @@ const isReleasedPull = (value: unknown): value is ReleasedPull =>
   isNonEmptyString(value.title) &&
   isValidUrl(value.url);
 
-const isRecentRelease = (value: unknown): value is RecentRelease =>
+const isCanonicalActionsRunUrl = (
+  value: unknown,
+  repository: string,
+  id: string,
+): value is string =>
+  value === `https://github.com/${repository}/actions/runs/${id}`;
+
+const isReleasePipelineRun = (
+  value: unknown,
+  repository: string,
+): value is ReleasePipelineRun => {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, [
+      "attempt",
+      "createdAt",
+      "id",
+      "name",
+      "path",
+      "startedAt",
+      "state",
+      "updatedAt",
+      "url",
+      "workflowId",
+    ]) ||
+    !isInteger(value.attempt, 1) ||
+    !isValidDate(value.createdAt) ||
+    !isNonEmptyString(value.id) ||
+    !RELEASE_PIPELINE_ID.test(value.id) ||
+    !isNonEmptyString(value.name) ||
+    !isNonEmptyString(value.path) ||
+    !(value.startedAt === null || isValidDate(value.startedAt)) ||
+    !RELEASE_PIPELINE_RUN_STATES.has(
+      value.state as ReleasePipelineRunState,
+    ) ||
+    !isValidDate(value.updatedAt) ||
+    !isCanonicalActionsRunUrl(value.url, repository, value.id) ||
+    !isNonEmptyString(value.workflowId) ||
+    !RELEASE_PIPELINE_ID.test(value.workflowId)
+  ) {
+    return false;
+  }
+
+  return true;
+};
+
+const isReleasePipeline = (
+  value: unknown,
+  repository: string,
+): value is ReleasePipeline => {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, ["checkedAt", "lookup", "runs"]) ||
+    !isValidDate(value.checkedAt) ||
+    !(
+      value.lookup === "complete" ||
+      value.lookup === "pending" ||
+      value.lookup === "unavailable"
+    ) ||
+    !Array.isArray(value.runs) ||
+    !value.runs.every((run) => isReleasePipelineRun(run, repository))
+  ) {
+    return false;
+  }
+
+  const runIds = new Set(value.runs.map((run) => run.id));
+  const workflowIds = new Set(value.runs.map((run) => run.workflowId));
+  return (
+    runIds.size === value.runs.length &&
+    workflowIds.size === value.runs.length
+  );
+};
+
+const isRecentRelease = (value: unknown): value is RecentRelease => {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, [
+      "complete",
+      "id",
+      "name",
+      "pipeline",
+      "publishedAt",
+      "pulls",
+      "repository",
+      "repositoryUrl",
+      "source",
+      "tag",
+      "url",
+      "warning",
+    ]) ||
+    typeof value.complete !== "boolean" ||
+    !isNonEmptyString(value.id) ||
+    !isNonEmptyString(value.name) ||
+    !isValidDate(value.publishedAt) ||
+    !Array.isArray(value.pulls) ||
+    !value.pulls.every(isReleasedPull) ||
+    !isRepository(value.repository) ||
+    !isReleasePipeline(value.pipeline, value.repository) ||
+    !isValidUrl(value.repositoryUrl) ||
+    !(
+      value.source === "comparison" ||
+      value.source === "notes-fallback" ||
+      value.source === "unavailable"
+    ) ||
+    !isNonEmptyString(value.tag) ||
+    !isValidUrl(value.url) ||
+    !(value.warning === null || isNonEmptyString(value.warning)) ||
+    !(value.complete || value.warning !== null)
+  ) {
+    return false;
+  }
+
+  const repository = value.repository;
+  return value.pulls.every(
+    (pull) => pull.repository.toLowerCase() === repository.toLowerCase(),
+  );
+};
+
+const releaseIdentity = (
+  release: Pick<
+    ReleasePipelineRelease,
+    "id" | "publishedAt" | "repository" | "tag"
+  >,
+): string =>
+  JSON.stringify([
+    release.id,
+    release.repository,
+    release.tag,
+    release.publishedAt,
+  ]);
+
+const isReleasePipelineRelease = (
+  value: unknown,
+): value is ReleasePipelineRelease =>
   isRecord(value) &&
-  hasOnlyKeys(value, [
-    "complete",
-    "id",
-    "name",
-    "publishedAt",
-    "pulls",
-    "repository",
-    "repositoryUrl",
-    "source",
-    "tag",
-    "url",
-    "warning",
-  ]) &&
-  typeof value.complete === "boolean" &&
+  hasOnlyKeys(value, ["id", "pipeline", "publishedAt", "repository", "tag"]) &&
   isNonEmptyString(value.id) &&
-  isNonEmptyString(value.name) &&
   isValidDate(value.publishedAt) &&
-  Array.isArray(value.pulls) &&
-  value.pulls.every(isReleasedPull) &&
-  value.pulls.every(
-    (pull) =>
-      pull.repository.toLowerCase() === String(value.repository).toLowerCase(),
-  ) &&
   isRepository(value.repository) &&
-  isValidUrl(value.repositoryUrl) &&
-  (value.source === "comparison" ||
-    value.source === "notes-fallback" ||
-    value.source === "unavailable") &&
-  isNonEmptyString(value.tag) &&
-  isValidUrl(value.url) &&
-  (value.warning === null || isNonEmptyString(value.warning)) &&
-  (value.complete || value.warning !== null);
+  isReleasePipeline(value.pipeline, value.repository) &&
+  isNonEmptyString(value.tag);
+
+export const isReleasePipelinesResponse = (
+  value: unknown,
+): value is ReleasePipelinesResponse => {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, ["generatedAt", "releases"]) ||
+    !isValidDate(value.generatedAt) ||
+    !Array.isArray(value.releases) ||
+    !value.releases.every(isReleasePipelineRelease) ||
+    new Set(value.releases.map(releaseIdentity)).size !== value.releases.length
+  ) {
+    return false;
+  }
+
+  return true;
+};
 
 export const isRecentReleasesResponse = (
   value: unknown,
@@ -1212,7 +1507,7 @@ export const isRecentReleasesResponse = (
   typeof value.partial === "boolean" &&
   Array.isArray(value.releases) &&
   value.releases.every(isRecentRelease) &&
-  new Set(value.releases.map((release) => release.id)).size ===
+  new Set(value.releases.map(releaseIdentity)).size ===
     value.releases.length &&
   Array.isArray(value.warnings) &&
   value.warnings.every(isNonEmptyString);
@@ -1253,12 +1548,14 @@ const isMergePullResponse = (value: unknown): value is MergePullResponse => {
     isSha(value.headRefOid) &&
     isRecord(value.action) &&
     hasOnlyKeys(value.action, [
+      "agent",
       "deduplicated",
       "id",
       "state",
       "token",
       "type",
     ]) &&
+    isAgent(value.action.agent) &&
     typeof value.action.deduplicated === "boolean" &&
     isNonEmptyString(value.action.id) &&
     (value.action.state === "repair_queued" ||
@@ -1429,10 +1726,16 @@ const postJsonAction = async <ResponseType>(
 
 const clearPullRequestArtifacts = (): void => {
   diffCache.clear();
+  commitsCache.clear();
+  commitDiffCache.clear();
   checkLogCache.clear();
   for (const request of diffRequests.values()) request.controller.abort();
+  for (const request of commitsRequests.values()) request.controller.abort();
+  for (const request of commitDiffRequests.values()) request.controller.abort();
   for (const request of checkLogRequests.values()) request.controller.abort();
   diffRequests.clear();
+  commitsRequests.clear();
+  commitDiffRequests.clear();
   checkLogRequests.clear();
 };
 
@@ -1504,6 +1807,12 @@ const pullGeneration = (pull: PullIdentity): string =>
 
 const pullDiffKey = (pull: PullIdentity): string =>
   JSON.stringify([pullScope(pull), pullGeneration(pull)]);
+
+const pullCommitsKey = (pull: PullIdentity): string =>
+  JSON.stringify([pullDiffKey(pull), "commits"]);
+
+const pullCommitDiffKey = (pull: PullIdentity, commitSha: string): string =>
+  JSON.stringify([pullDiffKey(pull), "commit", commitSha.toLowerCase()]);
 
 const checkLogKey = (pull: PullIdentity, job: GitHubActionsJob): string =>
   JSON.stringify([pullDiffKey(pull), job.runId, job.jobId]);
@@ -1579,6 +1888,154 @@ export const getPullDiff = async (
     );
   } finally {
     diffCache.release(cacheScope);
+  }
+};
+
+export const getPullCommits = async (
+  pull: PullIdentity,
+  signal?: AbortSignal,
+): Promise<PullCommits> => {
+  throwIfAborted(signal);
+  if (!isSha(pull.baseRefOid))
+    throw new Error("The pull request base is invalid.");
+  if (!isSha(pull.headRefOid))
+    throw new Error("The pull request head is invalid.");
+
+  const scope = pullScope(pull);
+  const generation = pullGeneration(pull);
+  const key = pullCommitsKey(pull);
+  const cacheScope = commitsCache.acquire(scope, generation);
+  try {
+    const cached = commitsCache.get(key, cacheScope);
+    if (cached) return cached;
+
+    return await subscribe(
+      commitsRequests,
+      key,
+      async (sharedSignal) => {
+        throwIfAborted(sharedSignal);
+        const query = new URLSearchParams({
+          base: pull.baseRefOid.toLowerCase(),
+          head: pull.headRefOid.toLowerCase(),
+        });
+        const response = await fetch(
+          `${pullPath(pull.repository, pull.number)}/commits?${query}`,
+          {
+            cache: "no-store",
+            headers: { Accept: "application/json" },
+            signal: sharedSignal,
+          },
+        );
+        throwIfAborted(sharedSignal);
+        const payload = await readJson(response);
+        throwIfAborted(sharedSignal);
+
+        if (!response.ok) {
+          throw new PullCommitsHttpError(
+            response.status,
+            getErrorCode(payload, "commits_unavailable"),
+            getErrorMessage(
+              response.status,
+              payload,
+              "The pull request commits failed",
+            ),
+          );
+        }
+        if (
+          !isPullCommits(payload) ||
+          payload.repository.toLowerCase() !== pull.repository.toLowerCase() ||
+          payload.number !== pull.number ||
+          payload.baseRefOid.toLowerCase() !== pull.baseRefOid.toLowerCase() ||
+          payload.headRefOid.toLowerCase() !== pull.headRefOid.toLowerCase()
+        ) {
+          throw new Error(
+            "The pull request commits returned an unexpected response.",
+          );
+        }
+
+        throwIfAborted(sharedSignal);
+        commitsCache.set(key, cacheScope, payload);
+        return payload;
+      },
+      signal,
+    );
+  } finally {
+    commitsCache.release(cacheScope);
+  }
+};
+
+export const getPullCommitDiff = async (
+  pull: PullIdentity,
+  commitSha: string,
+  signal?: AbortSignal,
+): Promise<PullCommitDiff> => {
+  throwIfAborted(signal);
+  if (!isSha(pull.baseRefOid) || !isSha(pull.headRefOid) || !isSha(commitSha)) {
+    throw new Error("The pull request commit identity is invalid.");
+  }
+
+  const canonicalCommitSha = commitSha.toLowerCase();
+  const scope = pullScope(pull);
+  const generation = pullGeneration(pull);
+  const key = pullCommitDiffKey(pull, canonicalCommitSha);
+  const cacheScope = commitDiffCache.acquire(scope, generation);
+  try {
+    const cached = commitDiffCache.get(key, cacheScope);
+    if (cached) return cached;
+
+    return await subscribe(
+      commitDiffRequests,
+      key,
+      async (sharedSignal) => {
+        throwIfAborted(sharedSignal);
+        const query = new URLSearchParams({
+          base: pull.baseRefOid.toLowerCase(),
+          head: pull.headRefOid.toLowerCase(),
+        });
+        const response = await fetch(
+          `${pullPath(pull.repository, pull.number)}/commits/${canonicalCommitSha}?${query}`,
+          {
+            cache: "no-store",
+            headers: { Accept: "application/json" },
+            signal: sharedSignal,
+          },
+        );
+        throwIfAborted(sharedSignal);
+        const payload = await readJson(response);
+        throwIfAborted(sharedSignal);
+
+        if (!response.ok) {
+          throw new PullCommitsHttpError(
+            response.status,
+            getErrorCode(payload, "commit_diff_unavailable"),
+            getErrorMessage(
+              response.status,
+              payload,
+              "The pull request commit diff failed",
+            ),
+          );
+        }
+        if (
+          !isPullCommitDiff(payload) ||
+          payload.repository.toLowerCase() !== pull.repository.toLowerCase() ||
+          payload.number !== pull.number ||
+          payload.baseRefOid.toLowerCase() !== pull.baseRefOid.toLowerCase() ||
+          payload.headRefOid.toLowerCase() !== pull.headRefOid.toLowerCase() ||
+          payload.commitSha.toLowerCase() !== canonicalCommitSha
+        ) {
+          throw new Error(
+            "The pull request commit diff returned an unexpected response.",
+          );
+        }
+
+        throwIfAborted(sharedSignal);
+        commitDiffCache.set(key, cacheScope, payload);
+        return payload;
+      },
+      signal,
+    );
+  } finally {
+    commitDiffCache.release(cacheScope);
   }
 };
 
@@ -1732,6 +2189,36 @@ export const getRecentReleases = async (
   return payload;
 };
 
+export const getReleasePipelines = async (
+  signal?: AbortSignal,
+  force = true,
+): Promise<ReleasePipelinesResponse> => {
+  const response = await fetch(
+    force ? "/api/releases/pipelines?refresh=1" : "/api/releases/pipelines",
+    {
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+      signal,
+    },
+  );
+  const payload = await readJson(response);
+
+  if (!response.ok) {
+    throw new Error(
+      getErrorMessage(
+        response.status,
+        payload,
+        "Release pipelines could not be loaded",
+      ),
+    );
+  }
+  if (!isReleasePipelinesResponse(payload)) {
+    throw new Error("Release pipelines returned an unexpected response.");
+  }
+
+  return payload;
+};
+
 export const getTaskOptions = async (
   signal?: AbortSignal,
 ): Promise<TaskOptions> => {
@@ -1791,6 +2278,7 @@ export class TaskStartError extends Error {
 }
 
 const validStartTaskRequest = (request: StartTaskRequest): boolean =>
+  isAgent(request.agent) &&
   isTaskId(request.id) &&
   isRepository(request.repository) &&
   isTaskBranch(request.base) &&
@@ -1836,6 +2324,7 @@ export const startTask = async (
   const task = payload;
   if (
     task.id !== request.id ||
+    (task.agent ?? "claude") !== request.agent ||
     task.repository.toLowerCase() !== request.repository.toLowerCase() ||
     task.base !== request.base
   ) {
@@ -1877,13 +2366,16 @@ export const mergePull = async (
   request: MergePullRequest,
   signal?: AbortSignal,
 ): Promise<MergePullResponse> => {
-  if (!isSha(request.expectedHeadRefOid)) {
+  if (!isAgent(request.agent) || !isSha(request.expectedHeadRefOid)) {
     throw new Error("The expected pull request head is invalid.");
   }
 
   const response = await postJsonAction(
     `${pullPath(request.repository, request.number)}/merge`,
-    { expectedHeadRefOid: request.expectedHeadRefOid.toLowerCase() },
+    {
+      agent: request.agent,
+      expectedHeadRefOid: request.expectedHeadRefOid.toLowerCase(),
+    },
     isMergePullResponse,
     "The pull request merge failed",
     signal,
@@ -1894,8 +2386,9 @@ export const mergePull = async (
     response.url !==
       `https://github.com/${request.repository}/pull/${request.number}` ||
     (!response.merged &&
-      response.headRefOid.toLowerCase() !==
-        request.expectedHeadRefOid.toLowerCase())
+      (response.action.agent !== request.agent ||
+        response.headRefOid.toLowerCase() !==
+          request.expectedHeadRefOid.toLowerCase()))
   ) {
     throw new Error("The pull request merge returned an unexpected response.");
   }
@@ -1910,6 +2403,7 @@ export const createRelease = async (
   if (
     !isRepository(request.repository) ||
     !isNonEmptyString(request.tag) ||
+    typeof request.prerelease !== "boolean" ||
     (request.expectedLatestTag !== null &&
       !isNonEmptyString(request.expectedLatestTag))
   ) {
@@ -1918,7 +2412,12 @@ export const createRelease = async (
 
   const response = await postJsonAction(
     "/api/releases",
-    request,
+    {
+      expectedLatestTag: request.expectedLatestTag,
+      prerelease: request.prerelease,
+      repository: request.repository,
+      tag: request.tag,
+    },
     isCreateReleaseResponse,
     "The release could not be created",
     signal,
@@ -1969,7 +2468,7 @@ const parseTaskEvent = (value: unknown): TaskEvent => {
     !isInteger(value.sequence, 1) ||
     !isNonEmptyString(value.type)
   ) {
-    throw new Error("Claude returned an invalid task event.");
+    throw new Error("The local agent returned an invalid task event.");
   }
 
   if (
@@ -1995,7 +2494,7 @@ const parseTaskEvent = (value: unknown): TaskEvent => {
     };
   }
 
-  throw new Error("Claude returned an invalid task event.");
+  throw new Error("The local agent returned an invalid task event.");
 };
 
 export async function* streamTaskEvents(
@@ -2026,7 +2525,7 @@ export async function* streamTaskEvents(
     );
   }
   if (!response.body) {
-    throw new Error("Claude returned an empty task event stream.");
+    throw new Error("The local agent returned an empty task event stream.");
   }
 
   let sequence = after;
@@ -2035,7 +2534,7 @@ export async function* streamTaskEvents(
     try {
       payload = JSON.parse(line);
     } catch {
-      throw new Error("Claude returned malformed task event data.");
+      throw new Error("The local agent returned malformed task event data.");
     }
 
     const event = parseTaskEvent(payload);
@@ -2044,7 +2543,7 @@ export async function* streamTaskEvents(
       (event.type === "task" && event.task.id !== id) ||
       (event.type === "output" && event.id !== id)
     ) {
-      throw new Error("Claude returned mismatched task event data.");
+      throw new Error("The local agent returned mismatched task event data.");
     }
     sequence = event.sequence;
     yield event;
@@ -2065,22 +2564,24 @@ const repairTerminal = (state: RepairState): boolean =>
   state === "failed" ||
   state === "cancelled";
 
-const parseRepairEvent = (value: unknown): RepairEvent => {
+const parseRepairEvent = (value: unknown, label = "Claude"): RepairEvent => {
   if (
     !isRecord(value) ||
     !isNonEmptyString(value.type) ||
     !isNonEmptyString(value.actionId) ||
+    !isAgent(value.agent) ||
     !isRepository(value.repository) ||
     !isInteger(value.number, 1) ||
     !isSha(value.headRefOid)
   ) {
-    throw new Error("Claude returned an invalid conflict repair event.");
+    throw new Error(`${label} returned an invalid conflict repair event.`);
   }
 
   if (
     value.type === "output" &&
     hasOnlyKeys(value, [
       "actionId",
+      "agent",
       "headRefOid",
       "number",
       "repository",
@@ -2091,6 +2592,7 @@ const parseRepairEvent = (value: unknown): RepairEvent => {
   ) {
     return {
       actionId: value.actionId,
+      agent: value.agent,
       headRefOid: value.headRefOid,
       number: value.number,
       repository: value.repository,
@@ -2101,6 +2603,7 @@ const parseRepairEvent = (value: unknown): RepairEvent => {
 
   const stateKeys = [
     "actionId",
+    "agent",
     "commit",
     "headRefOid",
     "message",
@@ -2125,6 +2628,7 @@ const parseRepairEvent = (value: unknown): RepairEvent => {
   ) {
     const common = {
       actionId: value.actionId,
+      agent: value.agent,
       ...(value.commit === undefined ? {} : { commit: value.commit }),
       headRefOid: value.headRefOid,
       ...(value.message === undefined ? {} : { message: value.message }),
@@ -2139,15 +2643,16 @@ const parseRepairEvent = (value: unknown): RepairEvent => {
       : { ...common, type: "state" };
   }
 
-  throw new Error("Claude returned an invalid conflict repair event.");
+  throw new Error(`${label} returned an invalid conflict repair event.`);
 };
 
 const matchesRepair = (
   event: RepairEvent,
-  action: Pick<MergePullRepairResponse["action"], "id">,
+  action: Pick<MergePullRepairResponse["action"], "agent" | "id">,
   pull: Pick<PullReadiness, "headRefOid" | "number" | "repository">,
 ): boolean =>
   event.actionId === action.id &&
+  event.agent === action.agent &&
   event.repository.toLowerCase() === pull.repository.toLowerCase() &&
   event.number === pull.number &&
   event.headRefOid.toLowerCase() === pull.headRefOid.toLowerCase();
@@ -2163,11 +2668,15 @@ const repairPath = (
 };
 
 export async function* streamRepair(
-  action: Pick<MergePullRepairResponse["action"], "id" | "token">,
+  action: Pick<MergePullRepairResponse["action"], "agent" | "id" | "token">,
   pull: Pick<PullReadiness, "headRefOid" | "number" | "repository">,
   signal?: AbortSignal,
 ): AsyncGenerator<RepairEvent, void, undefined> {
-  if (!/^[A-Za-z0-9_-]{43}$/.test(action.token) || !isSha(pull.headRefOid)) {
+  if (
+    !isAgent(action.agent) ||
+    !/^[A-Za-z0-9_-]{43}$/.test(action.token) ||
+    !isSha(pull.headRefOid)
+  ) {
     throw new Error("The conflict repair authorization is invalid.");
   }
   const response = await fetch(repairPath(action, pull), {
@@ -2189,7 +2698,9 @@ export async function* streamRepair(
     );
   }
   if (!response.body) {
-    throw new Error("Claude returned an empty conflict repair stream.");
+    throw new Error(
+      `${agentLabel(action.agent)} returned an empty conflict repair stream.`,
+    );
   }
 
   let index = 0;
@@ -2199,24 +2710,30 @@ export async function* streamRepair(
     try {
       payload = JSON.parse(line);
     } catch {
-      throw new Error("Claude returned malformed conflict repair stream data.");
+      throw new Error(
+        `${agentLabel(action.agent)} returned malformed conflict repair stream data.`,
+      );
     }
-    const event = parseRepairEvent(payload);
+    const event = parseRepairEvent(payload, agentLabel(action.agent));
     if (index === 0 && event.type !== "snapshot") {
       throw new Error(
-        "Claude returned conflict repair data without a snapshot.",
+        `${agentLabel(action.agent)} returned conflict repair data without a snapshot.`,
       );
     }
     if (index > 0 && event.type === "snapshot") {
       throw new Error(
-        "Claude returned more than one conflict repair snapshot.",
+        `${agentLabel(action.agent)} returned more than one conflict repair snapshot.`,
       );
     }
     if (!matchesRepair(event, action, pull)) {
-      throw new Error("Claude returned a mismatched conflict repair identity.");
+      throw new Error(
+        `${agentLabel(action.agent)} returned a mismatched conflict repair identity.`,
+      );
     }
     if (terminal) {
-      throw new Error("Claude returned data after conflict repair completed.");
+      throw new Error(
+        `${agentLabel(action.agent)} returned data after conflict repair completed.`,
+      );
     }
 
     index += 1;
@@ -2225,19 +2742,27 @@ export async function* streamRepair(
   }
 
   if (index === 0) {
-    throw new Error("Claude returned an empty conflict repair stream.");
+    throw new Error(
+      `${agentLabel(action.agent)} returned an empty conflict repair stream.`,
+    );
   }
   if (!terminal) {
-    throw new Error("Claude disconnected before conflict repair completed.");
+    throw new Error(
+      `${agentLabel(action.agent)} disconnected before conflict repair completed.`,
+    );
   }
 }
 
 export const cancelRepair = async (
-  action: Pick<MergePullRepairResponse["action"], "id" | "token">,
+  action: Pick<MergePullRepairResponse["action"], "agent" | "id" | "token">,
   pull: Pick<PullReadiness, "headRefOid" | "number" | "repository">,
   signal?: AbortSignal,
 ): Promise<RepairSnapshot> => {
-  if (!/^[A-Za-z0-9_-]{43}$/.test(action.token) || !isSha(pull.headRefOid)) {
+  if (
+    !isAgent(action.agent) ||
+    !/^[A-Za-z0-9_-]{43}$/.test(action.token) ||
+    !isSha(pull.headRefOid)
+  ) {
     throw new Error("The conflict repair authorization is invalid.");
   }
   const response = await fetch(repairPath(action, pull), {
@@ -2258,7 +2783,7 @@ export const cancelRepair = async (
       ),
     );
   }
-  const snapshot = parseRepairEvent(payload);
+  const snapshot = parseRepairEvent(payload, agentLabel(action.agent));
   if (
     snapshot.type !== "snapshot" ||
     !snapshot.terminal ||
@@ -2269,15 +2794,19 @@ export const cancelRepair = async (
   return snapshot;
 };
 
-const parseVerificationEvent = (value: unknown): VerificationRunEvent => {
+const parseVerificationEvent = (
+  value: unknown,
+  label = "Claude",
+): VerificationRunEvent => {
   if (!isRecord(value) || !isNonEmptyString(value.type)) {
-    throw new Error("Claude returned an invalid verification event.");
+    throw new Error(`${label} returned an invalid verification event.`);
   }
 
   switch (value.type) {
     case "start":
       if (
         hasOnlyKeys(value, [
+          "agent",
           "headSha",
           "pullNumber",
           "pullUrl",
@@ -2287,6 +2816,7 @@ const parseVerificationEvent = (value: unknown): VerificationRunEvent => {
           "tag",
           "type",
         ]) &&
+        isAgent(value.agent) &&
         isSha(value.headSha) &&
         isInteger(value.pullNumber, 1) &&
         isValidUrl(value.pullUrl) &&
@@ -2296,6 +2826,7 @@ const parseVerificationEvent = (value: unknown): VerificationRunEvent => {
         isNonEmptyString(value.tag)
       ) {
         return {
+          agent: value.agent,
           headSha: value.headSha,
           pullNumber: value.pullNumber,
           pullUrl: value.pullUrl,
@@ -2356,7 +2887,7 @@ const parseVerificationEvent = (value: unknown): VerificationRunEvent => {
       break;
   }
 
-  throw new Error("Claude returned an invalid verification event.");
+  throw new Error(`${label} returned an invalid verification event.`);
 };
 
 const isReleaseVerificationState = (
@@ -2374,6 +2905,7 @@ const isReleaseVerificationPull = (
 ): value is ReleaseVerificationPull =>
   isRecord(value) &&
   hasOnlyKeys(value, [
+    "agent",
     "headSha",
     "pullNumber",
     "pullUrl",
@@ -2381,6 +2913,7 @@ const isReleaseVerificationPull = (
     "repository",
     "tag",
   ]) &&
+  isAgent(value.agent) &&
   isSha(value.headSha) &&
   isInteger(value.pullNumber, 1) &&
   isRepository(value.repository) &&
@@ -2391,14 +2924,16 @@ const isReleaseVerificationPull = (
 
 const parseReleaseVerificationEvent = (
   value: unknown,
+  label = "Claude",
 ): ReleaseVerificationEvent => {
   if (!isRecord(value) || !isNonEmptyString(value.type)) {
-    throw new Error("Claude returned an invalid release verification event.");
+    throw new Error(`${label} returned an invalid release verification event.`);
   }
 
   if (value.type === "batch-start") {
     if (
       hasOnlyKeys(value, [
+        "agent",
         "batchId",
         "pulls",
         "releaseId",
@@ -2406,6 +2941,7 @@ const parseReleaseVerificationEvent = (
         "tag",
         "type",
       ]) &&
+      isAgent(value.agent) &&
       isNonEmptyString(value.batchId) &&
       Array.isArray(value.pulls) &&
       value.pulls.every(isReleaseVerificationPull) &&
@@ -2417,12 +2953,14 @@ const parseReleaseVerificationEvent = (
       value.pulls.every(
         (pull) =>
           pull.releaseId === value.releaseId &&
+          pull.agent === value.agent &&
           pull.repository.toLowerCase() ===
             String(value.repository).toLowerCase() &&
           pull.tag === value.tag,
       )
     ) {
       return {
+        agent: value.agent,
         batchId: value.batchId,
         pulls: value.pulls,
         releaseId: String(value.releaseId),
@@ -2455,7 +2993,7 @@ const parseReleaseVerificationEvent = (
       const event =
         value.event === undefined
           ? undefined
-          : parseVerificationEvent(value.event);
+          : parseVerificationEvent(value.event, label);
       const validEvent =
         (value.state === "queued" &&
           event === undefined &&
@@ -2528,14 +3066,16 @@ const parseReleaseVerificationEvent = (
     };
   }
 
-  throw new Error("Claude returned an invalid release verification event.");
+  throw new Error(`${label} returned an invalid release verification event.`);
 };
 
 export async function* streamVerification(
   request: VerificationRunRequest,
   signal?: AbortSignal,
 ): AsyncGenerator<VerificationRunEvent, void, undefined> {
+  const label = agentLabel(request.agent);
   if (
+    !isAgent(request.agent) ||
     !isSha(request.headSha) ||
     !isInteger(request.pullNumber, 1) ||
     !isValidUrl(request.pullUrl) ||
@@ -2565,12 +3105,12 @@ export async function* streamVerification(
       getErrorMessage(
         response.status,
         payload,
-        "Claude verification could not start",
+        `${label} verification could not start`,
       ),
     );
   }
   if (!response.body)
-    throw new Error("Claude returned an empty verification stream.");
+    throw new Error(`${label} returned an empty verification stream.`);
 
   let eventIndex = 0;
   let terminal = false;
@@ -2579,22 +3119,23 @@ export async function* streamVerification(
     try {
       payload = JSON.parse(line);
     } catch {
-      throw new Error("Claude returned malformed verification stream data.");
+      throw new Error(`${label} returned malformed verification stream data.`);
     }
 
-    const event = parseVerificationEvent(payload);
+    const event = parseVerificationEvent(payload, label);
     if (eventIndex === 0 && event.type !== "start") {
       throw new Error(
-        "Claude returned a verification stream without a start event.",
+        `${label} returned a verification stream without a start event.`,
       );
     }
     if (eventIndex > 0 && event.type === "start") {
       throw new Error(
-        "Claude returned more than one verification start event.",
+        `${label} returned more than one verification start event.`,
       );
     }
     if (event.type === "start") {
       const sameRequest =
+        event.agent === request.agent &&
         event.releaseId === request.releaseId &&
         event.repository.toLowerCase() === request.repository.toLowerCase() &&
         event.tag === request.tag &&
@@ -2603,13 +3144,13 @@ export async function* streamVerification(
         event.headSha.toLowerCase() === request.headSha.toLowerCase();
       if (!sameRequest) {
         throw new Error(
-          "Claude started verification for a different released pull request.",
+          `${label} started verification for a different released pull request.`,
         );
       }
     }
     if (terminal)
       throw new Error(
-        "Claude returned data after a terminal verification event.",
+        `${label} returned data after a terminal verification event.`,
       );
 
     eventIndex += 1;
@@ -2618,10 +3159,10 @@ export async function* streamVerification(
   }
 
   if (eventIndex === 0)
-    throw new Error("Claude returned an empty verification stream.");
+    throw new Error(`${label} returned an empty verification stream.`);
   if (!terminal)
     throw new Error(
-      "Claude disconnected before reporting verification completion.",
+      `${label} disconnected before reporting verification completion.`,
     );
 }
 
@@ -2629,7 +3170,9 @@ export async function* streamReleaseVerification(
   request: ReleaseVerificationRequest,
   signal?: AbortSignal,
 ): AsyncGenerator<ReleaseVerificationEvent, void, undefined> {
+  const label = agentLabel(request.agent);
   if (
+    !isAgent(request.agent) ||
     !isRepository(request.repository) ||
     !/^[1-9][0-9]*$/.test(request.releaseId) ||
     !isNonEmptyString(request.tag)
@@ -2661,7 +3204,7 @@ export async function* streamReleaseVerification(
     );
   }
   if (!response.body) {
-    throw new Error("Claude returned an empty release verification stream.");
+    throw new Error(`${label} returned an empty release verification stream.`);
   }
 
   let batchId: string | null = null;
@@ -2680,34 +3223,37 @@ export async function* streamReleaseVerification(
       payload = JSON.parse(line);
     } catch {
       throw new Error(
-        "Claude returned malformed release verification stream data.",
+        `${label} returned malformed release verification stream data.`,
       );
     }
 
-    const event = parseReleaseVerificationEvent(payload);
+    const event = parseReleaseVerificationEvent(payload, label);
     if (eventIndex === 0 && event.type !== "batch-start") {
       throw new Error(
-        "Claude returned a release verification stream without a batch start event.",
+        `${label} returned a release verification stream without a batch start event.`,
       );
     }
     if (eventIndex > 0 && event.type === "batch-start") {
       throw new Error(
-        "Claude returned more than one release verification batch start event.",
+        `${label} returned more than one release verification batch start event.`,
       );
     }
     if (terminal) {
       throw new Error(
-        "Claude returned data after a terminal release verification event.",
+        `${label} returned data after a terminal release verification event.`,
       );
     }
 
     if (event.type === "batch-start") {
       if (
+        event.agent !== request.agent ||
         event.releaseId !== request.releaseId ||
         event.repository.toLowerCase() !== request.repository.toLowerCase() ||
         event.tag !== request.tag
       ) {
-        throw new Error("Claude started verification for a different release.");
+        throw new Error(
+          `${label} started verification for a different release.`,
+        );
       }
       batchId = event.batchId;
       listed = new Map(
@@ -2723,10 +3269,18 @@ export async function* streamReleaseVerification(
     } else {
       if (batchId === null || event.batchId !== batchId) {
         throw new Error(
-          "Claude returned a mismatched release verification identity.",
+          `${label} returned a mismatched release verification identity.`,
         );
       }
       if (event.type === "verification") {
+        if (
+          event.event?.type === "start" &&
+          event.event.agent !== request.agent
+        ) {
+          throw new Error(
+            `${label} returned a nested verification start event for a different agent.`,
+          );
+        }
         const pull = listed.get(event.pullUrl);
         if (
           !pull ||
@@ -2734,7 +3288,7 @@ export async function* streamReleaseVerification(
           pull.headSha.toLowerCase() !== event.headSha.toLowerCase()
         ) {
           throw new Error(
-            "Claude returned verification for an unlisted released pull request.",
+            `${label} returned verification for an unlisted released pull request.`,
           );
         }
         const terminalState =
@@ -2751,7 +3305,7 @@ export async function* streamReleaseVerification(
               : pull.state === "queued" || pull.state === "running");
         if (!validTransition) {
           throw new Error(
-            "Claude returned an invalid release verification state transition.",
+            `${label} returned an invalid release verification state transition.`,
           );
         }
         pull.state = event.state;
@@ -2774,7 +3328,7 @@ export async function* streamReleaseVerification(
           event.totals.total !== totals.total
         ) {
           throw new Error(
-            "Claude returned inconsistent release verification totals.",
+            `${label} returned inconsistent release verification totals.`,
           );
         }
       }
@@ -2786,11 +3340,11 @@ export async function* streamReleaseVerification(
   }
 
   if (eventIndex === 0) {
-    throw new Error("Claude returned an empty release verification stream.");
+    throw new Error(`${label} returned an empty release verification stream.`);
   }
   if (!terminal) {
     throw new Error(
-      "Claude disconnected before reporting release verification completion.",
+      `${label} disconnected before reporting release verification completion.`,
     );
   }
 }
@@ -2810,11 +3364,7 @@ export const cancelVerification = async (
   if (!response.ok) {
     const payload = await readJson(response);
     throw new Error(
-      getErrorMessage(
-        response.status,
-        payload,
-        "Claude verification could not stop",
-      ),
+      getErrorMessage(response.status, payload, "Verification could not stop"),
     );
   }
 };

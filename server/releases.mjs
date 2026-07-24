@@ -2,9 +2,16 @@ import { createHash, randomUUID } from 'node:crypto'
 
 import { ActionError } from './claude.mjs'
 import { ExecutorError } from './executor.mjs'
+import {
+  loadReleasePipelines,
+  mergeReleasePipeline,
+  releasePipelineKey,
+} from './release-pipelines.mjs'
 import { validateReleaseTag } from './workspace.mjs'
 
 const CACHE_TTL = 5 * 60 * 1_000
+const PIPELINE_POLL_TTL = 5_000
+const RELEASE_PIPELINE_DISCOVERY_WINDOW = CACHE_TTL
 const AUTHORED_MERGED_WINDOW = 90 * 24 * 60 * 60 * 1_000
 const RECENT_RELEASE_WINDOW = 7 * 24 * 60 * 60 * 1_000
 const PAGE_SIZE = 100
@@ -43,6 +50,56 @@ const MERGED_PULLS_QUERY = `
         }
       }
       pageInfo { endCursor hasNextPage }
+    }
+  }
+`
+
+const RELEASES_QUERY = `
+  query RecentRepositoryReleases(
+    $after: String
+    $name: String!
+    $owner: String!
+  ) {
+    repository(owner: $owner, name: $name) {
+      nameWithOwner
+      releases(
+        first: 100
+        after: $after
+        orderBy: { field: CREATED_AT, direction: DESC }
+      ) {
+        nodes {
+          id
+          databaseId
+          createdAt
+          description
+          isDraft
+          name
+          publishedAt
+          repository { nameWithOwner url }
+          tagName
+          url
+        }
+        pageInfo { endCursor hasNextPage }
+      }
+    }
+  }
+`
+
+const RELEASE_NODES_QUERY = `
+  query RevalidateRecentReleases($ids: [ID!]!) {
+    nodes(ids: $ids) {
+      ... on Release {
+        id
+        databaseId
+        createdAt
+        description
+        isDraft
+        name
+        publishedAt
+        repository { nameWithOwner url }
+        tagName
+        url
+      }
     }
   }
 `
@@ -92,8 +149,7 @@ export function nextPatchTag(tags) {
   if (versions.length === 0) {
     return { latestTag: null, nextTag: 'v0.1.0' }
   }
-  const latest = versions.reduce((winner, candidate) =>
-    compareVersion(candidate, winner) > 0 ? candidate : winner)
+  const latest = versions.reduce((winner, candidate) => (compareVersion(candidate, winner) > 0 ? candidate : winner))
   return {
     latestTag: latest.tag,
     nextTag: `${latest.prefix}${latest.parts[0]}.${latest.parts[1]}.${latest.parts[2] + 1n}`,
@@ -222,6 +278,14 @@ async function mapLimit(values, limit, operation) {
   return Promise.all(values.map((value, index) => use(() => operation(value, index))))
 }
 
+function chunks(values, size) {
+  const result = []
+  for (let index = 0; index < values.length; index += size) {
+    result.push(values.slice(index, index + size))
+  }
+  return result
+}
+
 function executorError(error, code, message, status = 502) {
   if (error instanceof ActionError) return error
   if (error instanceof ExecutorError) return new ActionError(error.status, code, message)
@@ -242,10 +306,7 @@ function repositoryFromApiUrl(value) {
 }
 
 function repositoriesFromSnapshot(snapshot) {
-  const pulls = snapshot?.pulls ?? [
-    ...(snapshot?.ready ?? []),
-    ...(snapshot?.notReady ?? []),
-  ]
+  const pulls = snapshot?.pulls ?? [...(snapshot?.ready ?? []), ...(snapshot?.notReady ?? [])]
   if (!Array.isArray(pulls)) return []
   return pulls
     .filter((pull) => validRepository(pull?.repository))
@@ -419,6 +480,50 @@ function normalizeRelease(value, repository) {
   }
 }
 
+function normalizeReleaseMetadata(value, repository) {
+  const canonicalRepositoryUrl = `https://github.com/${repository}`
+  if (
+    !isRecord(value) ||
+    typeof value.id !== 'string' ||
+    value.id === '' ||
+    !Number.isSafeInteger(value.databaseId) ||
+    value.databaseId < 1 ||
+    typeof value.createdAt !== 'string' ||
+    Number.isNaN(Date.parse(value.createdAt)) ||
+    (value.description !== null && typeof value.description !== 'string') ||
+    typeof value.isDraft !== 'boolean' ||
+    (value.name !== null && typeof value.name !== 'string') ||
+    typeof value.tagName !== 'string' ||
+    value.tagName === '' ||
+    typeof value.url !== 'string' ||
+    value.url === '' ||
+    !isRecord(value.repository) ||
+    typeof value.repository.nameWithOwner !== 'string' ||
+    value.repository.nameWithOwner.toLowerCase() !== repository.toLowerCase() ||
+    typeof value.repository.url !== 'string' ||
+    value.repository.url.toLowerCase() !== canonicalRepositoryUrl.toLowerCase() ||
+    (value.publishedAt !== null && (typeof value.publishedAt !== 'string' || Number.isNaN(Date.parse(value.publishedAt)))) ||
+    (!value.isDraft && value.publishedAt === null)
+  )
+    return null
+  return {
+    body: value.description ?? '',
+    createdAt: value.createdAt,
+    description: value.description,
+    databaseId: String(value.databaseId),
+    draft: value.isDraft,
+    id: String(value.databaseId),
+    name: typeof value.name === 'string' && value.name.trim() ? value.name : value.tagName,
+    nodeId: value.id,
+    rawName: value.name,
+    publishedAt: value.publishedAt,
+    repository: value.repository.nameWithOwner,
+    repositoryUrl: value.repository.url,
+    tag: value.tagName,
+    url: value.url,
+  }
+}
+
 function compareReleases(left, right) {
   const time = Date.parse(right.publishedAt) - Date.parse(left.publishedAt)
   if (time !== 0) return time
@@ -429,13 +534,38 @@ function compareReleases(left, right) {
   return 0
 }
 
-function sameRelease(left, right) {
-  return Boolean(left && right) &&
+function sameReleaseMetadata(left, right) {
+  return (
+    Boolean(left && right) &&
+    left.body === right.body &&
+    left.createdAt === right.createdAt &&
+    left.databaseId === right.databaseId &&
+    left.description === right.description &&
+    left.draft === right.draft &&
     left.id === right.id &&
+    left.nodeId === right.nodeId &&
+    left.rawName === right.rawName &&
     left.publishedAt === right.publishedAt &&
     left.repository.toLowerCase() === right.repository.toLowerCase() &&
+    left.repositoryUrl.toLowerCase() === right.repositoryUrl.toLowerCase() &&
     left.tag === right.tag &&
     left.url === right.url
+  )
+}
+
+function sameRelease(left, right) {
+  return (
+    Boolean(left && right) &&
+    left.body === right.body &&
+    left.draft === right.draft &&
+    left.id === right.id &&
+    left.name === right.name &&
+    left.publishedAt === right.publishedAt &&
+    left.repository.toLowerCase() === right.repository.toLowerCase() &&
+    left.repositoryUrl.toLowerCase() === right.repositoryUrl.toLowerCase() &&
+    left.tag === right.tag &&
+    left.url === right.url
+  )
 }
 
 function tagObjectOid(transaction) {
@@ -452,7 +582,7 @@ function tagObjectOid(transaction) {
   return createHash('sha1').update(header).update(content).digest('hex')
 }
 
-async function listRelevantReleases(executor, repository) {
+async function listRelevantReleasesRest(executor, repository) {
   const published = new Map()
   const markers = new Set()
   const warnings = []
@@ -496,6 +626,413 @@ async function listRelevantReleases(executor, repository) {
   return { incomplete, releases, warnings }
 }
 
+async function listRelevantReleasesGraphql(executor, repository, cutoff) {
+  const [owner, name] = repository.split('/')
+  const byDatabaseId = new Map()
+  const databaseIdById = new Map()
+  const conflictedDatabaseIds = new Set()
+  const conflictedIds = new Set()
+  const cursors = new Set()
+  const warnings = []
+  let after = null
+  let incomplete = false
+
+  for (let page = 1; page <= MAXIMUM_RELEASE_PAGES; page += 1) {
+    const response = await executor.graphql(
+      RELEASES_QUERY,
+      { after, name, owner },
+      {
+        validate: (value) =>
+          value?.repository === null ||
+          (isRecord(value?.repository) &&
+            typeof value.repository.nameWithOwner === 'string' &&
+            isRecord(value.repository.releases) &&
+            Array.isArray(value.repository.releases.nodes) &&
+            isRecord(value.repository.releases.pageInfo) &&
+            typeof value.repository.releases.pageInfo.hasNextPage === 'boolean'),
+      },
+    )
+    const connection = response.repository?.releases
+    if (!connection || response.repository.nameWithOwner.toLowerCase() !== repository.toLowerCase()) {
+      incomplete = true
+      warnings.push(`${repository} returned malformed or changing published release data.`)
+      break
+    }
+
+    for (const value of connection.nodes) {
+      if (isRecord(value) && value.isDraft === true) continue
+      const metadata = normalizeReleaseMetadata(value, repository)
+      if (!metadata) {
+        incomplete = true
+        continue
+      }
+      const previousDatabaseId = databaseIdById.get(metadata.nodeId)
+      const previous = byDatabaseId.get(metadata.databaseId)
+      if (
+        conflictedIds.has(metadata.nodeId) ||
+        conflictedDatabaseIds.has(metadata.databaseId) ||
+        (previousDatabaseId && previousDatabaseId !== metadata.databaseId) ||
+        (previous && !sameReleaseMetadata(previous, metadata))
+      ) {
+        incomplete = true
+        conflictedIds.add(metadata.nodeId)
+        conflictedDatabaseIds.add(metadata.databaseId)
+        if (previousDatabaseId) {
+          conflictedDatabaseIds.add(previousDatabaseId)
+          byDatabaseId.delete(previousDatabaseId)
+        }
+        if (previous) {
+          conflictedIds.add(previous.nodeId)
+          databaseIdById.delete(previous.nodeId)
+        }
+        byDatabaseId.delete(metadata.databaseId)
+        databaseIdById.delete(metadata.nodeId)
+        continue
+      }
+      if (!previous) {
+        byDatabaseId.set(metadata.databaseId, metadata)
+        databaseIdById.set(metadata.nodeId, metadata.databaseId)
+      }
+    }
+
+    if (!connection.pageInfo.hasNextPage) break
+    const cursor = connection.pageInfo.endCursor
+    if (page === MAXIMUM_RELEASE_PAGES || typeof cursor !== 'string' || cursor === '' || cursors.has(cursor)) {
+      incomplete = true
+      warnings.push(
+        page === MAXIMUM_RELEASE_PAGES ? `${repository} release pagination exceeded the safe bound.` : `${repository} returned a repeated release cursor.`,
+      )
+      break
+    }
+    cursors.add(cursor)
+    after = cursor
+  }
+
+  const relevant = [...byDatabaseId.values()].filter(
+    (metadata) =>
+      !metadata.draft && Date.parse(metadata.publishedAt) >= cutoff && !conflictedIds.has(metadata.nodeId) && !conflictedDatabaseIds.has(metadata.databaseId),
+  )
+  if (
+    incomplete &&
+    !warnings.some(
+      (warning) =>
+        warning.includes('repeated release cursor') || warning.includes('safe bound') || warning.includes('malformed or changing published release data'),
+    )
+  ) {
+    warnings.push(`${repository} returned malformed or changing published release data.`)
+  }
+  return {
+    incomplete,
+    releases: relevant.sort(compareReleases),
+    warnings,
+  }
+}
+
+async function confirmRelevantReleasesGraphql(executor, releases) {
+  let incomplete = false
+  const groups = await mapLimit(chunks(releases, PAGE_SIZE), READ_CONCURRENCY, async (batch) => {
+    try {
+      const response = await executor.graphql(
+        RELEASE_NODES_QUERY,
+        { ids: batch.map(({ nodeId }) => nodeId) },
+        { validate: (value) => Array.isArray(value?.nodes) },
+      )
+      if (response.nodes.length !== batch.length) incomplete = true
+      return batch.flatMap((metadata, index) => {
+        const release = normalizeReleaseMetadata(response.nodes[index], metadata.repository)
+        if (!release || !sameReleaseMetadata(metadata, release)) {
+          incomplete = true
+          return []
+        }
+        return [release]
+      })
+    } catch {
+      incomplete = true
+      return []
+    }
+  })
+  return { incomplete, releases: groups.flat().sort(compareReleases) }
+}
+
+async function confirmRelevantReleasesRest(executor, releases) {
+  let incomplete = false
+  const values = await mapLimit(releases, READ_CONCURRENCY, async (release) => {
+    try {
+      const value = await executor.rest(`repos/${release.repository}/releases/${release.id}`, {
+        validate: isRecord,
+      })
+      const confirmed = normalizeRelease(value, release.repository)
+      if (!confirmed || !sameRelease(release, confirmed)) {
+        incomplete = true
+        return null
+      }
+      return confirmed
+    } catch {
+      incomplete = true
+      return null
+    }
+  })
+  return { incomplete, releases: values.filter(Boolean).sort(compareReleases) }
+}
+
+async function confirmRelevantReleases(executor, releases) {
+  return typeof executor.graphql === 'function' ? confirmRelevantReleasesGraphql(executor, releases) : confirmRelevantReleasesRest(executor, releases)
+}
+
+async function listRelevantReleases(executor, repository, cutoff) {
+  return typeof executor.graphql === 'function' ? listRelevantReleasesGraphql(executor, repository, cutoff) : listRelevantReleasesRest(executor, repository)
+}
+
+function normalizeExactGraphqlPull(value, descriptor, viewerLogin, cutoff) {
+  if (value === null) return false
+  if (!isRecord(value)) return null
+  if (typeof value.state !== 'string' || typeof value.merged !== 'boolean') return null
+  if (value.state !== 'MERGED' || value.merged !== true) return false
+  if (isRecord(value.author) && typeof value.author.login === 'string' && value.author.login.toLowerCase() !== viewerLogin.toLowerCase()) return false
+  if (!isRecord(value.author) || typeof value.author.login !== 'string' || typeof value.mergedAt !== 'string' || Number.isNaN(Date.parse(value.mergedAt)))
+    return null
+  if (Date.parse(value.mergedAt) < cutoff) return false
+  if (
+    !Number.isSafeInteger(value.number) ||
+    value.number !== descriptor.number ||
+    typeof value.title !== 'string' ||
+    typeof value.url !== 'string' ||
+    typeof value.baseRefOid !== 'string' ||
+    !SHA.test(value.baseRefOid) ||
+    typeof value.headRefOid !== 'string' ||
+    !SHA.test(value.headRefOid) ||
+    !isRecord(value.mergeCommit) ||
+    typeof value.mergeCommit.oid !== 'string' ||
+    !SHA.test(value.mergeCommit.oid) ||
+    !isRecord(value.repository) ||
+    typeof value.repository.nameWithOwner !== 'string' ||
+    value.repository.nameWithOwner.toLowerCase() !== descriptor.repository.toLowerCase() ||
+    typeof value.repository.url !== 'string'
+  )
+    return null
+  const repositoryUrl = `https://github.com/${descriptor.repository}`
+  const pullUrl = `${repositoryUrl}/pull/${descriptor.number}`
+  if (value.repository.url.toLowerCase() !== repositoryUrl.toLowerCase() || value.url.toLowerCase() !== pullUrl.toLowerCase()) return null
+  return {
+    baseSha: value.baseRefOid.toLowerCase(),
+    headSha: value.headRefOid.toLowerCase(),
+    mergeCommitSha: value.mergeCommit.oid.toLowerCase(),
+    mergedAt: value.mergedAt,
+    number: descriptor.number,
+    repository: descriptor.repository,
+    title: value.title,
+    url: pullUrl,
+  }
+}
+
+function normalizeExactRestPull(value, descriptor, viewerLogin, cutoff) {
+  if (!isRecord(value)) return null
+  if (typeof value.state !== 'string' || typeof value.merged !== 'boolean') return null
+  if (value.state !== 'closed' || value.merged !== true) return false
+  if (isRecord(value.user) && typeof value.user.login === 'string' && value.user.login.toLowerCase() !== viewerLogin.toLowerCase()) return false
+  if (!isRecord(value.user) || typeof value.user.login !== 'string' || typeof value.merged_at !== 'string' || Number.isNaN(Date.parse(value.merged_at)))
+    return null
+  if (Date.parse(value.merged_at) < cutoff) return false
+  if (
+    !Number.isSafeInteger(value.number) ||
+    value.number !== descriptor.number ||
+    typeof value.title !== 'string' ||
+    typeof value.html_url !== 'string' ||
+    !isRecord(value.base) ||
+    typeof value.base.sha !== 'string' ||
+    !SHA.test(value.base.sha) ||
+    !isRecord(value.base.repo) ||
+    typeof value.base.repo.full_name !== 'string' ||
+    value.base.repo.full_name.toLowerCase() !== descriptor.repository.toLowerCase() ||
+    typeof value.base.repo.html_url !== 'string' ||
+    !isRecord(value.head) ||
+    typeof value.head.sha !== 'string' ||
+    !SHA.test(value.head.sha) ||
+    typeof value.merge_commit_sha !== 'string' ||
+    !SHA.test(value.merge_commit_sha)
+  )
+    return null
+  const repositoryUrl = `https://github.com/${descriptor.repository}`
+  const pullUrl = `https://github.com/${descriptor.repository}/pull/${descriptor.number}`
+  if (value.base.repo.html_url.toLowerCase() !== repositoryUrl.toLowerCase() || value.html_url.toLowerCase() !== pullUrl.toLowerCase()) return null
+  return {
+    baseSha: value.base.sha.toLowerCase(),
+    headSha: value.head.sha.toLowerCase(),
+    mergeCommitSha: value.merge_commit_sha.toLowerCase(),
+    mergedAt: value.merged_at,
+    number: descriptor.number,
+    repository: descriptor.repository,
+    title: value.title,
+    url: pullUrl,
+  }
+}
+
+function pullBatches(descriptors) {
+  const batches = []
+  let batch = []
+  let repositories = new Set()
+  for (const descriptor of descriptors) {
+    const repository = descriptor.repository.toLowerCase()
+    if (batch.length === PAGE_SIZE || (!repositories.has(repository) && repositories.size === 10)) {
+      batches.push(batch)
+      batch = []
+      repositories = new Set()
+    }
+    batch.push(descriptor)
+    repositories.add(repository)
+  }
+  if (batch.length > 0) batches.push(batch)
+  return batches
+}
+
+function pullBatchQuery(batch) {
+  const repositories = new Map()
+  for (const descriptor of batch) {
+    const key = descriptor.repository.toLowerCase()
+    const values = repositories.get(key) ?? []
+    values.push(descriptor)
+    repositories.set(key, values)
+  }
+  const definitions = []
+  const selections = ['viewer { login }']
+  const variables = {}
+  const entries = []
+  let repositoryIndex = 0
+  let pullIndex = 0
+  for (const pulls of repositories.values()) {
+    const repository = pulls[0].repository
+    const [owner, name] = repository.split('/')
+    definitions.push(`$owner${repositoryIndex}: String!`, `$name${repositoryIndex}: String!`)
+    variables[`owner${repositoryIndex}`] = owner
+    variables[`name${repositoryIndex}`] = name
+    const pullSelections = []
+    for (const descriptor of pulls) {
+      const alias = `pull${pullIndex}`
+      const number = `number${pullIndex}`
+      definitions.push(`$${number}: Int!`)
+      variables[number] = descriptor.number
+      pullSelections.push(`
+        ${alias}: pullRequest(number: $${number}) {
+          author { login }
+          baseRefOid
+          headRefOid
+          mergeCommit { oid }
+          merged
+          mergedAt
+          number
+          repository { nameWithOwner url }
+          state
+          title
+          url
+        }
+      `)
+      entries.push({
+        descriptor,
+        pullAlias: alias,
+        repositoryAlias: `repository${repositoryIndex}`,
+      })
+      pullIndex += 1
+    }
+    selections.push(`
+      repository${repositoryIndex}: repository(
+        owner: $owner${repositoryIndex}
+        name: $name${repositoryIndex}
+      ) {
+        nameWithOwner
+        url
+        ${pullSelections.join('\n')}
+      }
+    `)
+    repositoryIndex += 1
+  }
+  return {
+    document: `
+      query RecentReleasePulls(${definitions.join(', ')}) {
+        ${selections.join('\n')}
+      }
+    `,
+    entries,
+    variables,
+  }
+}
+
+async function loadGraphqlPulls(executor, descriptors, viewerLogin, cutoff) {
+  let incomplete = false
+  const groups = await mapLimit(pullBatches(descriptors), READ_CONCURRENCY, async (batch) => {
+    const query = pullBatchQuery(batch)
+    try {
+      const response = await executor.graphql(query.document, query.variables, {
+        validate: (value) => isRecord(value) && (value.viewer === null || isRecord(value.viewer)),
+      })
+      if (!isRecord(response.viewer) || typeof response.viewer.login !== 'string' || response.viewer.login.toLowerCase() !== viewerLogin.toLowerCase()) {
+        incomplete = true
+        return []
+      }
+      const pulls = []
+      for (const entry of query.entries) {
+        const repository = response[entry.repositoryAlias]
+        if (repository === null) {
+          incomplete = true
+          continue
+        }
+        if (
+          !isRecord(repository) ||
+          typeof repository.nameWithOwner !== 'string' ||
+          repository.nameWithOwner.toLowerCase() !== entry.descriptor.repository.toLowerCase() ||
+          typeof repository.url !== 'string' ||
+          repository.url.toLowerCase() !== `https://github.com/${entry.descriptor.repository}`.toLowerCase()
+        ) {
+          incomplete = true
+          continue
+        }
+        const pull = normalizeExactGraphqlPull(repository[entry.pullAlias], entry.descriptor, viewerLogin, cutoff)
+        if (pull === null) incomplete = true
+        if (pull) pulls.push(pull)
+      }
+      return pulls
+    } catch {
+      incomplete = true
+      return []
+    }
+  })
+  return { incomplete, pulls: groups.flat() }
+}
+
+async function loadRestPulls(executor, descriptors, viewerLogin, cutoff) {
+  let authenticatedViewer = null
+  try {
+    const value = await executor.rest('user', {
+      validate: (result) => isRecord(result) && normalizeViewer(result.login) !== null,
+    })
+    authenticatedViewer = normalizeViewer(value.login)
+    if (authenticatedViewer.key !== normalizeViewer(viewerLogin)?.key) {
+      return { authenticatedViewer, incomplete: true, pulls: [] }
+    }
+  } catch {
+    return { authenticatedViewer, incomplete: true, pulls: [] }
+  }
+  if (descriptors.length === 0) {
+    return { authenticatedViewer, incomplete: false, pulls: [] }
+  }
+
+  let incomplete = false
+  const pulls = await mapLimit(descriptors, READ_CONCURRENCY, async (descriptor) => {
+    try {
+      const value = await executor.rest(`repos/${descriptor.repository}/pulls/${descriptor.number}`, {
+        validate: isRecord,
+      })
+      const pull = normalizeExactRestPull(value, descriptor, viewerLogin, cutoff)
+      if (pull === null) incomplete = true
+      return pull || null
+    } catch (error) {
+      if (error instanceof ExecutorError && error.apiStatus === 404) return null
+      incomplete = true
+      return null
+    }
+  })
+  return { authenticatedViewer, incomplete, pulls: pulls.filter(Boolean) }
+}
+
 function normalizeAssociatedPull(value, repository, viewerLogin) {
   if (
     !isRecord(value) ||
@@ -522,28 +1059,8 @@ function normalizeAssociatedPull(value, repository, viewerLogin) {
 }
 
 function publicPull(pull) {
-  const { mergeCommitSha: _mergeCommitSha, ...value } = pull
+  const { baseSha: _baseSha, mergeCommitSha: _mergeCommitSha, ...value } = pull
   return value
-}
-
-function mergedCandidate(value, viewerLogin) {
-  if (!isRecord(value) || !Number.isSafeInteger(value.number) || value.number < 1) return null
-  const repository = value.repository ?? repositoryFromApiUrl(value.repository_url)
-  if (!validRepository(repository)) return null
-  if (isRecord(value.user) && typeof value.user.login === 'string' &&
-      value.user.login.toLowerCase() !== viewerLogin.toLowerCase()) return null
-  const canonical = `https://github.com/${repository}/pull/${value.number}`
-  if (typeof value.html_url === 'string' && value.html_url.toLowerCase() !== canonical.toLowerCase()) {
-    return null
-  }
-  const pull = isRecord(value.pull) && value.pull.repository === repository &&
-    value.pull.number === value.number && typeof value.pull.headSha === 'string' && SHA.test(value.pull.headSha) &&
-    typeof value.pull.mergeCommitSha === 'string' && SHA.test(value.pull.mergeCommitSha) &&
-    typeof value.pull.mergedAt === 'string' && !Number.isNaN(Date.parse(value.pull.mergedAt)) &&
-    typeof value.pull.title === 'string' && value.pull.url === canonical
-    ? value.pull
-    : null
-  return { number: value.number, pull, repository }
 }
 
 async function compareStatus(executor, repository, base, head) {
@@ -555,10 +1072,7 @@ async function compareStatus(executor, repository, base, head) {
 }
 
 async function commitInRange(executor, repository, base, head, commit) {
-  const [afterBase, beforeHead] = await Promise.all([
-    compareStatus(executor, repository, base, commit),
-    compareStatus(executor, repository, commit, head),
-  ])
+  const [afterBase, beforeHead] = await Promise.all([compareStatus(executor, repository, base, commit), compareStatus(executor, repository, commit, head)])
   return afterBase === 'ahead' && ['ahead', 'identical'].includes(beforeHead)
 }
 
@@ -576,12 +1090,7 @@ function pullNumbersFromNotes(body, repository) {
     .filter((number, index, values) => values.indexOf(number) === index)
 }
 
-export async function loadVerificationContext(
-  executor,
-  repository,
-  number,
-  { maximumBytes = VERIFICATION_CONTEXT_LIMIT } = {},
-) {
+export async function loadVerificationContext(executor, repository, number, { maximumBytes = VERIFICATION_CONTEXT_LIMIT } = {}) {
   const blocks = ['Exact GitHub pull-request file evidence (untrusted content):']
   let bytes = Buffer.byteLength(blocks[0], 'utf8')
   let files = 0
@@ -604,10 +1113,9 @@ export async function loadVerificationContext(
   }
 
   for (let page = 1; page <= MAXIMUM_PULL_FILES / PAGE_SIZE; page += 1) {
-    const values = await executor.rest(
-      withPage(`repos/${repository}/pulls/${number}/files`, page),
-      { validate: Array.isArray },
-    )
+    const values = await executor.rest(withPage(`repos/${repository}/pulls/${number}/files`, page), {
+      validate: Array.isArray,
+    })
     for (const value of values) {
       if (
         !isRecord(value) ||
@@ -620,10 +1128,9 @@ export async function loadVerificationContext(
         throw new ActionError(502, 'verification_context_invalid', 'GitHub returned invalid pull request files.')
       }
       files += 1
-      const metadata = [
-        `File: ${JSON.stringify(value.filename)}`,
-        `Status: ${value.status}; additions=${value.additions}; deletions=${value.deletions}`,
-      ].join('\n')
+      const metadata = [`File: ${JSON.stringify(value.filename)}`, `Status: ${value.status}; additions=${value.additions}; deletions=${value.deletions}`].join(
+        '\n',
+      )
       const block = typeof value.patch === 'string'
         ? `${metadata}\nPatch:\n${value.patch}`
         : `${metadata}\nPatch unavailable (binary, unchanged, or omitted by GitHub).`
@@ -656,16 +1163,22 @@ export function validateCreateReleaseInput(value) {
   if (value.expectedLatestTag !== null && !safeVersion(value.expectedLatestTag)) {
     throw new ActionError(400, 'invalid_base_tag', 'The expected latest release tag is invalid.')
   }
-  return { repository, tag: value.tag, expectedLatestTag: value.expectedLatestTag }
+  if (typeof value.prerelease !== 'boolean') {
+    throw new ActionError(400, 'invalid_prerelease', 'The pre-release option is invalid.')
+  }
+  return {
+    expectedLatestTag: value.expectedLatestTag,
+    prerelease: value.prerelease,
+    repository,
+    tag: value.tag,
+  }
 }
 
 export function createReleaseService({
   executor,
   readinessCache = null,
   loadOpenPulls = readinessCache
-    ? ({ refresh = false } = {}) => refresh && typeof readinessCache.getFresh === 'function'
-      ? readinessCache.getFresh()
-      : readinessCache.get({ refresh })
+    ? ({ refresh = false } = {}) => (refresh && typeof readinessCache.getFresh === 'function' ? readinessCache.getFresh() : readinessCache.get({ refresh }))
     : async () => ({ ready: [], notReady: [] }),
   loadMergedPulls = null,
   now = Date.now,
@@ -692,7 +1205,174 @@ export function createReleaseService({
   let recentCache = null
   let recentLoadedAt = 0
   let recentInflight = null
+  let pipelineRevision = 0
+  let pipelineCache = null
+  let pipelineCacheFingerprint = null
+  let pipelineInflight = null
+  let pipelinePolls = new Map()
+  let pipelineConfirmations = new Set()
   const activeReleases = new Set()
+
+  function pipelineTargets(releases) {
+    return releases.map(({ id, publishedAt, repository, tag }) => ({
+      id,
+      publishedAt,
+      repository,
+      tag,
+    }))
+  }
+
+  function fingerprintPipelines(releases) {
+    return pipelineTargets(releases)
+      .map((release) => releasePipelineKey(release))
+      .sort()
+      .join('\n')
+  }
+
+  function activePipeline(pipeline) {
+    return pipeline.lookup === 'pending' ||
+      pipeline.runs.some((run) =>
+        run.state === 'queued' || run.state === 'running')
+  }
+
+  function attachPipelines(releases, evidence) {
+    const pipelines = new Map(
+      evidence.releases.map((release) => [releasePipelineKey(release), release.pipeline]),
+    )
+    return releases.map((release) => ({
+      ...release,
+      pipeline: pipelines.get(releasePipelineKey(release)) ?? {
+        checkedAt: evidence.generatedAt,
+        lookup: 'unavailable',
+        runs: [],
+      },
+    }))
+  }
+
+  function mergePipelineEvidence(current, incoming) {
+    const updates = new Map(
+      incoming.releases.map((release) => [
+        releasePipelineKey(release),
+        release.pipeline,
+      ]),
+    )
+    return {
+      generatedAt: incoming.generatedAt,
+      releases: current.releases.map((release) => {
+        const pipeline = updates.get(releasePipelineKey(release))
+        return pipeline
+          ? {
+              ...release,
+              pipeline: mergeReleasePipeline(release.pipeline, pipeline),
+            }
+          : release
+      }),
+    }
+  }
+
+  function synchronizePipelineCatalog(releases) {
+    const fingerprint = fingerprintPipelines(releases)
+    if (
+      pipelineCache &&
+      pipelineCacheFingerprint === fingerprint
+    ) {
+      const pipelines = new Map(releases.map((release) => [
+        releasePipelineKey(release),
+        release.pipeline,
+      ]))
+      pipelineCache = {
+        ...pipelineCache,
+        releases: pipelineCache.releases.map((release) => ({
+          ...release,
+          pipeline: mergeReleasePipeline(
+            release.pipeline,
+            pipelines.get(releasePipelineKey(release)) ?? release.pipeline,
+          ),
+        })),
+      }
+      return fingerprint
+    }
+
+    const checkedAt = new Date(now()).toISOString()
+    const cached = new Map(
+      (pipelineCache?.releases ?? []).map((release) => [
+        releasePipelineKey(release),
+        release.pipeline,
+      ]),
+    )
+    pipelineRevision += 1
+    pipelineCache = {
+      generatedAt: checkedAt,
+      releases: releases.map(
+        ({ id, pipeline, publishedAt, repository, tag }) => ({
+          id,
+          pipeline: cached.get(releasePipelineKey({
+            id,
+            publishedAt,
+            repository,
+            tag,
+          })) ?? pipeline ?? {
+            checkedAt,
+            lookup: 'unavailable',
+            runs: [],
+          },
+          publishedAt,
+          repository,
+          tag,
+        }),
+      ),
+    }
+    pipelineCacheFingerprint = fingerprint
+    pipelineInflight = null
+    pipelinePolls = new Map()
+    const identities = new Set(
+      pipelineCache.releases.map(releasePipelineKey),
+    )
+    pipelineConfirmations = new Set(
+      [...pipelineConfirmations].filter((key) => identities.has(key)),
+    )
+    return fingerprint
+  }
+
+  function seedPipelines(releases) {
+    const checked = now()
+    const checkedAt = new Date(checked).toISOString()
+    const cached = new Map(
+      (pipelineCache?.releases ?? []).map((release) => [
+        releasePipelineKey(release),
+        release.pipeline,
+      ]),
+    )
+    return releases.map((release) => {
+      const pipeline = cached.get(releasePipelineKey(release))
+      const discovering =
+        checked - Date.parse(release.publishedAt) <
+        RELEASE_PIPELINE_DISCOVERY_WINDOW
+      const expiredPending =
+        pipeline?.lookup === 'pending' &&
+        pipeline.runs.length === 0 &&
+        !discovering
+      return {
+        ...release,
+        pipeline: pipeline && !expiredPending
+          ? pipeline
+          : {
+              checkedAt,
+              lookup: discovering ? 'pending' : 'complete',
+              runs: [],
+            },
+      }
+    })
+  }
+
+  function clearPipelines() {
+    pipelineRevision += 1
+    pipelineCache = null
+    pipelineCacheFingerprint = null
+    pipelineInflight = null
+    pipelinePolls = new Map()
+    pipelineConfirmations = new Set()
+  }
 
   async function viewer() {
     const value = await executor.rest('user', {
@@ -711,10 +1391,7 @@ export function createReleaseService({
     const warnings = []
     let partial = false
     const viewerLogin = await viewer()
-    const [openResult, mergedResult] = await Promise.allSettled([
-      loadOpenPulls({ refresh: refreshOpen }),
-      loadMerged(viewerLogin),
-    ])
+    const [openResult, mergedResult] = await Promise.allSettled([loadOpenPulls({ refresh: refreshOpen }), loadMerged(viewerLogin)])
     const repositories = new Map()
     if (openResult.status === 'fulfilled') {
       for (const item of repositoriesFromSnapshot(openResult.value)) {
@@ -772,6 +1449,7 @@ export function createReleaseService({
     recentCache = null
     recentLoadedAt = 0
     recentInflight = null
+    clearPipelines()
     return viewerGeneration
   }
 
@@ -830,11 +1508,7 @@ export function createReleaseService({
   function primeRepositories(snapshot) {
     const identity = normalizeViewer(snapshot?.viewerLogin)
     if (!identity || snapshot?.stale !== false) {
-      return Promise.reject(new ActionError(
-        503,
-        'repository_catalog_unavailable',
-        'A fresh authenticated pull request snapshot is required.',
-      ))
+      return Promise.reject(new ActionError(503, 'repository_catalog_unavailable', 'A fresh authenticated pull request snapshot is required.'))
     }
 
     const generation = activateViewer(identity)
@@ -917,12 +1591,7 @@ export function createReleaseService({
     try {
       allowed = await allowedRepositories({ refreshOpen: true })
     } catch (error) {
-      throw executorError(
-        error,
-        'release_authorization_unavailable',
-        'The repository authorization could not be refreshed.',
-        503,
-      )
+      throw executorError(error, 'release_authorization_unavailable', 'The repository authorization could not be refreshed.', 503)
     }
     const key = repository.toLowerCase()
     const allowedViewer = normalizeViewer(allowed.viewerLogin)
@@ -935,25 +1604,21 @@ export function createReleaseService({
       return validRepository(candidate) && candidate.toLowerCase() === key
     })
     if (openProof || mergedProof) return
-    throw new ActionError(
-      403,
-      'repository_not_allowed',
-      'The repository is not freshly proven by an authored open or recently merged pull request.',
-    )
+    throw new ActionError(403, 'repository_not_allowed', 'The repository is not freshly proven by an authored open or recently merged pull request.')
   }
 
   async function loadOptions(binding) {
     assertCatalogBinding(binding)
-    const repositories = await mapLimit(
-      binding.catalog.repositories,
-      READ_CONCURRENCY,
-      async (item) => {
-        assertCatalogBinding(binding)
-        const tags = await listTags(executor, item.repository)
-        assertCatalogBinding(binding)
-        return { ...item, ...nextPatchTag(tags), previousTags: previousTags(tags) }
-      },
-    )
+    const repositories = await mapLimit(binding.catalog.repositories, READ_CONCURRENCY, async (item) => {
+      assertCatalogBinding(binding)
+      const tags = await listTags(executor, item.repository)
+      assertCatalogBinding(binding)
+      return {
+        ...item,
+        ...nextPatchTag(tags),
+        previousTags: previousTags(tags),
+      }
+    })
     assertCatalogBinding(binding)
     const generatedAt = new Date(now()).toISOString()
     return {
@@ -1009,55 +1674,137 @@ export function createReleaseService({
     }
   }
 
-  function loadCandidates(items, viewerLogin, repositories) {
-    const descriptors = new Map()
-    for (const item of items) {
-      const candidate = mergedCandidate(item, viewerLogin)
-      if (!candidate || !repositories.has(candidate.repository.toLowerCase())) continue
-      descriptors.set(`${candidate.repository.toLowerCase()}:${candidate.number}`, candidate)
+  async function loadPipelineEvidence(releases, binding, { refresh = false } = {}) {
+    assertCatalogBinding(binding)
+    synchronizePipelineCatalog(releases)
+    const targets = pipelineCache.releases.filter((release) =>
+      refresh ||
+      activePipeline(release.pipeline) ||
+      pipelineConfirmations.has(releasePipelineKey(release)))
+    if (targets.length === 0) {
+      return pipelineCache
     }
 
-    let incomplete = false
-    const pulls = [...descriptors.values()].map((candidate) => {
-      if (candidate.pull) return candidate.pull
-      incomplete = true
-      return null
-    })
-    const grouped = new Map()
-    for (const pull of pulls) {
-      if (!pull) continue
-      const key = pull.repository.toLowerCase()
-      const existing = grouped.get(key) ?? []
-      existing.push(pull)
-      grouped.set(key, existing)
+    const identities = pipelineTargets(targets)
+    const fingerprint = fingerprintPipelines(identities)
+    const generation = binding.generation
+    const revision = pipelineRevision
+    const pollKey = `${generation}:${revision}:${fingerprint}`
+    const poll = pipelinePolls.get(pollKey)
+    if (!refresh && poll && now() - poll.loadedAt < PIPELINE_POLL_TTL) {
+      return pipelineCache
     }
-    return { grouped, incomplete }
+
+    if (pipelineInflight) {
+      if (
+        pipelineInflight.generation === generation &&
+        pipelineInflight.revision === revision &&
+        (
+          pipelineInflight.refresh ||
+          (!refresh && pipelineInflight.fingerprint === fingerprint)
+        )
+      ) {
+        return pipelineInflight.promise
+      }
+      try {
+        await pipelineInflight.promise
+      } catch {
+        // A forced sweep still follows a failed narrow load.
+      }
+      assertCatalogBinding(binding)
+      return loadPipelineEvidence(releases, binding, { refresh })
+    }
+
+    const previous = new Map(targets.map((release) => [
+      releasePipelineKey(release),
+      {
+        active: activePipeline(release.pipeline),
+        confirmation: pipelineConfirmations.has(releasePipelineKey(release)),
+      },
+    ]))
+    const entry = {
+      fingerprint,
+      generation,
+      promise: null,
+      refresh,
+      revision,
+    }
+    entry.promise = loadReleasePipelines({
+        executor,
+        now,
+        previous: targets,
+        releases: identities,
+      })
+      .then((value) => {
+        assertCatalogBinding(binding)
+        if (
+          pipelineRevision !== revision ||
+          pipelineCacheFingerprint !== fingerprintPipelines(releases)
+        ) {
+          throw new ActionError(409, 'release_pipelines_changed', 'Recent release pipeline targets changed.')
+        }
+
+        pipelineCache = mergePipelineEvidence(pipelineCache, value)
+        const updates = new Map(value.releases.map((release) => [
+          releasePipelineKey(release),
+          release.pipeline,
+        ]))
+        const merged = new Map(pipelineCache.releases.map((release) => [
+          releasePipelineKey(release),
+          release.pipeline,
+        ]))
+        for (const identity of identities) {
+          const key = releasePipelineKey(identity)
+          const incoming = updates.get(key)
+          if (!incoming || incoming.lookup === 'unavailable') continue
+
+          const state = previous.get(key)
+          const pipeline = merged.get(key)
+          if (!pipeline) continue
+          if (state.confirmation || activePipeline(pipeline)) {
+            pipelineConfirmations.delete(key)
+          } else if (state.active) {
+            pipelineConfirmations.add(key)
+          } else if (refresh) {
+            pipelineConfirmations.delete(key)
+          }
+        }
+        if (!refresh) {
+          pipelinePolls.set(pollKey, { loadedAt: now() })
+          for (const [key, value] of pipelinePolls) {
+            if (now() - value.loadedAt >= PIPELINE_POLL_TTL) {
+              pipelinePolls.delete(key)
+            }
+          }
+        }
+        return pipelineCache
+      })
+      .finally(() => {
+        if (pipelineInflight === entry) pipelineInflight = null
+      })
+    pipelineInflight = entry
+    return entry.promise
   }
 
-  async function loadRecent(binding) {
+  async function loadRecent(binding, fallback) {
     assertCatalogBinding(binding)
     const currentCatalog = binding.catalog
     const cutoff = now() - RECENT_RELEASE_WINDOW
+    const failedRepositories = new Set()
     const warnings = [...currentCatalog.warnings]
-    let merged = { incomplete: true, items: [] }
-    try {
-      merged = normalizeMerged(await loadMerged(currentCatalog.viewerLogin))
-    } catch {
-      warnings.push('Recently merged pull requests could not be refreshed for release membership.')
-    }
-    assertCatalogBinding(binding)
     let releaseReadsIncomplete = false
     const releaseResults = await mapLimit(currentCatalog.repositories, READ_CONCURRENCY, async ({ repository }) => {
       try {
         assertCatalogBinding(binding)
-        const result = await listRelevantReleases(executor, repository)
+        const result = await listRelevantReleases(executor, repository, cutoff)
         assertCatalogBinding(binding)
         releaseReadsIncomplete ||= result.incomplete
         warnings.push(...result.warnings)
         return result.releases
       } catch (error) {
-        if (error instanceof ActionError) throw error
+        if (error instanceof ActionError && error.code === 'repository_catalog_changed') throw error
         releaseReadsIncomplete = true
+        failedRepositories.add(repository.toLowerCase())
         warnings.push(`${repository} releases could not be loaded.`)
         return []
       }
@@ -1069,41 +1816,92 @@ export function createReleaseService({
         if (Date.parse(release.publishedAt) >= cutoff) work.push({ release })
       }
     }
-    const repositories = new Set(work.map(({ release }) => release.repository.toLowerCase()))
-    const candidates = loadCandidates(merged.items, currentCatalog.viewerLogin, repositories)
-    if (merged.incomplete || candidates.incomplete) {
-      warnings.push('Some authored merged pull requests could not be loaded for release membership.')
-    }
-    const assignments = new Map(work.map(({ release }) => [release.id, new Map()]))
-    for (const [repository, pulls] of candidates.grouped) {
-      const intervals = work.filter(({ release }) => release.repository.toLowerCase() === repository)
-      for (const pull of pulls) {
-        const linked = intervals.filter(({ release }) =>
-          pullNumbersFromNotes(release.body, release.repository).includes(pull.number))
-        for (const { release } of linked) {
-          assignments.get(release.id).set(pull.number, pull)
+
+    const descriptors = new Map()
+    for (const { release } of work) {
+      for (const number of pullNumbersFromNotes(release.body, release.repository)) {
+        const key = `${release.repository.toLowerCase()}:${number}`
+        const descriptor = descriptors.get(key) ?? {
+          number,
+          releaseIds: new Set(),
+          repository: release.repository,
         }
+        descriptor.releaseIds.add(release.id)
+        descriptors.set(key, descriptor)
       }
     }
-    const releases = work.flatMap(({ release }) => {
+    const mergedCutoff = Date.parse(`${authoredMergedCutoffDate(now)}T00:00:00.000Z`)
+    const pullResult =
+      typeof executor.graphql === 'function'
+        ? await loadGraphqlPulls(executor, [...descriptors.values()], currentCatalog.viewerLogin, mergedCutoff)
+        : await loadRestPulls(executor, [...descriptors.values()], currentCatalog.viewerLogin, mergedCutoff)
+    if (pullResult.authenticatedViewer && pullResult.authenticatedViewer.key !== binding.key) {
+      activateViewer(pullResult.authenticatedViewer)
+      throw new ActionError(409, 'repository_catalog_changed', 'The authenticated viewer changed.')
+    }
+    if (pullResult.incomplete) {
+      warnings.push('Some authored merged pull requests could not be loaded for release membership.')
+    }
+    const confirmation = await confirmRelevantReleases(
+      executor,
+      work.map(({ release }) => release),
+    )
+    if (confirmation.incomplete) {
+      warnings.push('Some recent releases changed while linked pull requests were loaded.')
+    }
+    const confirmedWork = confirmation.releases.map((release) => ({ release }))
+    const assignments = new Map(confirmedWork.map(({ release }) => [release.id, new Map()]))
+    for (const pull of pullResult.pulls) {
+      const descriptor = descriptors.get(`${pull.repository.toLowerCase()}:${pull.number}`)
+      for (const releaseId of descriptor?.releaseIds ?? []) {
+        assignments.get(releaseId)?.set(pull.number, pull)
+      }
+    }
+    const releases = confirmedWork.flatMap(({ release }) => {
       const pulls = [...assignments.get(release.id).values()]
         .sort((left, right) => Date.parse(right.mergedAt) - Date.parse(left.mergedAt))
         .map(publicPull)
       if (pulls.length === 0) return []
-      return [{
-        ...release,
-        complete: false,
-        pulls,
-        source: 'notes-fallback',
-        warning: 'Discovered from canonical GitHub release-note links; Verify refreshes exact release-boundary membership.',
-      }]
+      return [
+        {
+          ...release,
+          complete: false,
+          pulls,
+          source: 'notes-fallback',
+          warning: 'Discovered from canonical GitHub release-note links; Verify refreshes exact release-boundary membership.',
+        },
+      ]
     })
     releases.sort(compareReleases)
-    const partial = currentCatalog.partial || merged.incomplete || releaseReadsIncomplete || candidates.incomplete
+    const partial = currentCatalog.partial || releaseReadsIncomplete || pullResult.incomplete || confirmation.incomplete
+    assertCatalogBinding(binding)
+    const publicReleases = releases.map(
+      ({
+        body: _body,
+        createdAt: _createdAt,
+        databaseId: _databaseId,
+        description: _description,
+        draft: _draft,
+        nodeId: _nodeId,
+        rawName: _rawName,
+        ...release
+      }) => release,
+    )
+    const mergedReleases = new Map(publicReleases.map((release) => [`${release.repository.toLowerCase()}:${release.id}`, release]))
+    if (fallback && failedRepositories.size > 0) {
+      for (const release of fallback.releases) {
+        if (failedRepositories.has(release.repository.toLowerCase()) && Date.parse(release.publishedAt) >= cutoff) {
+          const key = `${release.repository.toLowerCase()}:${release.id}`
+          if (!mergedReleases.has(key)) mergedReleases.set(key, release)
+        }
+      }
+    }
+    const resultReleases = [...mergedReleases.values()].sort(compareReleases)
+    assertCatalogBinding(binding)
     return {
       generatedAt: new Date(now()).toISOString(),
       partial,
-      releases: releases.map(({ body: _body, draft: _draft, ...release }) => release),
+      releases: seedPipelines(resultReleases),
       warnings,
     }
   }
@@ -1122,7 +1920,7 @@ export function createReleaseService({
     const revision = recentRevision
     if (!recentInflight || recentInflight.generation !== generation || recentInflight.revision !== revision) {
       const entry = { generation, revision, promise: null }
-      entry.promise = loadRecent(binding)
+      entry.promise = loadRecent(binding, fallback)
         .then((value) => {
           assertCatalogBinding(binding)
           if (recentRevision !== revision) {
@@ -1140,7 +1938,7 @@ export function createReleaseService({
     try {
       return await recentInflight.promise
     } catch (error) {
-      if (fallback && viewerGeneration === generation) {
+      if (fallback && viewerGeneration === generation && recentRevision === revision) {
         const generated = now()
         const cutoff = generated - RECENT_RELEASE_WINDOW
         return {
@@ -1156,6 +1954,56 @@ export function createReleaseService({
     }
   }
 
+  async function pipelines({ refresh = false } = {}) {
+    const source = recentCache
+    if (!source || !catalog) {
+      throw new ActionError(
+        409,
+        'release_pipelines_unavailable',
+        'Recent releases must be loaded before their pipelines can be refreshed.',
+      )
+    }
+    const binding = {
+      catalog,
+      generation: viewerGeneration,
+      key: viewerKey,
+    }
+    assertCatalogBinding(binding)
+    const revision = recentRevision
+    const fingerprint = fingerprintPipelines(source.releases)
+    let evidence
+    try {
+      evidence = await loadPipelineEvidence(source.releases, binding, {
+        refresh,
+      })
+    } catch (error) {
+      if (error instanceof ActionError) throw error
+      throw executorError(
+        error,
+        'release_pipelines_unavailable',
+        'Release pipelines could not be loaded.',
+        503,
+      )
+    }
+    assertCatalogBinding(binding)
+    if (
+      recentRevision !== revision ||
+      !recentCache ||
+      fingerprintPipelines(recentCache.releases) !== fingerprint
+    ) {
+      throw new ActionError(
+        409,
+        'release_pipelines_changed',
+        'Recent releases changed while their pipelines were refreshed.',
+      )
+    }
+    recentCache = {
+      ...recentCache,
+      releases: attachPipelines(recentCache.releases, evidence),
+    }
+    return evidence
+  }
+
   function invalidate() {
     optionRevision += 1
     optionCache = null
@@ -1165,6 +2013,7 @@ export function createReleaseService({
     recentCache = null
     recentLoadedAt = 0
     recentInflight = null
+    clearPipelines()
   }
 
   async function defaultCommit(repository) {
@@ -1173,18 +2022,12 @@ export function createReleaseService({
         validate: (value) => isRecord(value) &&
           typeof value.default_branch === 'string' && value.default_branch !== '',
       })
-      const commit = await executor.rest(
-        `repos/${repository}/commits/${encodeURIComponent(details.default_branch)}`,
-        { validate: (value) => isRecord(value) && typeof value.sha === 'string' && SHA.test(value.sha) },
-      )
+      const commit = await executor.rest(`repos/${repository}/commits/${encodeURIComponent(details.default_branch)}`, {
+        validate: (value) => isRecord(value) && typeof value.sha === 'string' && SHA.test(value.sha),
+      })
       return commit.sha.toLowerCase()
     } catch (error) {
-      throw executorError(
-        error,
-        'release_target_unavailable',
-        'The repository default-branch commit could not be captured.',
-        503,
-      )
+      throw executorError(error, 'release_target_unavailable', 'The repository default-branch commit could not be captured.', 503)
     }
   }
 
@@ -1202,12 +2045,15 @@ export function createReleaseService({
       (typeof value.id !== 'number' && typeof value.id !== 'string') ||
       typeof value.tag_name !== 'string' ||
       typeof value.draft !== 'boolean' ||
+      typeof value.prerelease !== 'boolean' ||
       typeof value.body !== 'string'
-    ) return null
+    )
+      return null
     return {
       body: value.body,
       draft: value.draft,
       id: String(value.id),
+      prerelease: value.prerelease,
       raw: value,
       tag: value.tag_name,
     }
@@ -1220,24 +2066,34 @@ export function createReleaseService({
     return state
   }
 
+  function matchesReleaseRequest(state, transaction) {
+    return state.prerelease === transaction.prerelease
+  }
+
   function ownedTagObject(value, transaction) {
-    return isRecord(value) &&
-      typeof value.sha === 'string' && value.sha.toLowerCase() === transaction.tagObjectOid &&
-      value.tag === transaction.tag && value.message === transaction.tagMessage &&
-      isRecord(value.object) && value.object.type === 'commit' &&
-      typeof value.object.sha === 'string' && value.object.sha.toLowerCase() === transaction.commitOid &&
-      isRecord(value.tagger) && value.tagger.name === transaction.tagger.name &&
+    return (
+      isRecord(value) &&
+      typeof value.sha === 'string' &&
+      value.sha.toLowerCase() === transaction.tagObjectOid &&
+      value.tag === transaction.tag &&
+      value.message === transaction.tagMessage &&
+      isRecord(value.object) &&
+      value.object.type === 'commit' &&
+      typeof value.object.sha === 'string' &&
+      value.object.sha.toLowerCase() === transaction.commitOid &&
+      isRecord(value.tagger) &&
+      value.tagger.name === transaction.tagger.name &&
       value.tagger.email === transaction.tagger.email &&
       typeof value.tagger.date === 'string' &&
       Date.parse(value.tagger.date) === Date.parse(transaction.tagger.date)
+    )
   }
 
   async function readOwnedTagObject(transaction) {
     try {
-      const value = await executor.rest(
-        `repos/${transaction.repository}/git/tags/${transaction.tagObjectOid}`,
-        { validate: isRecord },
-      )
+      const value = await executor.rest(`repos/${transaction.repository}/git/tags/${transaction.tagObjectOid}`, {
+        validate: isRecord,
+      })
       if (!ownedTagObject(value, transaction)) {
         throw new ActionError(409, 'tag_object_changed', 'The deterministic release tag object is not owned.')
       }
@@ -1250,10 +2106,9 @@ export function createReleaseService({
 
   async function readReference(repository, tag) {
     try {
-      const value = await executor.rest(
-        `repos/${repository}/git/ref/tags/${encodeURIComponent(tag)}`,
-        { validate: isRecord },
-      )
+      const value = await executor.rest(`repos/${repository}/git/ref/tags/${encodeURIComponent(tag)}`, {
+        validate: isRecord,
+      })
       if (value.ref !== `refs/tags/${tag}` || !isRecord(value.object) ||
           typeof value.object.sha !== 'string' || !SHA.test(value.object.sha) ||
           typeof value.object.type !== 'string') {
@@ -1271,7 +2126,9 @@ export function createReleaseService({
 
   async function readReleaseById(repository, id) {
     try {
-      return await executor.rest(`repos/${repository}/releases/${id}`, { validate: isRecord })
+      return await executor.rest(`repos/${repository}/releases/${id}`, {
+        validate: isRecord,
+      })
     } catch (error) {
       if (missing(error)) return null
       throw error
@@ -1280,10 +2137,7 @@ export function createReleaseService({
 
   async function readReleaseByTag(repository, tag) {
     try {
-      return await executor.rest(
-        `repos/${repository}/releases/tags/${encodeURIComponent(tag)}`,
-        { validate: isRecord },
-      )
+      return await executor.rest(`repos/${repository}/releases/tags/${encodeURIComponent(tag)}`, { validate: isRecord })
     } catch (error) {
       if (!missing(error)) throw error
     }
@@ -1321,12 +2175,7 @@ export function createReleaseService({
         lastError = error
       }
     }
-    throw executorError(
-      lastError,
-      'tag_object_create_unconfirmed',
-      'The owned release tag object could not be created.',
-      503,
-    )
+    throw executorError(lastError, 'tag_object_create_unconfirmed', 'The owned release tag object could not be created.', 503)
   }
 
   async function confirmOwnedTag(transaction) {
@@ -1340,7 +2189,10 @@ export function createReleaseService({
     for (let attempt = 0; attempt < RECONCILIATION_ATTEMPTS; attempt += 1) {
       try {
         const value = await executor.rest(`repos/${transaction.repository}/git/refs`, {
-          fields: { ref: `refs/tags/${transaction.tag}`, sha: transaction.tagObjectOid },
+          fields: {
+            ref: `refs/tags/${transaction.tag}`,
+            sha: transaction.tagObjectOid,
+          },
           method: 'POST',
           validate: isRecord,
         })
@@ -1358,23 +2210,14 @@ export function createReleaseService({
         const current = await readReference(transaction.repository, transaction.tag)
         if (current?.type === 'tag' && current.oid === transaction.tagObjectOid) return
         if (current) {
-          throw new ActionError(
-            409,
-            'tag_create_conflict',
-            'Another actor created the release tag. Reload release options and try again.',
-          )
+          throw new ActionError(409, 'tag_create_conflict', 'Another actor created the release tag. Reload release options and try again.')
         }
       } catch (error) {
         if (error instanceof ActionError && error.code === 'tag_create_conflict') throw error
         lastError = error
       }
     }
-    throw executorError(
-      lastError,
-      'tag_create_unconfirmed',
-      'The release tag creation could not be confirmed.',
-      503,
-    )
+    throw executorError(lastError, 'tag_create_unconfirmed', 'The release tag creation could not be confirmed.', 503)
   }
 
   async function createDraft(transaction) {
@@ -1386,7 +2229,7 @@ export function createReleaseService({
             body: transaction.marker,
             draft: true,
             generate_release_notes: true,
-            prerelease: false,
+            prerelease: transaction.prerelease,
             tag_name: transaction.tag,
             target_commitish: transaction.commitOid,
           },
@@ -1394,7 +2237,7 @@ export function createReleaseService({
           validate: isRecord,
         })
         const state = ownedRelease(value, transaction)
-        if (state?.draft) return state
+        if (state?.draft && matchesReleaseRequest(state, transaction)) return state
         lastError = new ActionError(502, 'release_created_unconfirmed', 'GitHub returned an invalid draft release.')
       } catch (error) {
         lastError = error
@@ -1404,24 +2247,18 @@ export function createReleaseService({
         const current = await readReleaseByTag(transaction.repository, transaction.tag)
         if (current) {
           const state = ownedRelease(current, transaction)
-          if (state?.draft) return state
-          throw new ActionError(
-            409,
-            'release_create_conflict',
-            'Another release now uses this tag. No foreign release was changed.',
-          )
+          if (state?.draft && matchesReleaseRequest(state, transaction)) return state
+          if (state && !matchesReleaseRequest(state, transaction)) {
+            throw new ActionError(409, 'release_changed', 'The owned draft release does not match the requested pre-release state.')
+          }
+          throw new ActionError(409, 'release_create_conflict', 'Another release now uses this tag. No foreign release was changed.')
         }
       } catch (error) {
         if (error instanceof ActionError && error.code === 'release_create_conflict') throw error
         lastError = error
       }
     }
-    throw executorError(
-      lastError,
-      'release_created_unconfirmed',
-      'The draft release creation could not be confirmed.',
-      503,
-    )
+    throw executorError(lastError, 'release_created_unconfirmed', 'The draft release creation could not be confirmed.', 503)
   }
 
   async function publishDraft(transaction) {
@@ -1433,17 +2270,24 @@ export function createReleaseService({
         if (!ownedBefore) {
           throw new ActionError(409, 'release_changed', 'The owned draft release changed before publication.')
         }
+        if (!matchesReleaseRequest(ownedBefore, transaction)) {
+          throw new ActionError(409, 'release_changed', 'The owned draft release does not match the requested pre-release state.')
+        }
         if (!ownedBefore.draft) {
           const normalized = normalizeRelease(before, transaction.repository)
           if (normalized) return normalized
           throw new ActionError(502, 'release_created_unconfirmed', 'The published release is incomplete.')
         }
-        const value = await executor.rest(
-          `repos/${transaction.repository}/releases/${transaction.releaseId}`,
-          { fields: { draft: false }, method: 'PATCH', validate: isRecord },
-        )
+        const value = await executor.rest(`repos/${transaction.repository}/releases/${transaction.releaseId}`, {
+          fields: { draft: false, prerelease: transaction.prerelease },
+          method: 'PATCH',
+          validate: isRecord,
+        })
         const state = ownedRelease(value, transaction)
         const normalized = normalizeRelease(value, transaction.repository)
+        if (state && !matchesReleaseRequest(state, transaction)) {
+          throw new ActionError(409, 'release_changed', 'The published release does not match the requested pre-release state.')
+        }
         if (state && !state.draft && normalized) return normalized
         lastError = new ActionError(502, 'release_created_unconfirmed', 'GitHub returned an invalid published release.')
       } catch (error) {
@@ -1457,6 +2301,9 @@ export function createReleaseService({
         if (!state) {
           throw new ActionError(409, 'release_changed', 'The owned release changed during publication.')
         }
+        if (!matchesReleaseRequest(state, transaction)) {
+          throw new ActionError(409, 'release_changed', 'The published release does not match the requested pre-release state.')
+        }
         if (!state.draft) {
           const normalized = normalizeRelease(current, transaction.repository)
           if (normalized) return normalized
@@ -1466,12 +2313,7 @@ export function createReleaseService({
         lastError = error
       }
     }
-    throw executorError(
-      lastError,
-      'release_publish_unconfirmed',
-      'The release publication could not be confirmed.',
-      503,
-    )
+    throw executorError(lastError, 'release_publish_unconfirmed', 'The release publication could not be confirmed.', 503)
   }
 
   async function removeOwnedRelease(transaction) {
@@ -1490,9 +2332,7 @@ export function createReleaseService({
 
     for (let attempt = 0; attempt < RECONCILIATION_ATTEMPTS; attempt += 1) {
       try {
-        await executor.action([
-          'api', `repos/${transaction.repository}/releases/${transaction.releaseId}`, '--method', 'DELETE',
-        ])
+        await executor.action(['api', `repos/${transaction.repository}/releases/${transaction.releaseId}`, '--method', 'DELETE'])
       } catch {
         // A lost DELETE response is reconciled by the following exact read.
       }
@@ -1525,12 +2365,7 @@ export function createReleaseService({
       if (!reference) return true
       if (reference.type !== 'tag' || reference.oid !== transaction.tagObjectOid) return true
       try {
-        await executor.action([
-          'api',
-          `repos/${transaction.repository}/git/refs/tags/${encodeURIComponent(transaction.tag)}`,
-          '--method',
-          'DELETE',
-        ])
+        await executor.action(['api', `repos/${transaction.repository}/git/refs/tags/${encodeURIComponent(transaction.tag)}`, '--method', 'DELETE'])
       } catch {
         // Reconcile the exact owned object before retrying.
       }
@@ -1575,6 +2410,7 @@ export function createReleaseService({
       const transaction = {
         commitOid,
         marker: markerFor(identifier()),
+        prerelease: input.prerelease,
         releaseId: null,
         repository: input.repository,
         tag: input.tag,
@@ -1599,9 +2435,15 @@ export function createReleaseService({
         if (!(await confirmOwnedTag(transaction))) {
           throw new ActionError(409, 'release_target_changed', 'The owned release tag changed before publication.')
         }
-        const normalized = await publishDraft(transaction)
+        await publishDraft(transaction)
         if (!(await confirmOwnedTag(transaction))) {
           throw new ActionError(409, 'release_target_changed', 'The owned release tag changed during publication.')
+        }
+        const published = await readReleaseById(transaction.repository, transaction.releaseId)
+        const finalState = ownedRelease(published, transaction)
+        const normalized = normalizeRelease(published, transaction.repository)
+        if (!finalState || finalState.draft || !matchesReleaseRequest(finalState, transaction) || !normalized) {
+          throw new ActionError(409, 'release_changed', 'The published release changed before the release transaction completed.')
         }
 
         invalidate()
@@ -1636,17 +2478,9 @@ export function createReleaseService({
   async function exactRelease(value) {
     let raw
     try {
-      raw = await executor.rest(
-        `repos/${value.repository}/releases/${value.releaseId}`,
-        { validate: isRecord },
-      )
+      raw = await executor.rest(`repos/${value.repository}/releases/${value.releaseId}`, { validate: isRecord })
     } catch (error) {
-      throw executorError(
-        error,
-        'verification_evidence_unavailable',
-        'Release verification evidence could not be refreshed.',
-        503,
-      )
+      throw executorError(error, 'verification_evidence_unavailable', 'Release verification evidence could not be refreshed.', 503)
     }
     const release = normalizeRelease(raw, value.repository)
     if (
@@ -1668,12 +2502,7 @@ export function createReleaseService({
           validate: Array.isArray,
         })
       } catch (error) {
-        throw executorError(
-          error,
-          'verification_evidence_unavailable',
-          'Release verification evidence could not be refreshed.',
-          503,
-        )
+        throw executorError(error, 'verification_evidence_unavailable', 'Release verification evidence could not be refreshed.', 503)
       }
       const marker = values.length === 0
         ? 'empty'
@@ -1686,33 +2515,17 @@ export function createReleaseService({
         if (isRecord(value) && value.draft === true) continue
         const candidate = normalizeRelease(value, release.repository)
         if (!candidate || candidate.draft) {
-          throw new ActionError(
-            502,
-            'verification_evidence_incomplete',
-            'GitHub returned incomplete published release evidence.',
-          )
+          throw new ActionError(502, 'verification_evidence_incomplete', 'GitHub returned incomplete published release evidence.')
         }
         const existing = published.get(candidate.id)
-        if (existing && (
-          existing.tag !== candidate.tag ||
-          existing.publishedAt !== candidate.publishedAt ||
-          existing.url !== candidate.url
-        )) {
-          throw new ActionError(
-            502,
-            'verification_evidence_changed',
-            'A published release changed while its adjacency was loaded.',
-          )
+        if (existing && (existing.tag !== candidate.tag || existing.publishedAt !== candidate.publishedAt || existing.url !== candidate.url)) {
+          throw new ActionError(502, 'verification_evidence_changed', 'A published release changed while its adjacency was loaded.')
         }
         published.set(candidate.id, candidate)
       }
       if (values.length < PAGE_SIZE) break
       if (page === MAXIMUM_RELEASE_PAGES) {
-        throw new ActionError(
-          502,
-          'verification_evidence_incomplete',
-          'GitHub release pagination exceeded the verification bound.',
-        )
+        throw new ActionError(502, 'verification_evidence_incomplete', 'GitHub release pagination exceeded the verification bound.')
       }
     }
 
@@ -1725,25 +2538,15 @@ export function createReleaseService({
   }
 
   async function tagCommit(repository, tag) {
-    const fail = () => new ActionError(
-      409,
-      'release_changed',
-      'The release tag no longer resolves to the authorized commit.',
-    )
+    const fail = () => new ActionError(409, 'release_changed', 'The release tag no longer resolves to the authorized commit.')
     let reference
     try {
-      reference = await executor.rest(
-        `repos/${repository}/git/ref/tags/${encodeURIComponent(tag)}`,
-        { validate: isRecord },
-      )
+      reference = await executor.rest(`repos/${repository}/git/ref/tags/${encodeURIComponent(tag)}`, {
+        validate: isRecord,
+      })
     } catch (error) {
       if (error instanceof ExecutorError && error.status === 404) throw fail()
-      throw executorError(
-        error,
-        'verification_evidence_unavailable',
-        'The release tag could not be refreshed.',
-        503,
-      )
+      throw executorError(error, 'verification_evidence_unavailable', 'The release tag could not be refreshed.', 503)
     }
     if (reference.ref !== `refs/tags/${tag}` || !isRecord(reference.object)) throw fail()
 
@@ -1759,12 +2562,7 @@ export function createReleaseService({
           validate: isRecord,
         })
       } catch (error) {
-        throw executorError(
-          error,
-          'verification_evidence_unavailable',
-          'The release tag could not be peeled.',
-          503,
-        )
+        throw executorError(error, 'verification_evidence_unavailable', 'The release tag could not be peeled.', 503)
       }
       if (!isRecord(annotated.object)) throw fail()
       target = annotated.object
@@ -1785,14 +2583,9 @@ export function createReleaseService({
     try {
       viewerLogin = await viewer()
       const before = await tagCommit(value.repository, value.tag)
-      const baseBefore = predecessor
-        ? await tagCommit(value.repository, predecessor.tag)
-        : null
+      const baseBefore = predecessor ? await tagCommit(value.repository, predecessor.tag) : null
 
-      const rawPull = await executor.rest(
-        `repos/${value.repository}/pulls/${value.pullNumber}`,
-        { validate: isRecord },
-      )
+      const rawPull = await executor.rest(`repos/${value.repository}/pulls/${value.pullNumber}`, { validate: isRecord })
       const pull = normalizeAssociatedPull(rawPull, value.repository, viewerLogin)
       if (
         !pull ||
@@ -1800,26 +2593,15 @@ export function createReleaseService({
         pull.url !== value.pullUrl ||
         pull.headSha !== String(value.headSha).toLowerCase() ||
         !(predecessor
-          ? await commitInRange(
-            executor,
-            value.repository,
-            baseBefore,
-            before,
-            pull.mergeCommitSha,
-          )
-          : await commitInFirstRelease(
-            executor,
-            value.repository,
-            before,
-            pull.mergeCommitSha,
-          ))
-      ) return null
+          ? await commitInRange(executor, value.repository, baseBefore, before, pull.mergeCommitSha)
+          : await commitInFirstRelease(executor, value.repository, before, pull.mergeCommitSha))
+      )
+        return null
 
       const context = await loadVerificationContext(executor, value.repository, value.pullNumber)
-      const confirmedRawPull = await executor.rest(
-        `repos/${value.repository}/pulls/${value.pullNumber}`,
-        { validate: isRecord },
-      )
+      const confirmedRawPull = await executor.rest(`repos/${value.repository}/pulls/${value.pullNumber}`, {
+        validate: isRecord,
+      })
       const confirmedPull = normalizeAssociatedPull(confirmedRawPull, value.repository, viewerLogin)
       if (
         !confirmedPull ||
@@ -1833,17 +2615,10 @@ export function createReleaseService({
       const currentRelease = await exactRelease(value)
       if (!sameRelease(currentRelease, release)) return null
       const after = await tagCommit(value.repository, value.tag)
-      const baseAfter = predecessor
-        ? await tagCommit(value.repository, predecessor.tag)
-        : null
+      const baseAfter = predecessor ? await tagCommit(value.repository, predecessor.tag) : null
       if (after !== before || baseAfter !== baseBefore) return null
       const currentPredecessor = await predecessorFor(currentRelease)
-      if (
-        currentPredecessor === undefined ||
-        (predecessor === null
-          ? currentPredecessor !== null
-          : !sameRelease(currentPredecessor, predecessor))
-      ) return null
+      if (currentPredecessor === undefined || (predecessor === null ? currentPredecessor !== null : !sameRelease(currentPredecessor, predecessor))) return null
       const { body: _body, draft: _draft, ...authorized } = currentRelease
 
       const releasedPull = publicPull(confirmedPull)
@@ -1861,12 +2636,7 @@ export function createReleaseService({
       }
     } catch (error) {
       if (error instanceof ActionError) throw error
-      throw executorError(
-        error,
-        'verification_evidence_unavailable',
-        'Release verification evidence could not be refreshed.',
-        503,
-      )
+      throw executorError(error, 'verification_evidence_unavailable', 'Release verification evidence could not be refreshed.', 503)
     }
   }
 
@@ -1879,76 +2649,44 @@ export function createReleaseService({
     try {
       const viewerLogin = await viewer()
       const before = await tagCommit(value.repository, value.tag)
-      const baseBefore = predecessor
-        ? await tagCommit(value.repository, predecessor.tag)
-        : null
+      const baseBefore = predecessor ? await tagCommit(value.repository, predecessor.tag) : null
       const numbers = pullNumbersFromNotes(release.body, value.repository)
-      const pulls = (await mapLimit(numbers, READ_CONCURRENCY, async (number) => {
-        const raw = await executor.rest(
-          `repos/${value.repository}/pulls/${number}`,
-          { validate: isRecord },
-        )
-        const pull = normalizeAssociatedPull(raw, value.repository, viewerLogin)
-        if (pull === false) return null
-        if (!pull) {
-          throw new ActionError(
-            409,
-            'verification_membership_changed',
-            'A released pull request identity could not be confirmed.',
-          )
-        }
-        const included = predecessor
-          ? await commitInRange(
-            executor,
-            value.repository,
-            baseBefore,
-            before,
-            pull.mergeCommitSha,
-          )
-          : await commitInFirstRelease(
-            executor,
-            value.repository,
-            before,
-            pull.mergeCommitSha,
-          )
-        if (!included) return null
+      const pulls = (
+        await mapLimit(numbers, READ_CONCURRENCY, async (number) => {
+          const raw = await executor.rest(`repos/${value.repository}/pulls/${number}`, { validate: isRecord })
+          const pull = normalizeAssociatedPull(raw, value.repository, viewerLogin)
+          if (pull === false) return null
+          if (!pull) {
+            throw new ActionError(409, 'verification_membership_changed', 'A released pull request identity could not be confirmed.')
+          }
+          const included = predecessor
+            ? await commitInRange(executor, value.repository, baseBefore, before, pull.mergeCommitSha)
+            : await commitInFirstRelease(executor, value.repository, before, pull.mergeCommitSha)
+          if (!included) return null
 
-        const confirmedRaw = await executor.rest(
-          `repos/${value.repository}/pulls/${number}`,
-          { validate: isRecord },
-        )
-        const confirmed = normalizeAssociatedPull(confirmedRaw, value.repository, viewerLogin)
-        if (
-          !confirmed ||
-          confirmed.url !== pull.url ||
-          confirmed.headSha !== pull.headSha ||
-          confirmed.mergeCommitSha !== pull.mergeCommitSha ||
-          confirmed.mergedAt !== pull.mergedAt ||
-          confirmed.title !== pull.title
-        ) {
-          throw new ActionError(
-            409,
-            'verification_membership_changed',
-            'A released pull request changed while verification was queued.',
-          )
-        }
-        return publicPull(confirmed)
-      })).filter(Boolean)
+          const confirmedRaw = await executor.rest(`repos/${value.repository}/pulls/${number}`, { validate: isRecord })
+          const confirmed = normalizeAssociatedPull(confirmedRaw, value.repository, viewerLogin)
+          if (
+            !confirmed ||
+            confirmed.url !== pull.url ||
+            confirmed.headSha !== pull.headSha ||
+            confirmed.mergeCommitSha !== pull.mergeCommitSha ||
+            confirmed.mergedAt !== pull.mergedAt ||
+            confirmed.title !== pull.title
+          ) {
+            throw new ActionError(409, 'verification_membership_changed', 'A released pull request changed while verification was queued.')
+          }
+          return publicPull(confirmed)
+        })
+      ).filter(Boolean)
 
       const currentRelease = await exactRelease(value)
       if (!sameRelease(currentRelease, release) || currentRelease.body !== release.body) return null
       const after = await tagCommit(value.repository, value.tag)
-      const baseAfter = predecessor
-        ? await tagCommit(value.repository, predecessor.tag)
-        : null
+      const baseAfter = predecessor ? await tagCommit(value.repository, predecessor.tag) : null
       if (after !== before || baseAfter !== baseBefore) return null
       const currentPredecessor = await predecessorFor(currentRelease)
-      if (
-        currentPredecessor === undefined ||
-        (predecessor === null
-          ? currentPredecessor !== null
-          : !sameRelease(currentPredecessor, predecessor))
-      ) return null
+      if (currentPredecessor === undefined || (predecessor === null ? currentPredecessor !== null : !sameRelease(currentPredecessor, predecessor))) return null
 
       const { body: _body, draft: _draft, ...authorized } = currentRelease
       return {
@@ -1964,12 +2702,7 @@ export function createReleaseService({
       }
     } catch (error) {
       if (error instanceof ActionError) throw error
-      throw executorError(
-        error,
-        'verification_evidence_unavailable',
-        'Release verification evidence could not be refreshed.',
-        503,
-      )
+      throw executorError(error, 'verification_evidence_unavailable', 'Release verification evidence could not be refreshed.', 503)
     }
   }
 
@@ -1977,9 +2710,11 @@ export function createReleaseService({
     activeReleaseCount: () => activeReleases.size,
     create,
     getOptions: options,
+    getPipelines: pipelines,
     getRecent: recent,
     invalidate,
     options,
+    pipelines,
     primeRepositories,
     recent,
     resolveReleaseVerifications,

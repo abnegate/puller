@@ -7,7 +7,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { createArtifactAuthorizer } from "./authorization.mjs";
 import { createSnapshotCache } from "./cache.mjs";
 import { createCheckLogsService } from "./check-logs.mjs";
-import { createClaudeRunManager } from "./claude.mjs";
+import { createAgentRunManager } from "./claude.mjs";
+import { createCommitsService } from "./commits.mjs";
 import { createConflictRepairManager } from "./conflict-repair.mjs";
 import { createDiffService } from "./diff.mjs";
 import { createGithubExecutor } from "./executor.mjs";
@@ -85,6 +86,7 @@ export async function start({
   createVite,
   createAuthorization = createArtifactAuthorizer,
   createCheckLogs = createCheckLogsService,
+  createCommits = createCommitsService,
   createDiff = createDiffService,
   createMemory = createVerificationMemory,
   executor,
@@ -92,7 +94,7 @@ export async function start({
   loader,
   root = ROOT,
   distPath = DIST,
-  createManager = createClaudeRunManager,
+  createManager = createAgentRunManager,
   createTask = createTaskManager,
   createRepair = createConflictRepairManager,
   createReleaseVerifier = createReleaseVerificationManager,
@@ -126,6 +128,9 @@ export async function start({
   const authorizer = createAuthorization({
     loadCheckAuthorization: githubLoader.loadCheckAuthorization,
     loadPullAuthorization: githubLoader.loadPullAuthorization,
+    loadPullCommitsAuthorization:
+      githubLoader.loadPullCommitsAuthorization ??
+      githubLoader.loadPullAuthorization,
     peek: cache.peek,
   });
   const trustedOrigin = originFor(host, port);
@@ -134,6 +139,7 @@ export async function start({
 
   let coordinator = null;
   let checkLogsService = null;
+  let commitsService = null;
   let diffService = null;
   let mergeService = null;
   let releaseService = null;
@@ -155,6 +161,10 @@ export async function start({
       authorizer,
       executor: githubExecutor,
     });
+    commitsService = createCommits({
+      authorizer,
+      executor: githubExecutor,
+    });
     diffService = createDiff({
       authorizer,
       executor: githubExecutor,
@@ -172,6 +182,7 @@ export async function start({
       refetch: () => cache.getFresh(),
     });
     mergeService = createMergeService({
+      coordinator,
       executor: githubExecutor,
       loadPull: githubLoader.loadPull,
       repairManager,
@@ -232,6 +243,7 @@ export async function start({
       runManager,
       taskManager,
       checkLogsService,
+      commitsService,
       diffService,
       mergeService,
       repairManager,
@@ -304,6 +316,7 @@ export async function start({
     authorizer,
     cache,
     checkLogsService,
+    commitsService,
     close,
     coordinator,
     diffService,

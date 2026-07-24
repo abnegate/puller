@@ -176,12 +176,22 @@ describe("BlockerDetails", () => {
       "href",
       "https://github.com/appwrite/cloud/actions/runs/3",
     );
+    expect(screen.getByRole("link", { name: "Open check" })).toHaveAttribute(
+      "data-pull-focus-token",
+      `blocker:check:${pull.ci.checks!.find(({ state }) => state === "failure")!.id}:open`,
+    );
     expect(screen.getByText("Unresolved comments")).toBeInTheDocument();
     expect(screen.getByText("@reviewer-one")).toBeInTheDocument();
     expect(screen.getByText("src/deploy.ts:42")).toBeInTheDocument();
     expect(
       screen.getByText("Please cover the retry path."),
     ).toBeInTheDocument();
+    expect(
+      screen.getAllByRole("link", { name: "Open thread" })[0],
+    ).toHaveAttribute(
+      "data-pull-focus-token",
+      `blocker:thread:${pull.unresolvedThreads![0]!.id}:${pull.unresolvedThreads![0]!.path}:open`,
+    );
     expect(screen.getByText("Greptile review")).toBeInTheDocument();
     expect(screen.getByText("4/5 confidence")).toBeInTheDocument();
     expect(screen.getByText(/Current head/)).toHaveTextContent(
@@ -190,6 +200,12 @@ describe("BlockerDetails", () => {
     expect(
       screen.getByRole("link", { name: "Open Greptile comment" }),
     ).toHaveAttribute("rel", "noopener noreferrer");
+    expect(
+      screen.getByRole("link", { name: "Open Greptile comment" }),
+    ).toHaveAttribute(
+      "data-pull-focus-token",
+      `blocker:greptile:${pull.greptile.commentId}:open`,
+    );
   });
 
   it("loads a supported failed job automatically when mounted", async () => {
@@ -213,6 +229,12 @@ describe("BlockerDetails", () => {
     expect(
       screen.getByRole("region", { name: "Integration tests logs" }),
     ).toHaveTextContent("Run pnpm test Tests failed");
+    expect(
+      screen.getByRole("region", { name: "Integration tests logs" }),
+    ).toHaveAttribute(
+      "data-pull-focus-token",
+      `blocker:check:${pull.ci.checks![1]!.id}:log`,
+    );
   });
 
   it("autoloads every unique failed check and deduplicates canonical jobs", async () => {
@@ -530,9 +552,14 @@ describe("BlockerDetails", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Logs unavailable: GitHub did not return logs yet.",
     );
-    fireEvent.click(
-      screen.getByRole("button", { name: "Retry Integration tests logs" }),
+    const retry = screen.getByRole("button", {
+      name: "Retry Integration tests logs",
+    });
+    expect(retry).toHaveAttribute(
+      "data-pull-focus-token",
+      `blocker:check:${pull.ci.checks![1]!.id}:retry`,
     );
+    fireEvent.click(retry);
 
     expect(
       screen.getByRole("status", { name: "Loading Integration tests logs" }),

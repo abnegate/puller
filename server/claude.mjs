@@ -1,10 +1,20 @@
-import { spawn as spawnProcess } from "node:child_process";
+import {
+  execFile as executeFile,
+  spawn as spawnProcess,
+} from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 
 import { SnapshotError } from "./cache.mjs";
+import { AgentError, agentLabel, validateAgent } from "./agent.mjs";
+import {
+  CodexError,
+  createCodexInvocation,
+  eventsForCodexLine,
+} from "./codex.mjs";
 import { assessPull } from "./readiness.mjs";
 import {
   ReviewTaskError,
@@ -26,9 +36,25 @@ const DEFAULT_RUNTIME = 30 * 60 * 1_000;
 const DEFAULT_KILL_GRACE = 2_000;
 const DEFAULT_REDACTION_DELAY = 512;
 const DEFAULT_RUN_LIMIT = 5;
+const DEFAULT_REVIEW_CLEANUP_TIMEOUT = 30_000;
 const DEFAULT_REVIEW_PREFLIGHT_TIMEOUT = 60_000;
+const execFile = promisify(executeFile);
+const SAFE_GIT_CONFIGURATION = [
+  "-c",
+  "core.hooksPath=/dev/null",
+  "-c",
+  "core.fsmonitor=false",
+];
+const REVIEW_CLEANUP_FAILURE =
+  "The isolated review workspace could not be removed. The run reservation was released; inspect Puller's local review workspace storage.";
+const REVIEW_CLEANUP_RUN_FAILURE =
+  "The agent finished, but Puller could not remove its isolated review workspace. Its push may have succeeded. The run reservation was released.";
+const AUTO_VERIFICATION_FAILURE =
+  "The Auto agent finished, but Puller could not safely publish and verify its isolated changes. Refresh the pull request before retrying.";
+const REVIEW_SSH_COMMAND =
+  "ssh -oBatchMode=yes -oConnectTimeout=15 -oStrictHostKeyChecking=yes";
 const REVIEW_VERIFICATION_FAILURE =
-  "Review verification failed after Claude Code exited successfully. Its push may have succeeded. Refresh the pull request before retrying.";
+  "Review verification failed after the agent exited successfully. Its push may have succeeded. Refresh the pull request before retrying.";
 const SHA = /^[a-f0-9]{40}$/i;
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const AUTO_PARALLELISM_LIMIT = 4;
@@ -208,6 +234,7 @@ export function createRunCoordinator({ limit = DEFAULT_RUN_LIMIT } = {}) {
     throw new TypeError("The global run limit must be a positive integer.");
   }
   const keys = new Set();
+  const locks = new Set();
   const workspaces = new Set();
   let stopping = false;
 
@@ -220,14 +247,14 @@ export function createRunCoordinator({ limit = DEFAULT_RUN_LIMIT } = {}) {
           "The server is shutting down.",
         );
       }
-      if (keys.has(key)) {
+      if (keys.has(key) || locks.has(key)) {
         throw new ActionError(409, duplicateCode, duplicateMessage);
       }
       if (keys.size >= limit) {
         throw new ActionError(
           429,
           "run_limit",
-          `${limit} Claude Code runs are already active.`,
+          `${limit} agent ${limit === 1 ? "run is" : "runs are"} already active.`,
         );
       }
       keys.add(key);
@@ -248,7 +275,7 @@ export function createRunCoordinator({ limit = DEFAULT_RUN_LIMIT } = {}) {
             throw new ActionError(
               409,
               "workspace_running",
-              "A Claude Code run is already active in this worktree.",
+              "An agent run is already active in this worktree.",
             );
           }
           workspaces.add(value);
@@ -264,6 +291,27 @@ export function createRunCoordinator({ limit = DEFAULT_RUN_LIMIT } = {}) {
           if (workspace !== null) workspaces.delete(workspace);
           workspace = null;
           keys.delete(key);
+        },
+      });
+    },
+    reserveKey({ key, duplicateCode, duplicateMessage }) {
+      if (stopping) {
+        throw new ActionError(
+          503,
+          "shutting_down",
+          "The server is shutting down.",
+        );
+      }
+      if (keys.has(key) || locks.has(key)) {
+        throw new ActionError(409, duplicateCode, duplicateMessage);
+      }
+      locks.add(key);
+      let released = false;
+      return Object.freeze({
+        release() {
+          if (released) return;
+          released = true;
+          locks.delete(key);
         },
       });
     },
@@ -343,6 +391,7 @@ export function validateRunInput(value, messageLimit = DEFAULT_MESSAGE_LIMIT) {
   }
 
   const { repository, number, expectedHeadRefOid, message } = value;
+  const agent = validateAgent(value.agent);
   if (
     !REPOSITORY.test(repository ?? "") ||
     repository.split("/").some((part) => part === "." || part === "..")
@@ -371,7 +420,7 @@ export function validateRunInput(value, messageLimit = DEFAULT_MESSAGE_LIMIT) {
     throw new ActionError(
       400,
       "invalid_message",
-      "The Claude Code instructions must be a string.",
+      "The agent instructions must be a string.",
     );
   }
   if (byteLength(message) > messageLimit) {
@@ -387,11 +436,12 @@ export function validateRunInput(value, messageLimit = DEFAULT_MESSAGE_LIMIT) {
     throw new ActionError(
       400,
       "invalid_source",
-      "The Claude Code run source is invalid.",
+      "The agent run source is invalid.",
     );
   }
 
   const base = {
+    agent,
     repository,
     number,
     expectedHeadRefOid: expectedHeadRefOid.toLowerCase(),
@@ -402,14 +452,14 @@ export function validateRunInput(value, messageLimit = DEFAULT_MESSAGE_LIMIT) {
       throw new ActionError(
         400,
         "invalid_triggers",
-        "Manual Claude Code runs cannot include Auto triggers.",
+        "Manual agent runs cannot include Auto triggers.",
       );
     }
     if (value.parallelism !== undefined) {
       throw new ActionError(
         400,
         "invalid_parallelism",
-        "Manual Claude Code runs cannot include Auto parallelism.",
+        "Manual agent runs cannot include Auto parallelism.",
       );
     }
     return value.source === undefined ? base : { ...base, source };
@@ -916,9 +966,16 @@ export function buildReviewPrompt(authorization, input) {
         ]),
     "",
     "Inspect the selected lines and surrounding code, implement the smallest complete fix, and run relevant local validation.",
-    "You must create a new commit whose history descends from the submitted head, then push that commit to the already-proven existing pull request branch through the origin remote.",
-    "Use only a normal non-force push. Never force push, rewrite or amend existing history, rebase, merge, reset, switch or create branches, change remotes, push another ref, post GitHub comments, resolve review threads, or modify another worktree.",
-    "Finish only after the worktree is clean and the new commit has been pushed successfully.",
+    ...(input.agent === "codex"
+      ? [
+          "Do not create commits, push, or modify Git metadata. Puller will validate, commit, and push the intended changes after you finish.",
+          "Never rewrite history, rebase, merge, reset, switch or create branches, change remotes, post GitHub comments, resolve review threads, or modify another worktree.",
+        ]
+      : [
+          "You must create a new commit whose history descends from the submitted head, then push that commit to the already-proven existing pull request branch through the origin remote.",
+          "Use only a normal non-force push. Never force push, rewrite or amend existing history, rebase, merge, reset, switch or create branches, change remotes, push another ref, post GitHub comments, resolve review threads, or modify another worktree.",
+          "Finish only after the worktree is clean and the new commit has been pushed successfully.",
+        ]),
   ].join("\n");
 }
 
@@ -955,6 +1012,14 @@ export function reviewClaudeEnvironment(environment, temporary) {
     CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
     ENABLE_CLAUDEAI_MCP_SERVERS: "false",
     ENABLE_TOOL_SEARCH: "false",
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_OPTIONAL_LOCKS: "0",
+    GIT_SSH_COMMAND: REVIEW_SSH_COMMAND,
+    GIT_TERMINAL_PROMPT: "0",
     TEMP: temporary,
     TMP: temporary,
     TMPDIR: temporary,
@@ -1354,24 +1419,35 @@ export function createClaudeRunManager({
   createTemporary = (prefix) => mkdtemp(prefix),
   removeTemporary = (path) => rm(path, { recursive: true, force: true }),
   redactionDelay = DEFAULT_REDACTION_DELAY,
+  reviewCleanupTimeout = DEFAULT_REVIEW_CLEANUP_TIMEOUT,
   reviewPreflightTimeout = DEFAULT_REVIEW_PREFLIGHT_TIMEOUT,
   setTimer = setTimeout,
   clearTimer = clearTimeout,
   coordinator = null,
   environment = process.env,
+  reportDiagnostic = console.error,
+  prepareCodex = createCodexInvocation,
+  git = execFile,
 } = {}) {
   if (typeof loadPull !== "function")
     throw new TypeError("loadPull must be a function.");
+  if (!Number.isSafeInteger(reviewCleanupTimeout) || reviewCleanupTimeout < 1) {
+    throw new TypeError("reviewCleanupTimeout must be a positive integer.");
+  }
   if (
     !Number.isSafeInteger(reviewPreflightTimeout) ||
     reviewPreflightTimeout < 1
   ) {
     throw new TypeError("reviewPreflightTimeout must be a positive integer.");
   }
+  if (typeof reportDiagnostic !== "function") {
+    throw new TypeError("reportDiagnostic must be a function.");
+  }
   const runs = new Map();
   const pulls = new Set();
   const workspaces = new Set();
   const pendingReviews = new Set();
+  const pendingReviewSettlements = new Map();
   let pending = 0;
   const activeAutos = new Map();
   let stopping = false;
@@ -1382,6 +1458,443 @@ export function createClaudeRunManager({
       await removeTemporary(path);
     } catch {
       // Run cleanup remains best effort after the sandboxed process exits.
+    }
+  }
+
+  function reviewWorkspaceCleanup(workspace) {
+    if (typeof workspace?.cleanup !== "function") {
+      throw new ActionError(
+        500,
+        "review_workspace_invalid",
+        "The isolated review workspace is invalid.",
+      );
+    }
+    let cleaning = null;
+    return () => {
+      cleaning ??= new Promise((resolveCleanup, rejectCleanup) => {
+        let settled = false;
+        const finish = (complete) => {
+          if (settled) return;
+          settled = true;
+          clearTimer(timer);
+          complete();
+        };
+        const timer = setTimer(
+          () =>
+            finish(() =>
+              rejectCleanup(
+                new ActionError(
+                  500,
+                  "review_workspace_cleanup_failed",
+                  REVIEW_CLEANUP_FAILURE,
+                ),
+              ),
+            ),
+          reviewCleanupTimeout,
+        );
+        timer.unref?.();
+        Promise.resolve()
+          .then(() => workspace.cleanup())
+          .then(
+            () => finish(resolveCleanup),
+            () =>
+              finish(() =>
+                rejectCleanup(
+                  new ActionError(
+                    500,
+                    "review_workspace_cleanup_failed",
+                    REVIEW_CLEANUP_FAILURE,
+                  ),
+                ),
+              ),
+          );
+      });
+      return cleaning;
+    };
+  }
+
+  function reportReviewCleanup(error) {
+    const message =
+      error instanceof ActionError &&
+      error.code === "review_workspace_cleanup_failed"
+        ? error.message
+        : REVIEW_CLEANUP_FAILURE;
+    try {
+      reportDiagnostic(`[puller] ${message}`);
+    } catch {
+      // Diagnostics must not hold a completed run reservation open.
+    }
+  }
+
+  function throwIfReviewAborted(run) {
+    const signal = run.reviewController.signal;
+    if (signal.aborted) {
+      throw signal.reason ?? reviewAbortError();
+    }
+  }
+
+  function reviewAbort(error, run) {
+    return (
+      run.reviewController.signal.aborted ||
+      error?.name === "AbortError" ||
+      error?.code === "ABORT_ERR"
+    );
+  }
+
+  async function reviewGit(
+    run,
+    arguments_,
+    { signal = run.reviewController.signal } = {},
+  ) {
+    if (signal.aborted) {
+      throw signal.reason ?? reviewAbortError();
+    }
+    return git(
+      "git",
+      [...SAFE_GIT_CONFIGURATION, "-C", run.workspaceKey, ...arguments_],
+      {
+        encoding: "utf8",
+        env: {
+          LANG: "C",
+          LC_ALL: "C",
+          PATH:
+            typeof environment.PATH === "string"
+              ? environment.PATH
+              : "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_CONFIG_SYSTEM: "/dev/null",
+          GIT_TERMINAL_PROMPT: "0",
+        },
+        maxBuffer: 4 * 1024 * 1024,
+        signal,
+        windowsHide: true,
+      },
+    );
+  }
+
+  function reportPushReconciliation(status) {
+    const message =
+      status === "accepted"
+        ? "Cancellation raced an accepted push. Puller verified that GitHub now points to the new descendant commit before cleaning the isolated workspace."
+        : status === "original"
+          ? "Cancellation raced a push. Fresh GitHub authorization still showed the original head during reconciliation; refresh before retrying because remote completion may still be in flight."
+          : "Cancellation raced a push and Puller could not prove the exact remote result. Refresh the pull request before retrying.";
+    try {
+      reportDiagnostic(`[puller] ${message}`);
+    } catch {
+      // Reconciliation diagnostics cannot keep cleanup or reservations open.
+    }
+  }
+
+  function reconcileReviewPush(run) {
+    if (run.review.reconciliation) return run.review.reconciliation;
+    run.review.reconciliation = (async () => {
+      const controller = new AbortController();
+      const timer = setTimer(
+        () =>
+          controller.abort(
+            new ActionError(
+              504,
+              "review_reconciliation_timeout",
+              "Post-push reconciliation timed out.",
+            ),
+          ),
+        reviewPreflightTimeout,
+      );
+      timer.unref?.();
+      let status = "unknown";
+      try {
+        const localHead = (
+          await reviewGit(run, ["rev-parse", "--verify", "HEAD"], {
+            signal: controller.signal,
+          })
+        ).stdout
+          .trim()
+          .toLowerCase();
+        if (!SHA.test(localHead)) {
+          throw new ActionError(
+            500,
+            "review_reconciliation_failed",
+            "The local post-push head could not be proven.",
+          );
+        }
+        const proof = await waitForReview(
+          () =>
+            loadReviewAuthorization(
+              {
+                number: run.review.authorization.number,
+                repository: run.review.authorization.repository,
+              },
+              controller.signal,
+            ),
+          controller.signal,
+        );
+        if (proof?.headRefOid?.toLowerCase() === localHead) {
+          const workspace = await waitForReview(
+            () =>
+              resolver.verifyReview(run.review.workspace, {
+                expectedHeadRefOid: run.review.authorization.headRefOid,
+                signal: controller.signal,
+              }),
+            controller.signal,
+          );
+          validateReviewCompletion(
+            run.review.authorization,
+            proof,
+            workspace.headRefOid,
+          );
+          status = "accepted";
+          diffService?.invalidate?.({
+            number: run.review.authorization.number,
+            repository: run.review.authorization.repository,
+          });
+          resolver.clear?.({
+            number: run.review.authorization.number,
+            repository: run.review.authorization.repository,
+          });
+          void Promise.resolve()
+            .then(() =>
+              refreshReadiness({
+                number: run.review.authorization.number,
+                repository: run.review.authorization.repository,
+              }),
+            )
+            .catch(() => undefined);
+        } else {
+          validateReviewReauthorization(
+            run.review.authorization,
+            proof,
+            run.review.input,
+          );
+          status = "original";
+        }
+      } catch {
+        status = "unknown";
+      } finally {
+        clearTimer(timer);
+        reportPushReconciliation(status);
+      }
+      return status;
+    })();
+    return run.review.reconciliation;
+  }
+
+  async function reviewPush(run, arguments_) {
+    throwIfReviewAborted(run);
+    run.review.pushStarted = true;
+    try {
+      const result = await reviewGit(run, arguments_);
+      throwIfReviewAborted(run);
+      return result;
+    } catch (error) {
+      if (reviewAbort(error, run)) {
+        await reconcileReviewPush(run);
+      }
+      throw error;
+    }
+  }
+
+  async function proveReviewHead(cwd, expectedHeadRefOid, signal) {
+    const head = (
+      await git(
+        "git",
+        [...SAFE_GIT_CONFIGURATION, "-C", cwd, "rev-parse", "--verify", "HEAD"],
+        {
+          encoding: "utf8",
+          env: {
+            LANG: "C",
+            LC_ALL: "C",
+            PATH:
+              typeof environment.PATH === "string"
+                ? environment.PATH
+                : "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
+            GIT_CONFIG_GLOBAL: "/dev/null",
+            GIT_CONFIG_NOSYSTEM: "1",
+            GIT_CONFIG_SYSTEM: "/dev/null",
+            GIT_TERMINAL_PROMPT: "0",
+          },
+          maxBuffer: 4 * 1024 * 1024,
+          signal,
+          windowsHide: true,
+        },
+      )
+    ).stdout
+      .trim()
+      .toLowerCase();
+    if (head !== expectedHeadRefOid) {
+      throw new ActionError(
+        409,
+        "review_head_changed",
+        "The isolated worktree is not at the authorized pull request head.",
+      );
+    }
+  }
+
+  async function reauthorizeReview(run) {
+    const proof = await waitForReview(
+      () =>
+        loadReviewAuthorization(
+          {
+            number: run.review.authorization.number,
+            repository: run.review.authorization.repository,
+          },
+          run.reviewController.signal,
+        ),
+      run.reviewController.signal,
+    );
+    return validateReviewReauthorization(
+      run.review.authorization,
+      proof,
+      run.review.input,
+    );
+  }
+
+  async function publishAutoReview(run) {
+    try {
+      const initial = (
+        await reviewGit(run, ["rev-parse", "--verify", "HEAD"])
+      ).stdout
+        .trim()
+        .toLowerCase();
+      if (initial !== run.review.authorization.headRefOid) {
+        throw new ActionError(
+          409,
+          "review_head_changed",
+          "The Auto worktree head changed outside Puller's publish step.",
+        );
+      }
+      const status = await reviewGit(run, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ]);
+      if (String(status.stdout ?? "").trim() === "") {
+        throw new ActionError(
+          409,
+          "auto_unchanged",
+          "The Auto agent finished without producing a change.",
+        );
+      }
+
+      await reauthorizeReview(run);
+      throwIfReviewAborted(run);
+      await reviewGit(run, ["add", "--all"]);
+      await reauthorizeReview(run);
+      throwIfReviewAborted(run);
+      await reviewGit(run, [
+        "-c",
+        "commit.gpgSign=false",
+        "-c",
+        "user.name=Puller",
+        "-c",
+        "user.email=puller@localhost",
+        "commit",
+        "--no-verify",
+        "-m",
+        "fix: address pull request blockers",
+      ]);
+      await reauthorizeReview(run);
+      await reviewPush(run, [
+        "push",
+        "--no-verify",
+        "origin",
+        `HEAD:refs/heads/${run.review.authorization.headRefName}`,
+      ]);
+      const clean = await reviewGit(run, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ]);
+      throwIfReviewAborted(run);
+      if (String(clean.stdout ?? "").trim() !== "") {
+        throw new ActionError(
+          500,
+          "auto_publish_failed",
+          "The Auto worktree was not clean after Puller published it.",
+        );
+      }
+    } catch (error) {
+      if (
+        run.review.pushStarted &&
+        !run.review.reconciliation &&
+        reviewAbort(error, run)
+      ) {
+        await reconcileReviewPush(run);
+      }
+      throw error;
+    }
+  }
+
+  async function publishCodexReview(run) {
+    try {
+      const initial = (
+        await reviewGit(run, ["rev-parse", "--verify", "HEAD"])
+      ).stdout
+        .trim()
+        .toLowerCase();
+      if (initial !== run.review.authorization.headRefOid) {
+        throw new ActionError(
+          409,
+          "review_head_changed",
+          "The review worktree head changed outside Puller's publish step.",
+        );
+      }
+      const status = await reviewGit(run, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ]);
+      if (String(status.stdout ?? "").trim() === "") {
+        throw new ActionError(
+          409,
+          "review_unchanged",
+          "Codex finished without producing a review change.",
+        );
+      }
+      throwIfReviewAborted(run);
+      await reviewGit(run, ["add", "--all"]);
+      throwIfReviewAborted(run);
+      await reviewGit(run, [
+        "-c",
+        "commit.gpgSign=false",
+        "-c",
+        "user.name=Puller",
+        "-c",
+        "user.email=puller@localhost",
+        "commit",
+        "--no-verify",
+        "-m",
+        "fix: address review feedback",
+      ]);
+      await reviewPush(run, [
+        "push",
+        "--no-verify",
+        "origin",
+        `HEAD:refs/heads/${run.review.authorization.headRefName}`,
+      ]);
+      const clean = await reviewGit(run, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+      ]);
+      throwIfReviewAborted(run);
+      if (String(clean.stdout ?? "").trim() !== "") {
+        throw new ActionError(
+          500,
+          "review_publish_failed",
+          "The review worktree was not clean after Puller published it.",
+        );
+      }
+    } catch (error) {
+      if (
+        run.review.pushStarted &&
+        !run.review.reconciliation &&
+        reviewAbort(error, run)
+      ) {
+        await reconcileReviewPush(run);
+      }
+      throw error;
     }
   }
 
@@ -1411,7 +1924,7 @@ export function createClaudeRunManager({
       proof,
       workspace.headRefOid,
     );
-    diffService.invalidate?.({
+    diffService?.invalidate?.({
       number: run.review.authorization.number,
       repository: run.review.authorization.repository,
     });
@@ -1429,7 +1942,10 @@ export function createClaudeRunManager({
       .catch(() => undefined);
   }
 
-  function terminate(run, signal = "SIGTERM") {
+  function terminate(
+    run,
+    signal = run.agent === "codex" ? "SIGINT" : "SIGTERM",
+  ) {
     if (!run.child || run.closed) return;
     try {
       kill(-run.child.pid, signal);
@@ -1486,36 +2002,75 @@ export function createClaudeRunManager({
     }
     write(run, event);
     terminate(run);
-    if (!run.killTimer) {
+    if (run.agent === "codex" && !run.termTimer) {
+      run.termTimer = setTimer(() => {
+        run.termTimer = null;
+        terminate(run, "SIGTERM");
+        if (!run.killTimer) {
+          run.killTimer = setTimer(() => terminate(run, "SIGKILL"), killGrace);
+          run.killTimer.unref?.();
+        }
+      }, killGrace);
+      run.termTimer.unref?.();
+    } else if (run.agent !== "codex" && !run.killTimer) {
       run.killTimer = setTimer(() => terminate(run, "SIGKILL"), killGrace);
       run.killTimer.unref?.();
     }
   }
 
   function cleanup(run) {
-    if (run.closed) return;
+    if (run.cleanupPromise) return run.cleanupPromise;
     run.closed = true;
     clearTimer(run.runtimeTimer);
+    clearTimer(run.termTimer);
     clearTimer(run.killTimer);
-    runs.delete(run.id);
-    pulls.delete(run.pullKey);
-    if (activeAutos.get(run.pullKey) === run.auto) {
-      activeAutos.delete(run.pullKey);
-    }
-    if (!run.workspaceReleased) {
-      run.workspaceReleased = true;
-      workspaces.delete(run.workspaceKey);
-      run.reservation?.release();
-    }
     run.removeClose?.();
     run.removeDrain?.();
     run.child.stdout?.removeAllListeners("data");
     run.child.stdout?.removeAllListeners("end");
     run.child.stderr?.removeAllListeners("data");
     run.child.stderr?.removeAllListeners("end");
+    run.child.stdin?.removeAllListeners("error");
     run.child.removeAllListeners("error");
     run.child.removeAllListeners("close");
-    void discardTemporary(run.temporary).finally(run.resolveDone);
+    run.cleanupPromise = Promise.allSettled([
+      Promise.resolve().then(() => discardTemporary(run.temporary)),
+      Promise.resolve().then(() => run.review?.cleanup?.()),
+      Promise.resolve().then(() => run.codex?.cleanup?.()),
+    ])
+      .then((results) => {
+        const reviewCleanup = results[1];
+        if (
+          reviewCleanup?.status === "rejected" &&
+          !run.reviewCleanupReported
+        ) {
+          run.reviewCleanupReported = true;
+          reportReviewCleanup(reviewCleanup.reason);
+        }
+        if (results[2]?.status === "rejected") {
+          try {
+            reportDiagnostic(
+              "[puller] Codex runtime cleanup failed; its isolated state was preserved for inspection.",
+            );
+          } catch {
+            // Cleanup diagnostics cannot keep a terminal run active.
+          }
+        }
+      })
+      .finally(() => {
+        runs.delete(run.id);
+        pulls.delete(run.pullKey);
+        if (activeAutos.get(run.pullKey) === run.auto) {
+          activeAutos.delete(run.pullKey);
+        }
+        if (!run.workspaceReleased) {
+          run.workspaceReleased = true;
+          workspaces.delete(run.workspaceKey);
+          run.reservation?.release();
+        }
+        run.resolveDone();
+      });
+    return run.cleanupPromise;
   }
 
   async function start(value, channel) {
@@ -1527,11 +2082,13 @@ export function createClaudeRunManager({
       );
     }
     const input = validateRunInput(value, messageLimit);
+    const label = agentLabel(input.agent);
     const source = input.source ?? "manual";
+    const isolated = source === "review" || source === "auto";
     if (
-      source === "review" &&
-      (!diffService ||
-        typeof diffService.loadAuthorized !== "function" ||
+      isolated &&
+      ((source === "review" &&
+        (!diffService || typeof diffService.loadAuthorized !== "function")) ||
         typeof loadReviewAuthorization !== "function" ||
         typeof resolver?.resolveReview !== "function" ||
         typeof resolver?.verifyReview !== "function")
@@ -1539,7 +2096,7 @@ export function createClaudeRunManager({
       throw new ActionError(
         503,
         "review_runs_unavailable",
-        "Claude review tasks are unavailable.",
+        "Review tasks are unavailable.",
       );
     }
     const pullKey = `${input.repository.toLowerCase()}#${input.number}`;
@@ -1570,14 +2127,14 @@ export function createClaudeRunManager({
         throw new ActionError(
           409,
           "pull_running",
-          "A Claude Code run is already active for this pull request.",
+          "An agent run is already active for this pull request.",
         );
       }
       if (pulls.has(pullKey)) {
         throw new ActionError(
           409,
           "pull_running",
-          "A Claude Code run is already active for this pull request.",
+          "An agent run is already active for this pull request.",
         );
       }
       if (
@@ -1586,7 +2143,7 @@ export function createClaudeRunManager({
         throw new ActionError(
           409,
           "auto_running",
-          "The selected number of Auto Claude Code runs are already active.",
+          "The selected number of Auto agent runs are already active.",
         );
       }
     }
@@ -1594,14 +2151,14 @@ export function createClaudeRunManager({
       throw new ActionError(
         429,
         "run_limit",
-        `${DEFAULT_RUN_LIMIT} Claude Code runs are already active.`,
+        `${DEFAULT_RUN_LIMIT} agent runs are already active.`,
       );
     }
     if (pulls.has(pullKey)) {
       throw new ActionError(
         409,
         "pull_running",
-        "A Claude Code run is already active for this pull request.",
+        "An agent run is already active for this pull request.",
       );
     }
     const reservation =
@@ -1609,9 +2166,15 @@ export function createClaudeRunManager({
         key: `fix:${pullKey}`,
         duplicateCode: "pull_running",
         duplicateMessage:
-          "A Claude Code run is already active for this pull request.",
+          "An agent run is already active for this pull request.",
       }) ?? null;
-    const reviewController = source === "review" ? new AbortController() : null;
+    const reviewController = isolated ? new AbortController() : null;
+    let settleReviewPreflight = () => undefined;
+    const reviewPreflightDone = isolated
+      ? new Promise((resolve) => {
+          settleReviewPreflight = resolve;
+        })
+      : null;
     let activeReviewRun = null;
     const closeReview = () => {
       if (reviewController && !reviewController.signal.aborted) {
@@ -1624,25 +2187,24 @@ export function createClaudeRunManager({
         });
       }
     };
-    const removeReviewClose =
-      source === "review" ? channel.onClose?.(closeReview) : null;
-    const reviewPreflightTimer =
-      source === "review"
-        ? setTimer(
-            () =>
-              reviewController.abort(
-                new ActionError(
-                  504,
-                  "review_preflight_timeout",
-                  "The review run preflight timed out.",
-                ),
+    const removeReviewClose = isolated ? channel.onClose?.(closeReview) : null;
+    const reviewPreflightTimer = isolated
+      ? setTimer(
+          () =>
+            reviewController.abort(
+              new ActionError(
+                504,
+                "review_preflight_timeout",
+                "The review run preflight timed out.",
               ),
-            reviewPreflightTimeout,
-          )
-        : null;
+            ),
+          reviewPreflightTimeout,
+        )
+      : null;
     reviewPreflightTimer?.unref?.();
-    if (source === "review") {
+    if (isolated) {
       pendingReviews.add(reviewController);
+      pendingReviewSettlements.set(reviewController, reviewPreflightDone);
       if (channel.closed?.()) closeReview();
     }
     if (automatic !== null) activeAutos.set(pullKey, automatic);
@@ -1652,12 +2214,14 @@ export function createClaudeRunManager({
     let pull;
     let cwd;
     let child;
+    let codex = null;
     let id;
     let redactor;
     let temporary;
     let workspaceKey;
     let workspaceReserved = false;
     let review = null;
+    let releaseReviewWorkspace = null;
     try {
       let auto = null;
       if (source === "review") {
@@ -1704,12 +2268,21 @@ export function createClaudeRunManager({
             }),
           signal,
         );
+        releaseReviewWorkspace = reviewWorkspaceCleanup(workspace);
         const authorization = validateReviewReauthorization(
           diffAuthorization,
           await loadAuthorization(),
           input,
         );
-        review = { authorization, feedback, workspace };
+        review = {
+          authorization,
+          cleanup: releaseReviewWorkspace,
+          feedback,
+          input,
+          pushStarted: false,
+          reconciliation: null,
+          workspace,
+        };
         pull = {
           headRefOid: authorization.headRefOid,
           number: authorization.number,
@@ -1723,11 +2296,75 @@ export function createClaudeRunManager({
         auto = source === "auto" ? freshAutoPull(pull, input) : null;
         if (auto === null) {
           pull = freshManualPull(pull, input);
+          cwd = await resolver.resolve(input);
+        } else {
+          if (!SHA.test(pull.baseRefOid ?? "")) {
+            throw new ActionError(
+              409,
+              "snapshot_incomplete",
+              "A complete fresh pull request base is required for Auto.",
+            );
+          }
+          const signal = reviewController.signal;
+          const authorizationInput = {
+            ...input,
+            expectedBaseRefOid: pull.baseRefOid,
+          };
+          const loadAuthorization = () =>
+            waitForReview(
+              () =>
+                loadReviewAuthorization(
+                  {
+                    number: input.number,
+                    repository: input.repository,
+                  },
+                  signal,
+                ),
+              signal,
+            );
+          const initialAuthorization = validateReviewAuthorization(
+            await loadAuthorization(),
+            authorizationInput,
+            input.expectedHeadRefOid,
+          );
+          const workspace = await waitForReview(
+            () =>
+              resolver.resolveReview({
+                expectedHeadRefOid: initialAuthorization.headRefOid,
+                headRefName: initialAuthorization.headRefName,
+                number: initialAuthorization.number,
+                repository: initialAuthorization.repository,
+                signal,
+              }),
+            signal,
+          );
+          releaseReviewWorkspace = reviewWorkspaceCleanup(workspace);
+          const authorization = validateReviewReauthorization(
+            initialAuthorization,
+            await loadAuthorization(),
+            authorizationInput,
+          );
+          await waitForReview(
+            () =>
+              proveReviewHead(workspace.cwd, authorization.headRefOid, signal),
+            signal,
+          );
+          review = {
+            authorization,
+            cleanup: releaseReviewWorkspace,
+            input: authorizationInput,
+            pushStarted: false,
+            reconciliation: null,
+            workspace,
+          };
+          cwd = workspace.cwd;
         }
-        cwd = await resolver.resolve(input);
       }
       workspaceKey = await canonicalize(cwd);
-      if (stopping || channel.closed?.()) {
+      if (stopping || channel.closed?.() || reviewController?.signal.aborted) {
+        if (reviewController?.signal.aborted) {
+          throw reviewController.signal.reason ?? reviewAbortError();
+        }
         throw new ActionError(
           499,
           "client_closed",
@@ -1738,13 +2375,18 @@ export function createClaudeRunManager({
         throw new ActionError(
           409,
           "workspace_running",
-          "A Claude Code run is already active in this worktree.",
+          "An agent run is already active in this worktree.",
         );
       }
       reservation?.reserveWorkspace(workspaceKey);
       workspaces.add(workspaceKey);
       workspaceReserved = true;
-      temporary = await createTemporary(join(tmpdir(), "puller-fix-"));
+      if (input.agent === "claude") {
+        temporary = await createTemporary(join(tmpdir(), "puller-fix-"));
+      }
+      if (reviewController?.signal.aborted) {
+        throw reviewController.signal.reason ?? reviewAbortError();
+      }
 
       const prompt =
         source === "review"
@@ -1755,23 +2397,51 @@ export function createClaudeRunManager({
         cwd: workspaceKey,
         delay: redactionDelay,
       });
-      child = spawn(
-        "claude",
-        source === "review"
-          ? reviewClaudeArguments(prompt)
-          : claudeArguments(prompt, workspaceKey, temporary, environment),
-        {
-          cwd: workspaceKey,
+      if (input.agent === "codex") {
+        codex = await prepareCodex({
+          environment,
+          prompt,
+          purpose: source === "review" ? "review" : "fix",
+          target: workspaceKey,
+        });
+        child = spawn(codex.command, codex.args, {
+          cwd: codex.cwd,
           detached: true,
-          env:
-            source === "review"
-              ? reviewClaudeEnvironment(environment, temporary)
-              : claudeEnvironment(environment, temporary),
+          env: codex.environment,
           shell: false,
-          stdio: ["ignore", "pipe", "pipe"],
+          stdio: ["pipe", "pipe", "pipe"],
           windowsHide: true,
-        },
-      );
+        });
+        if (
+          !child.stdin ||
+          typeof child.stdin.end !== "function" ||
+          typeof child.stdin.once !== "function"
+        ) {
+          throw new ActionError(
+            500,
+            "codex_start_failed",
+            "Codex could not be started safely.",
+          );
+        }
+      } else {
+        child = spawn(
+          "claude",
+          source === "review"
+            ? reviewClaudeArguments(prompt)
+            : claudeArguments(prompt, workspaceKey, temporary, environment),
+          {
+            cwd: workspaceKey,
+            detached: true,
+            env:
+              source === "review"
+                ? reviewClaudeEnvironment(environment, temporary)
+                : claudeEnvironment(environment, temporary),
+            shell: false,
+            stdio: ["ignore", "pipe", "pipe"],
+            windowsHide: true,
+          },
+        );
+      }
     } catch (error) {
       clearTimer(reviewPreflightTimer);
       pendingReviews.delete(reviewController);
@@ -1779,15 +2449,28 @@ export function createClaudeRunManager({
       if (reviewController && !reviewController.signal.aborted) {
         reviewController.abort(error);
       }
-      pulls.delete(pullKey);
-      if (workspaceReserved) {
-        workspaces.delete(workspaceKey);
+      let cleanupResults;
+      try {
+        cleanupResults = await Promise.allSettled([
+          Promise.resolve().then(() => discardTemporary(temporary)),
+          Promise.resolve().then(() => releaseReviewWorkspace?.()),
+          Promise.resolve().then(() => codex?.cleanup?.()),
+        ]);
+      } finally {
+        pulls.delete(pullKey);
+        if (workspaceReserved) {
+          workspaces.delete(workspaceKey);
+        }
+        reservation?.release();
+        if (activeAutos.get(pullKey) === automatic) {
+          activeAutos.delete(pullKey);
+        }
+        pendingReviewSettlements.delete(reviewController);
+        settleReviewPreflight();
       }
-      reservation?.release();
-      if (activeAutos.get(pullKey) === automatic) {
-        activeAutos.delete(pullKey);
+      if (cleanupResults[1]?.status === "rejected") {
+        throw cleanupResults[1].reason;
       }
-      await discardTemporary(temporary);
       throw error;
     } finally {
       pending -= 1;
@@ -1797,18 +2480,23 @@ export function createClaudeRunManager({
       resolveDone = resolve;
     });
     const run = {
+      agent: input.agent,
+      codex,
+      codexCompleted: false,
       id,
       pullKey,
       workspaceKey,
       workspaceReleased: false,
       child,
       channel,
+      cleanupPromise: null,
       closed: false,
       terminal: false,
       paused: false,
       output: 0,
       runtimeTimer: null,
       killTimer: null,
+      termTimer: null,
       removeClose: null,
       removeDrain: null,
       resolveDone,
@@ -1819,28 +2507,44 @@ export function createClaudeRunManager({
       source,
       auto: automatic,
       review,
+      reviewCleanupReported: false,
       reviewController,
     };
     clearTimer(reviewPreflightTimer);
     pendingReviews.delete(reviewController);
+    pendingReviewSettlements.delete(reviewController);
+    settleReviewPreflight();
     activeReviewRun = run;
     runs.set(id, run);
 
     write(run, {
       type: "start",
+      agent: input.agent,
       runId: id,
       repository: pull.repository,
       number: pull.number,
     });
+    if (input.agent === "codex") {
+      write(run, {
+        type: "diagnostic",
+        text: "Codex 0.144.6 managed runs can access standard macOS temporary roots; repository and Git metadata restrictions remain enforced.",
+      });
+    }
 
     const limit = (message) => stop(run, { type: "limit", message });
     const decoder = createLineDecoder({
       maximum: lineLimit,
-      onLimit: () => limit("Claude Code exceeded the per-line output limit."),
+      onLimit: () => limit(`${label} exceeded the per-line output limit.`),
       onLine: (line) => {
-        for (const event of eventsForClaudeLine(line, workspaceKey)) {
+        const events =
+          input.agent === "codex"
+            ? eventsForCodexLine(line, workspaceKey)
+            : eventsForClaudeLine(line, workspaceKey);
+        for (const event of events) {
           if (event.type === "error") {
             stop(run, event);
+          } else if (event.type === "protocol") {
+            run.codexCompleted = event.status === "completed";
           } else if (event.type === "text") {
             const text = run.redactor.push(event.text);
             if (text) write(run, { ...event, text });
@@ -1853,7 +2557,7 @@ export function createClaudeRunManager({
     });
     const diagnostics = createLineDecoder({
       maximum: lineLimit,
-      onLimit: () => limit("Claude Code exceeded the per-line output limit."),
+      onLimit: () => limit(`${label} exceeded the per-line output limit.`),
       onLine: (line) => {
         if (line)
           write(run, {
@@ -1867,7 +2571,7 @@ export function createClaudeRunManager({
       if (run.terminal) return;
       run.output += chunk.byteLength;
       if (run.output > outputLimit) {
-        limit("Claude Code exceeded the total output limit.");
+        limit(`${label} exceeded the total output limit.`);
         return;
       }
       target.push(chunk);
@@ -1876,61 +2580,117 @@ export function createClaudeRunManager({
     child.stderr?.on("data", consume(diagnostics));
     child.stdout?.once("end", () => decoder.end());
     child.stderr?.once("end", () => diagnostics.end());
+    child.stdin?.once?.("error", () => {
+      stop(run, {
+        type: "error",
+        message: `${label} could not receive the run instructions.`,
+      });
+    });
     child.once("error", () => {
       stop(run, {
         type: "error",
-        message: "Claude Code could not be started.",
+        message: `${label} could not be started.`,
       });
       cleanup(run);
     });
     child.once("close", (code, signal) => {
       void (async () => {
         if (run.closed) return;
+        let terminalEvent = null;
         if (!run.terminal) {
-          if (code === 0 && run.source === "review") {
+          if (code === 0 && run.agent === "codex" && !run.codexCompleted) {
+            terminalEvent = {
+              type: "error",
+              message: "Codex exited without completing its event stream.",
+            };
+          } else if (code === 0 && run.source === "review") {
             try {
+              if (run.agent === "codex") {
+                await publishCodexReview(run);
+              }
               await completeReview(run);
-              write(run, { type: "complete", exitCode: 0 });
+              terminalEvent = { type: "complete", exitCode: 0 };
             } catch {
-              write(run, {
+              terminalEvent = {
                 type: "error",
                 message: REVIEW_VERIFICATION_FAILURE,
-              });
+              };
+            }
+          } else if (code === 0 && run.source === "auto") {
+            try {
+              await publishAutoReview(run);
+              await completeReview(run);
+              terminalEvent = { type: "complete", exitCode: 0 };
+            } catch {
+              terminalEvent = {
+                type: "error",
+                message: AUTO_VERIFICATION_FAILURE,
+              };
             }
           } else if (code === 0) {
-            write(run, { type: "complete", exitCode: 0 });
+            terminalEvent = { type: "complete", exitCode: 0 };
           } else {
-            write(run, {
+            terminalEvent = {
               type: "error",
               message: signal
-                ? "Claude Code was terminated unexpectedly."
-                : "Claude Code exited with an error.",
-            });
+                ? `${label} was terminated unexpectedly.`
+                : `${label} exited with an error.`,
+            };
           }
         }
-        cleanup(run);
+        if (run.source === "review" || run.source === "auto") {
+          try {
+            await run.review.cleanup();
+          } catch (error) {
+            run.reviewCleanupReported = true;
+            if (run.terminal) {
+              reportReviewCleanup(error);
+            } else if (terminalEvent?.type === "complete") {
+              terminalEvent = {
+                type: "error",
+                message: REVIEW_CLEANUP_RUN_FAILURE,
+              };
+            } else {
+              write(run, {
+                type: "diagnostic",
+                text: REVIEW_CLEANUP_FAILURE,
+              });
+            }
+          }
+        }
+        if (!run.terminal && terminalEvent !== null) write(run, terminalEvent);
+        await cleanup(run);
       })();
     });
 
-    run.removeClose =
-      source === "review"
-        ? removeReviewClose
-        : channel.onClose?.(() => {
-            if (!run.closed)
-              stop(run, {
-                type: "cancelled",
-                message: "The client disconnected.",
-              });
-          });
+    run.removeClose = isolated
+      ? removeReviewClose
+      : channel.onClose?.(() => {
+          if (!run.closed)
+            stop(run, {
+              type: "cancelled",
+              message: "The client disconnected.",
+            });
+        });
     run.runtimeTimer = setTimer(
       () =>
         stop(run, {
           type: "limit",
-          message: "Claude Code exceeded the run time limit.",
+          message: `${label} exceeded the run time limit.`,
         }),
       runtime,
     );
     run.runtimeTimer.unref?.();
+    if (run.agent === "codex") {
+      try {
+        child.stdin.end(run.codex.prompt);
+      } catch {
+        stop(run, {
+          type: "error",
+          message: "Codex could not receive the run instructions.",
+        });
+      }
+    }
     return { id, done };
   }
 
@@ -1944,6 +2704,7 @@ export function createClaudeRunManager({
   async function shutdown() {
     if (stopping) return;
     stopping = true;
+    const pending = [...pendingReviewSettlements.values()];
     for (const controller of pendingReviews) {
       if (!controller.signal.aborted) {
         controller.abort(
@@ -1955,8 +2716,9 @@ export function createClaudeRunManager({
     for (const run of active) {
       stop(run, { type: "cancelled", message: "Server shutting down." });
     }
-    await Promise.all(
-      active.map((run) =>
+    await Promise.all([
+      ...pending,
+      ...active.map((run) =>
         Promise.race([
           run.done,
           new Promise((resolve) => {
@@ -1965,11 +2727,17 @@ export function createClaudeRunManager({
           }),
         ]),
       ),
+    ]);
+    await Promise.all(
+      active.map(async (run) => {
+        if (!run.closed) {
+          terminate(run, "SIGKILL");
+          await cleanup(run);
+          return;
+        }
+        await run.done;
+      }),
     );
-    for (const run of active.filter((candidate) => !candidate.closed)) {
-      terminate(run, "SIGKILL");
-      cleanup(run);
-    }
   }
 
   return {
@@ -1984,6 +2752,8 @@ export function createClaudeRunManager({
 export function actionError(error) {
   if (
     error instanceof ActionError ||
+    error instanceof AgentError ||
+    error instanceof CodexError ||
     error instanceof ReviewTaskError ||
     error instanceof WorkspaceError
   ) {
@@ -1992,6 +2762,8 @@ export function actionError(error) {
   return new ActionError(
     500,
     "run_failed",
-    "The Claude Code run could not be started.",
+    "The agent run could not be started.",
   );
 }
+
+export const createAgentRunManager = createClaudeRunManager;

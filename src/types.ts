@@ -1,6 +1,13 @@
 export type CIState = "success" | "pending" | "failure" | "none" | "unknown";
 
-export type CICheckState = Exclude<CIState, "none"> | "neutral" | "skipped";
+export type Agent = "claude" | "codex";
+
+export type CICheckState =
+  | Exclude<CIState, "none">
+  | "in_progress"
+  | "neutral"
+  | "queued"
+  | "skipped";
 
 export type CICheck = {
   detailsUrl: string | null;
@@ -60,7 +67,9 @@ export type PullReadiness = {
     checks?: CICheck[];
     complete?: boolean;
     failed?: number;
+    inProgress?: number;
     passed?: number;
+    queued?: number;
     running?: number;
     state: CIState;
     total?: number;
@@ -160,6 +169,31 @@ export type PullDiff = {
   warning: string | null;
 };
 
+export type PullCommit = {
+  authorLogin: string | null;
+  authorName: string;
+  authoredAt: string;
+  message: string;
+  sha: string;
+  url: string;
+};
+
+export type PullCommits = {
+  baseRefOid: string;
+  commits: PullCommit[];
+  complete: boolean;
+  count: number;
+  headRefOid: string;
+  number: number;
+  repository: string;
+  warning: string | null;
+};
+
+export type PullCommitDiff = Omit<PullDiff, "headRefOid"> & {
+  commitSha: string;
+  headRefOid: string;
+};
+
 export type ReviewCommentSide = "LEFT" | "RIGHT";
 
 export type ReleaseRepository = {
@@ -181,6 +215,40 @@ export type ReleaseOptions = {
 
 export type ReleaseSource = "comparison" | "notes-fallback" | "unavailable";
 
+export type ReleasePipelineLookup = "complete" | "pending" | "unavailable";
+
+export type ReleasePipelineRunState =
+  | "action-required"
+  | "cancelled"
+  | "failed"
+  | "neutral"
+  | "queued"
+  | "running"
+  | "skipped"
+  | "stale"
+  | "succeeded"
+  | "timed-out"
+  | "unknown";
+
+export type ReleasePipelineRun = {
+  attempt: number;
+  createdAt: string;
+  id: string;
+  name: string;
+  path: string;
+  startedAt: string | null;
+  state: ReleasePipelineRunState;
+  updatedAt: string;
+  url: string;
+  workflowId: string;
+};
+
+export type ReleasePipeline = {
+  checkedAt: string;
+  lookup: ReleasePipelineLookup;
+  runs: ReleasePipelineRun[];
+};
+
 export type ReleasedPull = {
   headSha: string;
   mergedAt: string;
@@ -194,6 +262,7 @@ export type RecentRelease = {
   complete: boolean;
   id: string;
   name: string;
+  pipeline: ReleasePipeline;
   publishedAt: string;
   pulls: ReleasedPull[];
   repository: string;
@@ -204,6 +273,19 @@ export type RecentRelease = {
   warning: string | null;
 };
 
+export type ReleasePipelineRelease = {
+  id: string;
+  pipeline: ReleasePipeline;
+  publishedAt: string;
+  repository: string;
+  tag: string;
+};
+
+export type ReleasePipelinesResponse = {
+  generatedAt: string;
+  releases: ReleasePipelineRelease[];
+};
+
 export type RecentReleasesResponse = {
   generatedAt: string;
   partial: boolean;
@@ -212,6 +294,7 @@ export type RecentReleasesResponse = {
 };
 
 export type MergePullRequest = {
+  agent: Agent;
   expectedHeadRefOid: string;
   number: number;
   repository: string;
@@ -227,6 +310,7 @@ export type MergePullSuccessResponse = {
 
 export type MergePullRepairResponse = {
   action: {
+    agent: Agent;
     deduplicated: boolean;
     id: string;
     state: "repair_queued" | "repair_running";
@@ -254,6 +338,7 @@ export type RepairState =
 
 export type RepairSnapshot = {
   actionId: string;
+  agent: Agent;
   commit?: string;
   headRefOid: string;
   message?: string;
@@ -270,6 +355,7 @@ export type RepairEvent =
   | RepairSnapshot
   | {
       actionId: string;
+      agent: Agent;
       headRefOid: string;
       number: number;
       repository: string;
@@ -278,6 +364,7 @@ export type RepairEvent =
     }
   | {
       actionId: string;
+      agent: Agent;
       commit?: string;
       headRefOid: string;
       message?: string;
@@ -291,6 +378,7 @@ export type RepairEvent =
 
 export type CreateReleaseRequest = {
   expectedLatestTag: string | null;
+  prerelease: boolean;
   repository: string;
   tag: string;
 };
@@ -305,6 +393,7 @@ export type CreateReleaseResponse = {
 };
 
 export type VerificationRunRequest = {
+  agent: Agent;
   headSha: string;
   pullNumber: number;
   pullUrl: string;
@@ -324,6 +413,7 @@ export type VerificationRunEvent =
   | { message: string; type: "limit" };
 
 export type ReleaseVerificationRequest = {
+  agent: Agent;
   releaseId: string;
   repository: string;
   tag: string;
@@ -388,6 +478,7 @@ export type TaskPullRequest = {
 };
 
 export type Task = {
+  agent?: Agent;
   base: string;
   branch?: string;
   createdAt: string;
@@ -416,6 +507,7 @@ export type TaskOptions = {
 };
 
 export type StartTaskRequest = {
+  agent: Agent;
   base: string;
   id: string;
   prompt: string;

@@ -149,18 +149,68 @@
     @apply ring-2 ring-ring/50;
   }
 
-  .readiness-section-header {
-    box-shadow: 0 1px 0 color-mix(in oklab, var(--border) 72%, transparent);
-  }
-
   [data-comment-gutter] {
     transition:
       color 120ms ease,
       background-color 120ms ease;
   }
+
+  [data-diff-layout] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  [data-commit-layout] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+[data-dashboard-columns] {
+  transition:
+    grid-template-columns 180ms ease-out,
+    gap 180ms ease-out;
+}
+
+[data-release-column] {
+  overflow-x: clip;
+  opacity: 1;
+  transition: opacity 180ms ease-out;
+}
+
+.release-pipeline-chip {
+  max-width: min(100%, 13rem);
 }
 
 @media (min-width: 64rem) {
+  [data-diff-layout][data-navigation-visible="true"] {
+    grid-template-columns:
+      var(--diff-navigation-width, 14rem) 0.375rem
+      minmax(0, 1fr);
+  }
+
+  [data-diff-layout][data-navigation-visible="false"] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  [data-commit-layout][data-list-visible="true"] {
+    grid-template-columns:
+      var(--commit-list-width, 15rem) 0.375rem
+      minmax(0, 1fr);
+  }
+
+  [data-commit-layout][data-list-visible="false"] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  [data-dashboard-columns][data-release-panel-expanded="false"] {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 0fr);
+    gap: 0;
+  }
+
+  [data-dashboard-columns][data-release-panel-expanded="false"]
+    [data-release-column] {
+    opacity: 0;
+  }
+
   [data-release-column] {
     position: sticky;
     top: 1.25rem;
@@ -181,6 +231,11 @@
 }
 
 @media (max-width: 63.999rem) {
+  [data-dashboard-columns][data-release-panel-expanded="false"]
+    [data-release-column] {
+    display: none;
+  }
+
   [data-release-column],
   [data-recent-releases],
   [data-release-scroll-body] {
@@ -222,5 +277,10 @@
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+
+  [data-dashboard-columns],
+  [data-release-column] {
+    transition: none !important;
   }
 }

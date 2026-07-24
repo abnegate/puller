@@ -16,9 +16,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   RecentRelease,
   RecentReleasesResponse,
+  ReleasePipeline,
+  ReleasePipelineRun,
+  ReleasePipelineRunState,
+  ReleaseVerificationEvent,
   VerificationRunEvent,
   VerificationRunRequest,
-  ReleaseVerificationEvent,
 } from "@/types";
 import RecentReleases, { groupReleasesByDate } from "./RecentReleases";
 
@@ -52,6 +55,11 @@ const release = (
   complete: source === "comparison",
   id,
   name: `Release ${id}`,
+  pipeline: {
+    checkedAt: "2026-07-21T08:00:00.000Z",
+    lookup: "complete",
+    runs: [],
+  },
   publishedAt: "2026-07-21T07:00:00.000Z",
   pulls:
     source === "unavailable"
@@ -77,6 +85,37 @@ const release = (
       : source === "unavailable"
         ? "Membership could not be verified."
         : null,
+});
+
+const withPipeline = (
+  item: RecentRelease,
+  pipeline: Partial<ReleasePipeline>,
+): RecentRelease =>
+  ({
+    ...item,
+    pipeline: {
+      checkedAt: "2026-07-21T08:00:00.000Z",
+      lookup: "complete",
+      runs: [],
+      ...pipeline,
+    },
+  }) satisfies RecentRelease;
+
+const pipelineRun = (
+  state: ReleasePipelineRunState,
+  change: Partial<ReleasePipelineRun> = {},
+): ReleasePipelineRun => ({
+  attempt: 2,
+  createdAt: "2026-07-21T07:20:00.000Z",
+  id: "123",
+  name: "Deploy Edge",
+  path: ".github/workflows/deploy-edge.yml",
+  startedAt: "2026-07-21T07:25:00.000Z",
+  state,
+  updatedAt: "2026-07-21T07:30:00.000Z",
+  url: "https://github.com/appwrite/cloud/actions/runs/123",
+  workflowId: "deploy-edge",
+  ...change,
 });
 
 const response = (releases: RecentRelease[]): RecentReleasesResponse => ({
@@ -254,6 +293,214 @@ describe("RecentReleases", () => {
     expect(reopen.querySelector("svg")).not.toHaveClass("rotate-180");
   });
 
+  it.each([
+    ["running", "Deploying", "text-amber-700", true],
+    ["queued", "Queued", "text-amber-700", false],
+    ["failed", "Failed", "text-destructive", false],
+    ["timed-out", "Timed out", "text-destructive", false],
+    ["action-required", "Action required", "text-destructive", false],
+    ["stale", "Stale", "text-muted-foreground", false],
+    ["cancelled", "Cancelled", "text-muted-foreground", false],
+    ["skipped", "Skipped", "text-muted-foreground", false],
+    ["neutral", "Neutral", "text-muted-foreground", false],
+    ["unknown", "Unknown", "text-muted-foreground", false],
+  ] as const)(
+    "renders the %s pipeline state textually without relying on color",
+    (state, label, tone, spins) => {
+      const item = withPipeline(release("one"), {
+        runs: [pipelineRun(state)],
+      });
+      const view = render(
+        <RecentReleases
+          data={response([item])}
+          error={null}
+          loading={false}
+          onRefresh={vi.fn()}
+        />,
+      );
+
+      const link = view.container.querySelector<HTMLAnchorElement>(
+        `[data-pipeline-state="${state}"]`,
+      )!;
+      const precise = new Date("2026-07-21T07:30:00.000Z").toLocaleString();
+      expect(link).toHaveTextContent(`Deploy Edge${label}`);
+      expect(link).toHaveClass(tone);
+      expect(link).toHaveAttribute(
+        "aria-label",
+        `Deploy Edge: ${label}, attempt 2, updated ${precise}`,
+      );
+      expect(link).toHaveAttribute(
+        "title",
+        `Deploy Edge: ${label}, attempt 2, updated ${precise}`,
+      );
+      expect(link).toHaveAttribute(
+        "href",
+        "https://github.com/appwrite/cloud/actions/runs/123",
+      );
+      expect(link).toHaveAttribute("target", "_blank");
+      expect(link).toHaveAttribute("rel", "noopener noreferrer");
+      expect(link.querySelector("svg")).toHaveClass(
+        ...(spins
+          ? ["animate-spin", "motion-reduce:animate-none"]
+          : ["size-3"]),
+      );
+      if (state === "skipped" || state === "neutral") {
+        expect(link).not.toHaveClass("text-destructive");
+      }
+      expect(link.closest("[aria-live='polite']")).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", {
+          name: "Show 1 pull request in v1.2.3",
+        }),
+      ).toHaveAttribute("aria-expanded", "false");
+    },
+  );
+
+  it("renders a successful workflow as deployed with its humanized update time", () => {
+    const item = withPipeline(release("one"), {
+      runs: [pipelineRun("succeeded")],
+    });
+    const view = render(
+      <RecentReleases
+        data={response([item])}
+        error={null}
+        loading={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    const link = view.container.querySelector<HTMLAnchorElement>(
+      '[data-pipeline-state="succeeded"]',
+    )!;
+    expect(link).toHaveClass("text-emerald-700");
+    expect(link).toHaveTextContent(/^Deploy EdgeDeployed /);
+    expect(link).toHaveAccessibleName(
+      /^Deploy Edge: Deployed .+, attempt 2, updated /,
+    );
+    expect(link.querySelector("svg")).not.toHaveClass("animate-spin");
+  });
+
+  it("labels a successful non-deployment release workflow as succeeded", () => {
+    const item = withPipeline(release("one"), {
+      runs: [
+        pipelineRun("succeeded", {
+          name: "Publish packages",
+          path: ".github/workflows/publish.yml",
+        }),
+      ],
+    });
+    const view = render(
+      <RecentReleases
+        data={response([item])}
+        error={null}
+        loading={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    expect(
+      view.container.querySelector('[data-pipeline-state="succeeded"]'),
+    ).toHaveTextContent(/^Publish packagesSucceeded /);
+  });
+
+  it("keeps empty pipeline lookup states quiet and omits a complete empty lookup", () => {
+    const view = render(
+      <RecentReleases
+        data={response([withPipeline(release("one"), {})])}
+        error={null}
+        loading={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    expect(
+      view.container.querySelector("[data-release-pipeline]"),
+    ).not.toBeInTheDocument();
+    expect(
+      view.container.querySelector("[data-release-pipeline-empty]"),
+    ).not.toBeInTheDocument();
+
+    view.rerender(
+      <RecentReleases
+        data={response([withPipeline(release("one"), { lookup: "pending" })])}
+        error={null}
+        loading={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+    const pending = screen.getByText("Waiting for pipeline");
+    expect(pending).toHaveClass("text-amber-700");
+    expect(pending).toHaveAttribute("aria-live", "polite");
+
+    view.rerender(
+      <RecentReleases
+        data={response([
+          withPipeline(release("one"), { lookup: "unavailable" }),
+        ])}
+        error={null}
+        loading={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+    const unavailable = screen.getByText("Pipeline status unavailable");
+    expect(unavailable).toHaveClass("text-muted-foreground");
+    expect(unavailable).toHaveAttribute("aria-live", "polite");
+  });
+
+  it("keeps distinct workflow links compact, stale-aware, and independent of release expansion", () => {
+    const item = withPipeline(release("one"), {
+      lookup: "unavailable",
+      runs: [
+        pipelineRun("succeeded"),
+        pipelineRun("running", {
+          attempt: 4,
+          name: "Deploy Edge Database",
+          path: ".github/workflows/deploy-edge-database.yml",
+          url: "https://github.com/appwrite/cloud/actions/runs/456",
+        }),
+      ],
+    });
+    const view = render(
+      <RecentReleases
+        data={response([item])}
+        error={null}
+        loading={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+    const toggle = screen.getByRole("button", {
+      name: "Show 1 pull request in v1.2.3",
+    });
+    const pipeline = view.container.querySelector<HTMLElement>(
+      "[data-release-pipeline]",
+    )!;
+    const links = pipeline.querySelectorAll<HTMLAnchorElement>(
+      ".release-pipeline-chip",
+    );
+
+    expect(pipeline).toHaveClass("min-w-0", "max-w-full", "flex-wrap");
+    expect(pipeline.closest("[data-slot='card-header']")).toHaveClass("py-2.5");
+    expect(links).toHaveLength(2);
+    expect(links[0]).toHaveTextContent("Deploy Edge");
+    expect(links[1]).toHaveTextContent("Deploy Edge Database");
+    expect(links[0]).toHaveClass(
+      "release-pipeline-chip",
+      "min-w-0",
+      "max-w-full",
+    );
+    expect(links[1]?.querySelector("span.min-w-0")).toHaveClass("truncate");
+    expect(screen.getByText("Status unavailable")).toHaveAttribute(
+      "data-release-pipeline-stale",
+    );
+
+    fireEvent.click(links[0]!);
+    fireEvent.click(links[1]!);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(
+      screen.queryByRole("list", { name: "Pull requests in Release one" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("expands releases independently and preserves each state across reorder", () => {
     const first = release("one");
     const second = release("two");
@@ -356,6 +603,7 @@ describe("RecentReleases", () => {
     );
     expect(body).not.toContainElement(header);
     expect(dateHeading).toHaveClass("release-date-heading", "sticky");
+    expect(dateHeading?.nextElementSibling).toHaveClass("pl-1");
   });
 
   it("paginates 21 releases after slicing and retains the date heading at the boundary", () => {
@@ -670,9 +918,11 @@ describe("RecentReleases", () => {
     ): AsyncGenerator<ReleaseVerificationEvent, void, undefined> {
       const pull = item.pulls[0]!;
       yield {
+        agent: "claude",
         batchId: "batch-hidden",
         pulls: [
           {
+            agent: "claude",
             headSha: pull.headSha,
             pullNumber: pull.number,
             pullUrl: pull.url,
@@ -773,6 +1023,7 @@ describe("RecentReleases", () => {
       undefined
     > {
       const pulls = item.pulls.map((pull) => ({
+        agent: "claude" as const,
         headSha: pull.headSha,
         pullNumber: pull.number,
         pullUrl: pull.url,
@@ -781,6 +1032,7 @@ describe("RecentReleases", () => {
         tag: item.tag,
       }));
       yield {
+        agent: "claude",
         batchId: "batch-1",
         pulls,
         releaseId: item.id,
@@ -829,6 +1081,7 @@ describe("RecentReleases", () => {
     await waitFor(() => expect(api.streamBatch).toHaveBeenCalledTimes(1));
     expect(api.streamBatch).toHaveBeenCalledWith(
       {
+        agent: "claude",
         releaseId: item.id,
         repository: item.repository,
         tag: item.tag,
@@ -854,9 +1107,11 @@ describe("RecentReleases", () => {
     > {
       const pull = item.pulls[0]!;
       yield {
+        agent: "claude",
         batchId: "batch-then-row",
         pulls: [
           {
+            agent: "claude",
             headSha: pull.headSha,
             pullNumber: pull.number,
             pullUrl: pull.url,
@@ -937,6 +1192,115 @@ describe("RecentReleases", () => {
     );
   });
 
+  it("keeps an active direct verification authoritative and blocks Verify all until it finishes", async () => {
+    const item = { ...release("one"), id: "123" };
+    api.cancel.mockResolvedValue(undefined);
+    let finishDirect!: () => void;
+    const directGate = new Promise<void>((resolve) => {
+      finishDirect = resolve;
+    });
+    api.stream.mockImplementation(async function* (
+      request: VerificationRunRequest,
+    ): AsyncGenerator<VerificationRunEvent, void, undefined> {
+      yield { ...request, runId: "direct-claude", type: "start" };
+      yield { text: "Claude direct output.\n", type: "text" };
+      await directGate;
+      yield { exitCode: 0, type: "complete" };
+    });
+    api.streamBatch.mockImplementation(async function* (request: {
+      agent: "claude" | "codex";
+      releaseId: string;
+      repository: string;
+      tag: string;
+    }): AsyncGenerator<ReleaseVerificationEvent, void, undefined> {
+      const pull = item.pulls[0]!;
+      yield {
+        ...request,
+        batchId: "codex-after-direct",
+        pulls: [
+          {
+            ...request,
+            headSha: pull.headSha,
+            pullNumber: pull.number,
+            pullUrl: pull.url,
+          },
+        ],
+        type: "batch-start",
+      };
+      yield {
+        batchId: "codex-after-direct",
+        event: { exitCode: 0, type: "complete" },
+        headSha: pull.headSha,
+        pullNumber: pull.number,
+        pullUrl: pull.url,
+        state: "complete",
+        type: "verification",
+      };
+      yield {
+        batchId: "codex-after-direct",
+        totals: { complete: 1, error: 0, existing: 0, total: 1 },
+        type: "complete",
+      };
+    });
+    const view = render(
+      <RecentReleases
+        agent="claude"
+        data={response([item])}
+        error={null}
+        loading={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+    expandRelease(item.tag);
+    fireEvent.click(screen.getByRole("button", { name: "Verify" }));
+    expect(
+      await screen.findByRole("log", {
+        name: "Claude verification output for appwrite/cloud #41",
+      }),
+    ).toHaveTextContent("Claude direct output.");
+
+    view.rerender(
+      <RecentReleases
+        agent="codex"
+        data={response([item])}
+        error={null}
+        loading={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+    const verifyAll = screen.getByRole("button", {
+      name: "Verify all pull requests in Release one",
+    });
+    expect(verifyAll).toBeDisabled();
+    fireEvent.click(verifyAll);
+    expect(api.streamBatch).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("log", {
+        name: "Claude verification output for appwrite/cloud #41",
+      }),
+    ).toHaveTextContent("Claude direct output.");
+    expect(
+      screen.getByRole("button", {
+        name: "Cancel verification for appwrite/cloud #41",
+      }),
+    ).toBeEnabled();
+
+    await act(async () => finishDirect());
+    await waitFor(() => expect(verifyAll).toBeEnabled());
+    fireEvent.click(verifyAll);
+
+    await waitFor(() => expect(api.streamBatch).toHaveBeenCalledTimes(1));
+    expect(api.streamBatch).toHaveBeenCalledWith(
+      {
+        agent: "codex",
+        releaseId: item.id,
+        repository: item.repository,
+        tag: item.tag,
+      },
+      expect.any(AbortSignal),
+    );
+  });
+
   it("enables one guarded batch request for the real notes-fallback release shape", async () => {
     const item: RecentRelease = {
       ...release("one", "notes-fallback"),
@@ -955,9 +1319,11 @@ describe("RecentReleases", () => {
     > {
       const pull = item.pulls[0]!;
       yield {
+        agent: "claude",
         batchId: "batch-notes",
         pulls: [
           {
+            agent: "claude",
             headSha: pull.headSha,
             pullNumber: pull.number,
             pullUrl: pull.url,
@@ -1004,6 +1370,7 @@ describe("RecentReleases", () => {
     await waitFor(() => expect(api.streamBatch).toHaveBeenCalledTimes(1));
     expect(api.streamBatch).toHaveBeenCalledWith(
       {
+        agent: "claude",
         releaseId: "10",
         repository: "appwrite/cloud",
         tag: "v1.2.4",
@@ -1023,9 +1390,11 @@ describe("RecentReleases", () => {
     ): AsyncGenerator<ReleaseVerificationEvent, void, undefined> {
       const pull = item.pulls[0]!;
       yield {
+        agent: "claude",
         batchId: "batch-controls",
         pulls: [
           {
+            agent: "claude",
             headSha: pull.headSha,
             pullNumber: pull.number,
             pullUrl: pull.url,
@@ -1329,6 +1698,7 @@ describe("RecentReleases", () => {
 
     expect(api.stream).toHaveBeenCalledWith(
       {
+        agent: "claude",
         headSha: first.pulls[0]!.headSha,
         pullNumber: first.pulls[0]!.number,
         pullUrl: first.pulls[0]!.url,
@@ -1380,6 +1750,7 @@ describe("RecentReleases", () => {
     await waitFor(() =>
       expect(api.stream).toHaveBeenCalledWith(
         {
+          agent: "claude",
           headSha: item.pulls[0]!.headSha,
           pullNumber: item.pulls[0]!.number,
           pullUrl: item.pulls[0]!.url,
@@ -1480,6 +1851,7 @@ describe("RecentReleases", () => {
         undefined
       > {
         yield {
+          agent: "claude",
           batchId: "batch-retry",
           pulls: [],
           releaseId: item.id,

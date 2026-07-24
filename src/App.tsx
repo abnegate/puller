@@ -6,7 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { RefreshCw } from "lucide-react";
+import { PanelRightClose, PanelRightOpen, RefreshCw } from "lucide-react";
 import {
   AnimatePresence,
   LayoutGroup,
@@ -14,8 +14,10 @@ import {
   useReducedMotion,
 } from "motion/react";
 
+import { useAgentPreference } from "./agent";
 import { getPulls, getRecentReleases } from "./api";
 import { useAuto, type AutoController } from "./auto";
+import AgentToggle from "./components/AgentToggle";
 import HiddenPullsMenu, { type HiddenPull } from "./components/HiddenPullsMenu";
 import NewTaskForm from "./components/NewTaskForm";
 import ReadinessSection from "./components/ReadinessSection";
@@ -60,13 +62,26 @@ import {
   type ReadinessRank,
 } from "./movements";
 import { getPullKey, selectPullView, usePullPreferences } from "./preferences";
+import { useReleasePanelPreference } from "./release-panel";
+import {
+  applyReleasePipelineSnapshot,
+  useReleasePipelinePolling,
+} from "./release-pipelines";
+import {
+  PullRowContinuityProvider,
+  usePullRowContinuity,
+} from "./row-continuity";
 import {
   groupPulls,
-  isRunActive,
+  isRunExecuting,
   reconcilePulls,
   usePullRuns,
   type RunState,
 } from "./runs";
+import {
+  browserRunTranscriptStore,
+  type RunTranscriptStore,
+} from "./run-transcripts";
 import { ThemeProvider } from "./theme";
 import { isTaskActive, useTasks, type TaskState } from "./tasks";
 import type {
@@ -75,10 +90,15 @@ import type {
   PullReadiness,
   PullsResponse,
   RecentReleasesResponse,
+  ReleasePipelinesResponse,
 } from "./types";
 import { reconcileRecentReleases } from "./verifications";
 
 const REFRESH_INTERVAL = 10_000;
+const REFRESH_CATCH_UP_INTERVAL = 1_000;
+const REFRESH_BACKOFFS = [10_000, 20_000, 40_000, 80_000, 120_000] as const;
+const RELEASE_REFRESH_INTERVAL = 5 * 60_000;
+const CONTINUITY_CONTROL_KEY = "\0pull-row-continuity";
 const PULL_ID = String.raw`[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9._-]+#[1-9]\d*`;
 const SILENT_REVALIDATION_NOTICE = new RegExp(
   String.raw`^GitHub (?:(?:(?:changed CI while refreshing|returned (?:conflicting(?: CI)? state|incomplete evidence) for|could not refresh) ${PULL_ID})|(?:could not completely revalidate (?:this pull request|${PULL_ID})))(?:; (?:readiness|the pull request) was (?:marked incomplete|not updated))?\.$`,
@@ -98,6 +118,9 @@ const formatSnapshot = (snapshotAt: string): string => {
     ? "time unavailable"
     : snapshotFormatter.format(date);
 };
+
+const refreshBackoff = (failures: number): number =>
+  REFRESH_BACKOFFS[Math.min(failures, REFRESH_BACKOFFS.length - 1)]!;
 
 const getErrorText = (error: unknown, fallback: string): string =>
   error instanceof Error ? error.message : fallback;
@@ -119,6 +142,14 @@ type PullRequest = {
   controller: AbortController;
   generation: number;
   kind: PullLoadKind;
+};
+
+type RecentLoadKind = "background" | "initial" | "manual";
+
+type RecentRequest = {
+  controller: AbortController;
+  generation: number;
+  kind: RecentLoadKind;
 };
 
 type ArtifactProof = {
@@ -148,7 +179,7 @@ export const countActiveLocalWork = (
   const active = new Set<string>();
 
   for (const pull of pulls) {
-    if (isRunActive(runs.get(pull.url))) active.add(getPullKey(pull));
+    if (isRunExecuting(runs.get(pull.url))) active.add(getPullKey(pull));
   }
 
   for (const state of tasks) {
@@ -262,8 +293,16 @@ function AutoControl({
   );
 }
 
-function Dashboard() {
+function Dashboard({
+  runTranscriptStore,
+}: {
+  runTranscriptStore: RunTranscriptStore;
+}) {
   const reducedMotion = useReducedMotion();
+  const { agent, setAgent } = useAgentPreference();
+  const releasePanel = useReleasePanelPreference();
+  const { prune: pruneRowContinuity, remove: removeRowContinuity } =
+    usePullRowContinuity(CONTINUITY_CONTROL_KEY);
   const [artifactProof, setArtifactProof] = useState<ArtifactProof>({
     epoch: 0,
     viewerLogin: null,
@@ -276,13 +315,19 @@ function Dashboard() {
   const [recent, setRecent] = useState<RecentReleasesResponse | null>(null);
   const [recentError, setRecentError] = useState<string | null>(null);
   const [recentLoading, setRecentLoading] = useState(false);
+  const [pipelineRefreshRevision, setPipelineRefreshRevision] = useState(0);
   const [viewedFiles, setViewedFiles] = useState<ViewedFilesByPull>(
     () => EMPTY_VIEWED_FILES_BY_PULL,
   );
   const refreshTimer = useRef<number | null>(null);
+  const pullDeadline = useRef<number | null>(null);
+  const pullFailures = useRef(0);
+  const pullGeneratedAt = useRef<string | null>(null);
   const pullRequest = useRef<PullRequest | null>(null);
   const pullGeneration = useRef(0);
-  const recentController = useRef<AbortController | null>(null);
+  const recentTimer = useRef<number | null>(null);
+  const recentDeadline = useRef<number | null>(null);
+  const recentRequest = useRef<RecentRequest | null>(null);
   const recentGeneration = useRef(0);
   const movementTimer = useRef<number | null>(null);
   const movementTracker = useRef(new PullMovementTracker());
@@ -291,6 +336,23 @@ function Dashboard() {
   const loadRef = useRef<(kind?: PullLoadKind) => Promise<void>>(
     async () => undefined,
   );
+  const loadRecentRef = useRef<(kind?: RecentLoadKind) => Promise<void>>(
+    async () => undefined,
+  );
+  const applyPipelineSnapshot = useCallback(
+    (snapshot: ReleasePipelinesResponse) => {
+      setRecent((current) =>
+        applyReleasePipelineSnapshot(current, snapshot),
+      );
+    },
+    [],
+  );
+  useReleasePipelinePolling({
+    enabled: releasePanel.expanded,
+    onSnapshot: applyPipelineSnapshot,
+    refreshRevision: pipelineRefreshRevision,
+    releases: recent?.releases ?? [],
+  });
 
   const clearRefreshTimer = useCallback(() => {
     if (refreshTimer.current !== null) {
@@ -299,42 +361,103 @@ function Dashboard() {
     }
   }, []);
 
-  const scheduleRefresh = useCallback(() => {
-    clearRefreshTimer();
-    if (document.visibilityState !== "visible") return;
+  const scheduleRefresh = useCallback(
+    (deadline = Date.now() + REFRESH_INTERVAL) => {
+      clearRefreshTimer();
+      pullDeadline.current = deadline;
+      if (document.visibilityState !== "visible") return;
 
-    refreshTimer.current = window.setTimeout(() => {
-      refreshTimer.current = null;
-      if (document.visibilityState === "visible") {
-        void loadRef.current("automatic");
-      }
-    }, REFRESH_INTERVAL);
-  }, [clearRefreshTimer]);
+      refreshTimer.current = window.setTimeout(
+        () => {
+          refreshTimer.current = null;
+          if (document.visibilityState === "visible") {
+            void loadRef.current("automatic");
+          }
+        },
+        Math.max(0, deadline - Date.now()),
+      );
+    },
+    [clearRefreshTimer],
+  );
+
+  const clearRecentTimer = useCallback(() => {
+    if (recentTimer.current !== null) {
+      window.clearTimeout(recentTimer.current);
+      recentTimer.current = null;
+    }
+  }, []);
+
+  const scheduleRecentRefresh = useCallback(
+    (deadline = Date.now() + RELEASE_REFRESH_INTERVAL) => {
+      clearRecentTimer();
+      recentDeadline.current = deadline;
+      if (document.visibilityState !== "visible") return;
+
+      recentTimer.current = window.setTimeout(
+        () => {
+          recentTimer.current = null;
+          if (document.visibilityState === "visible") {
+            void loadRecentRef.current("background");
+          }
+        },
+        Math.max(0, deadline - Date.now()),
+      );
+    },
+    [clearRecentTimer],
+  );
 
   const load = useCallback(
     async (kind: PullLoadKind = "initial") => {
-      clearRefreshTimer();
-
       const active = pullRequest.current;
       if (active) {
-        if (kind === "automatic" || kind === "initial") return;
+        if (
+          kind === "automatic" ||
+          kind === "initial" ||
+          kind === "visibility"
+        ) {
+          return;
+        }
         if (active.kind === "manual") setRefreshing(false);
         active.controller.abort();
       }
 
+      clearRefreshTimer();
       const controller = new AbortController();
       const generation = ++pullGeneration.current;
       pullRequest.current = { controller, generation, kind };
       if (kind === "initial") setInitialLoading(true);
       if (kind === "manual") setRefreshing(true);
+      let deadline: number | undefined;
 
       try {
-        const next = await getPulls(kind !== "initial", controller.signal);
+        const next = await getPulls(
+          kind === "manual" || kind === "mutation",
+          controller.signal,
+        );
+        const completedAt = Date.now();
         if (
           !mounted.current ||
           pullRequest.current?.generation !== generation
         ) {
           return;
+        }
+
+        if (next.stale) {
+          deadline = completedAt + refreshBackoff(pullFailures.current);
+          pullFailures.current = Math.min(
+            pullFailures.current + 1,
+            REFRESH_BACKOFFS.length,
+          );
+        } else {
+          const generatedDeadline =
+            Date.parse(next.generatedAt) + REFRESH_INTERVAL;
+          deadline =
+            generatedDeadline <= completedAt &&
+            pullGeneratedAt.current === next.generatedAt
+              ? completedAt + REFRESH_CATCH_UP_INTERVAL
+              : generatedDeadline;
+          pullGeneratedAt.current = next.generatedAt;
+          pullFailures.current = 0;
         }
 
         const pulls = [...next.ready, ...next.notReady];
@@ -365,6 +488,9 @@ function Dashboard() {
           return { epoch: current.epoch + 1, viewerLogin: viewer };
         });
 
+        if (!next.partial && !next.stale && viewer !== null) {
+          pruneRowContinuity(new Set(visible.map(getPullKey)));
+        }
         setCurrentPulls((current) =>
           reconcilePulls(current, visible, !next.partial && !next.stale),
         );
@@ -373,108 +499,178 @@ function Dashboard() {
       } catch (loadError) {
         if (
           mounted.current &&
-          pullRequest.current?.generation === generation &&
-          !isAbortError(loadError)
+          pullRequest.current?.generation === generation
         ) {
-          setArtifactProof((current) =>
-            current.viewerLogin === null
-              ? current
-              : { epoch: current.epoch + 1, viewerLogin: null },
+          deadline = Date.now() + refreshBackoff(pullFailures.current);
+          pullFailures.current = Math.min(
+            pullFailures.current + 1,
+            REFRESH_BACKOFFS.length,
           );
-          setError(
-            getErrorText(
-              loadError,
-              "The readiness service could not be reached.",
-            ),
-          );
+          if (!isAbortError(loadError)) {
+            setArtifactProof((current) =>
+              current.viewerLogin === null
+                ? current
+                : { epoch: current.epoch + 1, viewerLogin: null },
+            );
+            setError(
+              getErrorText(
+                loadError,
+                "The readiness service could not be reached.",
+              ),
+            );
+          }
         }
       } finally {
         if (mounted.current && pullRequest.current?.generation === generation) {
           pullRequest.current = null;
           if (kind === "manual") setRefreshing(false);
           setInitialLoading(false);
-          scheduleRefresh();
+          scheduleRefresh(deadline);
         }
       }
     },
-    [clearRefreshTimer, scheduleRefresh],
+    [clearRefreshTimer, pruneRowContinuity, scheduleRefresh],
   );
 
   loadRef.current = load;
 
-  const loadRecent = useCallback(async (refresh = false) => {
-    if (recentController.current && !refresh) return;
-    recentController.current?.abort();
-    const controller = new AbortController();
-    const generation = ++recentGeneration.current;
-    recentController.current = controller;
-    setRecentLoading(true);
+  const loadRecent = useCallback(
+    async (kind: RecentLoadKind = "initial") => {
+      const active = recentRequest.current;
+      if (active) {
+        if (kind !== "manual" || active.kind === "manual") return;
+        active.controller.abort();
+      }
 
-    try {
-      const next = await getRecentReleases(refresh, controller.signal);
-      if (!mounted.current || generation !== recentGeneration.current) return;
+      clearRecentTimer();
+      const controller = new AbortController();
+      const generation = ++recentGeneration.current;
+      recentRequest.current = { controller, generation, kind };
+      if (kind !== "background") setRecentLoading(true);
 
-      setRecent((current) => reconcileRecentReleases(current, next));
-      setRecentError(null);
-    } catch (loadError) {
-      if (
-        mounted.current &&
-        generation === recentGeneration.current &&
-        !isAbortError(loadError)
-      ) {
-        setRecentError(
-          getErrorText(loadError, "The release service could not be reached."),
+      try {
+        const next = await getRecentReleases(
+          kind === "manual",
+          controller.signal,
         );
+        if (
+          !mounted.current ||
+          recentRequest.current?.generation !== generation
+        ) {
+          return;
+        }
+
+        setRecent((current) => reconcileRecentReleases(current, next));
+        setPipelineRefreshRevision((revision) => revision + 1);
+        setRecentError(null);
+      } catch (loadError) {
+        if (
+          kind !== "background" &&
+          mounted.current &&
+          recentRequest.current?.generation === generation &&
+          !isAbortError(loadError)
+        ) {
+          setRecentError(
+            getErrorText(
+              loadError,
+              "The release service could not be reached.",
+            ),
+          );
+        }
+      } finally {
+        if (
+          mounted.current &&
+          recentRequest.current?.generation === generation
+        ) {
+          recentRequest.current = null;
+          if (kind !== "background") setRecentLoading(false);
+          scheduleRecentRefresh();
+        }
       }
-    } finally {
-      if (mounted.current && generation === recentGeneration.current) {
-        recentController.current = null;
-        setRecentLoading(false);
-      }
-    }
-  }, []);
+    },
+    [clearRecentTimer, scheduleRecentRefresh],
+  );
+
+  loadRecentRef.current = loadRecent;
 
   useEffect(() => {
     mounted.current = true;
     void loadRef.current("initial");
-    void loadRecent(false);
+    void loadRecentRef.current("initial");
 
     return () => {
       mounted.current = false;
       clearRefreshTimer();
+      clearRecentTimer();
       queueMicrotask(() => {
         if (mounted.current) return;
 
         pullGeneration.current += 1;
         pullRequest.current?.controller.abort();
         pullRequest.current = null;
+        pullDeadline.current = null;
+        pullGeneratedAt.current = null;
         recentGeneration.current += 1;
-        recentController.current?.abort();
-        recentController.current = null;
+        recentRequest.current?.controller.abort();
+        recentRequest.current = null;
+        recentDeadline.current = null;
       });
     };
-  }, [clearRefreshTimer, loadRecent]);
+  }, [clearRecentTimer, clearRefreshTimer]);
 
   useEffect(() => {
-    const handleVisibility = () => {
+    const handleVisibleResume = () => {
       clearRefreshTimer();
-      if (document.visibilityState === "visible") {
+      clearRecentTimer();
+      if (document.visibilityState !== "visible") return;
+
+      const pullDue = pullDeadline.current;
+      if (pullDue === null || pullDue <= Date.now()) {
         void loadRef.current("visibility");
+      } else {
+        scheduleRefresh(pullDue);
+      }
+
+      const recentDue = recentDeadline.current;
+      if (recentDue === null || recentDue <= Date.now()) {
+        void loadRecentRef.current("background");
+      } else {
+        scheduleRecentRefresh(recentDue);
       }
     };
 
-    document.addEventListener("visibilitychange", handleVisibility);
+    document.addEventListener("visibilitychange", handleVisibleResume);
+    window.addEventListener("focus", handleVisibleResume);
     return () => {
-      document.removeEventListener("visibilitychange", handleVisibility);
+      document.removeEventListener("visibilitychange", handleVisibleResume);
+      window.removeEventListener("focus", handleVisibleResume);
       clearRefreshTimer();
+      clearRecentTimer();
     };
-  }, [clearRefreshTimer]);
+  }, [
+    clearRecentTimer,
+    clearRefreshTimer,
+    scheduleRecentRefresh,
+    scheduleRefresh,
+  ]);
 
   const refreshAfterRepair = useCallback(() => {
     void loadRef.current("mutation");
   }, []);
-  const runs = usePullRuns(currentPulls, refreshAfterRepair);
-  const tasks = useTasks();
+  const viewerLogin = artifactProof.viewerLogin;
+  const autoAuthoritative =
+    data !== null &&
+    !initialLoading &&
+    error === null &&
+    !data.partial &&
+    !data.stale &&
+    viewerLogin !== null;
+  const runs = usePullRuns(currentPulls, refreshAfterRepair, {
+    agent,
+    authoritative: autoAuthoritative,
+    transcriptStore: runTranscriptStore,
+  });
+  const tasks = useTasks(agent);
   const preferences = usePullPreferences();
   const groupedPulls = useMemo(
     () => groupPulls(currentPulls, runs.states),
@@ -553,15 +749,8 @@ function Dashboard() {
     [view.groups.blocked, view.groups.progress, view.groups.ready],
   );
   const artifactEpoch = artifactProof.epoch;
-  const viewerLogin = artifactProof.viewerLogin;
-  const autoAuthoritative =
-    data !== null &&
-    !initialLoading &&
-    error === null &&
-    !data.partial &&
-    !data.stale &&
-    viewerLogin !== null;
   const auto = useAuto({
+    agent,
     authoritative: autoAuthoritative,
     pulls: currentPulls,
     runs,
@@ -657,6 +846,7 @@ function Dashboard() {
           candidate.number === pull.number &&
           candidate.headRefOid.toLowerCase() === pull.headRefOid.toLowerCase();
         mergedPulls.current.add(pullIdentity(pull));
+        removeRowContinuity(getPullKey(pull));
         setCurrentPulls((current) => current.filter((item) => !matches(item)));
         setData((current) => {
           if (!current) return current;
@@ -673,27 +863,34 @@ function Dashboard() {
             ready,
           };
         });
-        void loadRecent(true);
+        void loadRecent("manual");
       } else {
         void observeRepair(pull, response);
       }
 
       void loadRef.current("mutation");
     },
-    [loadRecent, observeRepair],
+    [loadRecent, observeRepair, removeRowContinuity],
   );
 
   const handleManualRefresh = () => {
     void loadRef.current("manual");
-    void loadRecent(true);
+    void loadRecent("manual");
   };
 
   const handleReleaseCreated = useCallback(
     async (_release: CreateReleaseResponse) => {
-      await Promise.allSettled([loadRef.current("mutation"), loadRecent(true)]);
+      await Promise.allSettled([
+        loadRef.current("mutation"),
+        loadRecent("manual"),
+      ]);
     },
     [loadRecent],
   );
+
+  const handleRecentRefresh = useCallback(() => {
+    void loadRecent("manual");
+  }, [loadRecent]);
 
   const stats = useMemo(
     () => ({
@@ -781,9 +978,41 @@ function Dashboard() {
                     onShow={preferences.show}
                     onShowAll={preferences.showAll}
                   />
-                  <ReleaseDialog onCreated={handleReleaseCreated} />
+                  <ReleaseDialog
+                    onCreated={handleReleaseCreated}
+                    viewerLogin={autoAuthoritative ? viewerLogin : null}
+                  />
                   <AutoControl auto={auto} trusted={autoAuthoritative} />
+                  <AgentToggle agent={agent} onAgentChange={setAgent} />
                   <ThemeToggle />
+                  <Button
+                    aria-controls="recent-releases-panel"
+                    aria-expanded={releasePanel.expanded}
+                    aria-label={
+                      releasePanel.expanded
+                        ? "Hide recent releases"
+                        : "Show recent releases"
+                    }
+                    className="min-h-11 min-w-11 sm:min-h-7 sm:min-w-7"
+                    data-release-panel-toggle=""
+                    onClick={() =>
+                      releasePanel.setExpanded(!releasePanel.expanded)
+                    }
+                    size="icon-sm"
+                    title={
+                      releasePanel.expanded
+                        ? "Hide recent releases"
+                        : "Show recent releases"
+                    }
+                    type="button"
+                    variant="outline"
+                  >
+                    {releasePanel.expanded ? (
+                      <PanelRightClose aria-hidden="true" />
+                    ) : (
+                      <PanelRightOpen aria-hidden="true" />
+                    )}
+                  </Button>
                   <Button
                     aria-busy={refreshing}
                     className="min-h-11 flex-1 sm:min-h-7 sm:flex-none"
@@ -835,6 +1064,7 @@ function Dashboard() {
         <div
           className="grid items-start gap-5 lg:grid-cols-[minmax(0,1.7fr)_minmax(22rem,0.8fr)] xl:grid-cols-[minmax(0,2fr)_minmax(24rem,0.9fr)]"
           data-dashboard-columns=""
+          data-release-panel-expanded={releasePanel.expanded ? "true" : "false"}
         >
           <div className="min-w-0 space-y-5" data-pull-column="">
             {!data && initialLoading && (
@@ -908,6 +1138,7 @@ function Dashboard() {
                 >
                   <LayoutGroup id="task-readiness">
                     <ReadinessSection
+                      agent={agent}
                       artifactEpoch={artifactEpoch}
                       emptyMessage="No CI checks or local fixes are in progress."
                       hidePull={preferences.hide}
@@ -990,6 +1221,7 @@ function Dashboard() {
                   <LayoutGroup id="pull-readiness">
                     <div className="flex flex-col gap-5">
                       <ReadinessSection
+                        agent={agent}
                         artifactEpoch={artifactEpoch}
                         emptyMessage="No pulls meet every readiness check."
                         hidePull={preferences.hide}
@@ -1006,6 +1238,7 @@ function Dashboard() {
                         viewedFiles={viewedFiles}
                       />
                       <ReadinessSection
+                        agent={agent}
                         artifactEpoch={artifactEpoch}
                         emptyMessage="No CI checks or local fixes are in progress."
                         hidePull={preferences.hide}
@@ -1023,6 +1256,7 @@ function Dashboard() {
                         viewedFiles={viewedFiles}
                       />
                       <ReadinessSection
+                        agent={agent}
                         artifactEpoch={artifactEpoch}
                         emptyMessage="No pull requests are waiting on fixes."
                         hidePull={preferences.hide}
@@ -1044,12 +1278,20 @@ function Dashboard() {
               )}
             </AnimatePresence>
           </div>
-          <aside className="min-w-0" data-release-column="">
+          <aside
+            aria-hidden={!releasePanel.expanded}
+            className="min-w-0"
+            data-release-column=""
+            data-state={releasePanel.expanded ? "expanded" : "collapsed"}
+            id="recent-releases-panel"
+            inert={!releasePanel.expanded}
+          >
             <RecentReleases
+              agent={agent}
               data={recent}
               error={recentError}
               loading={recentLoading}
-              onRefresh={() => void loadRecent(true)}
+              onRefresh={handleRecentRefresh}
             />
           </aside>
         </div>
@@ -1058,11 +1300,19 @@ function Dashboard() {
   );
 }
 
-export default function App() {
+export type AppProps = {
+  runTranscriptStore?: RunTranscriptStore;
+};
+
+export default function App({
+  runTranscriptStore = browserRunTranscriptStore,
+}: AppProps) {
   return (
     <ThemeProvider defaultTheme="system">
       <TooltipProvider>
-        <Dashboard />
+        <PullRowContinuityProvider>
+          <Dashboard runTranscriptStore={runTranscriptStore} />
+        </PullRowContinuityProvider>
       </TooltipProvider>
     </ThemeProvider>
   );

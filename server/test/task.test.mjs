@@ -51,6 +51,7 @@ function childProcess() {
 
 function input(overrides = {}) {
   return {
+    agent: "claude",
     id: ID,
     repository: "owner/repo",
     base: "main",
@@ -69,6 +70,7 @@ async function waitFor(manager, phase) {
 }
 
 function harness({
+  codexChanges = false,
   createFails = false,
   createWaitsForAbort = false,
   crossRepository = false,
@@ -96,6 +98,7 @@ function harness({
       return reservation;
     }),
   };
+  let statusCalls = 0;
   const run = vi.fn(async (executable, args, options = {}) => {
     order.push(`${executable}:${args.slice(0, 3).join(" ")}`);
     if (executable === "git" && args.includes("show-ref")) {
@@ -113,6 +116,13 @@ function harness({
     }
     if (executable === "git" && args.includes("rev-parse"))
       return { stdout: `${OID}\n`, stderr: "" };
+    if (codexChanges && executable === "git" && args.includes("status")) {
+      statusCalls += 1;
+      return {
+        stdout: statusCalls === 1 ? " M src/example.js\0" : "",
+        stderr: "",
+      };
+    }
     if (executable === "git" && args.includes("push") && pushFails)
       throw new Error("remote branch appeared");
     if (executable === "gh" && args.includes("create")) {
@@ -193,6 +203,133 @@ function harness({
 }
 
 describe("new task manager", () => {
+  it("runs a Codex task, requires turn completion, and lets Puller publish it", async () => {
+    const paths = await directories();
+    const test = harness({ codexChanges: true });
+    test.child.stdin = new PassThrough();
+    vi.spyOn(test.child.stdin, "end");
+    test.catalog.resolve.mockResolvedValue({
+      cwd: paths.source,
+      origin: "https://github.com/owner/repo",
+      repository: "owner/repo",
+    });
+    const codexCleanup = vi.fn(async () => undefined);
+    const prepareCodex = vi.fn(async () => ({
+      args: ["exec", "--json", "-"],
+      cleanup: codexCleanup,
+      command: "/opt/homebrew/bin/codex",
+      cwd: "/protected/control",
+      environment: {},
+      prompt: "trusted task prompt",
+    }));
+    const manager = createTaskManager({
+      ...test,
+      defer: (callback) => test.deferred.push(callback),
+      prepareCodex,
+      stateRoot: paths.stateRoot,
+      worktreeRoot: paths.worktreeRoot,
+    });
+    await manager.start(input({ agent: "codex" }));
+    test.deferred.shift()();
+    await waitFor(manager, "running");
+    await vi.waitFor(() => expect(test.spawn).toHaveBeenCalledOnce());
+    expect(test.spawn).toHaveBeenCalledWith(
+      "/opt/homebrew/bin/codex",
+      ["exec", "--json", "-"],
+      expect.objectContaining({ cwd: "/protected/control" }),
+    );
+    expect(test.child.stdin.end).toHaveBeenCalledWith("trusted task prompt");
+    test.child.stdout.write(
+      '{"type":"item.completed","item":{"type":"agent_message","text":"Done."}}\n',
+    );
+    test.child.stdout.write('{"type":"turn.completed"}\n');
+    test.child.emit("close", 0, null);
+    await expect(waitFor(manager, "completed")).resolves.toMatchObject({
+      agent: "codex",
+      phase: "completed",
+    });
+    expect(
+      test.run.mock.calls.some(
+        ([executable, args]) =>
+          executable === "git" &&
+          args.includes("commit") &&
+          args.includes("feat: Add the compact task launcher and test it."),
+      ),
+    ).toBe(true);
+    expect(
+      test.run.mock.calls.some(
+        ([executable, args]) =>
+          executable === "git" &&
+          args.includes("push") &&
+          args.some((argument) =>
+            String(argument).startsWith("HEAD:refs/heads/puller/"),
+          ),
+      ),
+    ).toBe(true);
+    expect(codexCleanup).toHaveBeenCalledOnce();
+    await manager.close();
+  });
+
+  it("escalates a cancelled Codex task from SIGINT through SIGTERM to SIGKILL", async () => {
+    const paths = await directories();
+    const test = harness();
+    test.child.stdin = new PassThrough();
+    const timers = [];
+    const kill = vi.fn();
+    const codexCleanup = vi.fn(async () => undefined);
+    test.catalog.resolve.mockResolvedValue({
+      cwd: paths.source,
+      origin: "https://github.com/owner/repo",
+      repository: "owner/repo",
+    });
+    const manager = createTaskManager({
+      ...test,
+      clearTimer: vi.fn((timer) => {
+        if (timer) timer.cleared = true;
+      }),
+      defer: (callback) => test.deferred.push(callback),
+      kill,
+      killGrace: 5,
+      prepareCodex: vi.fn(async () => ({
+        args: ["exec", "--json", "-"],
+        cleanup: codexCleanup,
+        command: "/opt/homebrew/bin/codex",
+        cwd: "/protected/control",
+        environment: {},
+        prompt: "trusted task prompt",
+      })),
+      setTimer(callback, delay) {
+        const timer = { callback, cleared: false, delay, unref: vi.fn() };
+        timers.push(timer);
+        return timer;
+      },
+      stateRoot: paths.stateRoot,
+      worktreeRoot: paths.worktreeRoot,
+    });
+    await manager.start(input({ agent: "codex" }));
+    test.deferred.shift()();
+    await waitFor(manager, "running");
+    await vi.waitFor(() => expect(test.spawn).toHaveBeenCalledOnce());
+
+    await manager.cancel(ID);
+    expect(kill.mock.calls.map(([, signal]) => signal)).toEqual(["SIGINT"]);
+    timers.findLast((timer) => timer.delay === 5).callback();
+    expect(kill.mock.calls.map(([, signal]) => signal)).toEqual([
+      "SIGINT",
+      "SIGTERM",
+    ]);
+    timers.findLast((timer) => timer.delay === 5).callback();
+    expect(kill.mock.calls.map(([, signal]) => signal)).toEqual([
+      "SIGINT",
+      "SIGTERM",
+      "SIGKILL",
+    ]);
+
+    test.child.emit("close", null, "SIGKILL");
+    await vi.waitFor(() => expect(codexCleanup).toHaveBeenCalledOnce());
+    await manager.close();
+  });
+
   it("creates and confirms a draft PR before scheduling a dangerous one-shot Claude process", async () => {
     const paths = await directories();
     const test = harness();
@@ -543,11 +680,18 @@ describe("new task manager", () => {
       worktreeRoot: paths.worktreeRoot,
     });
     const first = await manager.start(input());
+    expect(first.agent).toBe("claude");
     await expect(
       manager.start(input({ repository: "OWNER/REPO" })),
     ).resolves.toEqual(first);
     await expect(
       manager.start(input({ prompt: "A different task" })),
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "task_id_conflict",
+    });
+    await expect(
+      manager.start(input({ agent: "codex" })),
     ).rejects.toMatchObject({
       status: 409,
       code: "task_id_conflict",
@@ -913,10 +1057,12 @@ describe("new task manager", () => {
         version: 1,
         input: {
           ...input(),
+          agent: undefined,
           title: "Add the compact task launcher and test it.",
         },
         task: {
           ...input(),
+          agent: undefined,
           branch: "puller/task-12345678",
           createdAt,
           phase: "running",
@@ -940,6 +1086,7 @@ describe("new task manager", () => {
 
     expect(manager.list()).toEqual([
       expect.objectContaining({
+        agent: "claude",
         id: ID,
         phase: "failed",
         error: "The server restarted before this task completed.",
@@ -951,6 +1098,47 @@ describe("new task manager", () => {
       }),
     ]);
     await expect(stat(worktree)).resolves.toBeDefined();
+    await manager.close();
+  });
+
+  it("round-trips a persisted version 2 Codex task", async () => {
+    const paths = await directories();
+    await mkdir(paths.stateRoot, { recursive: true });
+    const createdAt = "2026-07-22T00:00:00.000Z";
+    const persistedInput = {
+      ...input({ agent: "codex" }),
+      title: "Add the compact task launcher and test it.",
+    };
+    await writeFile(
+      join(paths.stateRoot, `${ID}.json`),
+      JSON.stringify({
+        version: 2,
+        input: persistedInput,
+        task: {
+          agent: "codex",
+          base: persistedInput.base,
+          createdAt,
+          id: persistedInput.id,
+          phase: "completed",
+          repository: persistedInput.repository,
+          title: persistedInput.title,
+          updatedAt: createdAt,
+        },
+        events: [],
+      }),
+    );
+    const manager = createTaskManager({
+      catalog: { options: vi.fn(), resolve: vi.fn() },
+      stateRoot: paths.stateRoot,
+      worktreeRoot: paths.worktreeRoot,
+    });
+    expect(manager.list()).toEqual([
+      expect.objectContaining({
+        agent: "codex",
+        id: ID,
+        phase: "completed",
+      }),
+    ]);
     await manager.close();
   });
 

@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { availableParallelism } from "node:os";
 
 import { createExecutor, ExecutorError } from "./executor.mjs";
+import { GREPTILE_LOGIN } from "./greptile.mjs";
 
 export const SEARCH_QUERY =
   "is:pr author:@me state:open archived:false sort:updated-desc";
@@ -15,6 +16,7 @@ const SHA = /^[0-9a-f]{40}$/i;
 const REPOSITORY = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/;
 const ACTIONS_JOB =
   /^\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/actions\/runs\/([1-9]\d{0,19})\/job\/([1-9]\d{0,19})$/;
+const PULL_STATES = new Set(["CLOSED", "MERGED", "OPEN"]);
 
 const CONTEXT_FIELDS = `
   checkRunCount
@@ -205,11 +207,30 @@ const POLL_FIELDS = `
       login
     }
   }
-  reviewThreads(first: 1) {
+  reviewThreads(first: 100) {
     totalCount
+    nodes {
+      id
+      isResolved
+    }
+    pageInfo {
+      endCursor
+      hasNextPage
+    }
   }
-  comments(first: 1) {
+  comments(first: 100) {
     totalCount
+    nodes {
+      id
+      author {
+        login
+      }
+      updatedAt
+    }
+    pageInfo {
+      endCursor
+      hasNextPage
+    }
   }
 `;
 
@@ -337,6 +358,40 @@ export const TARGET_CHECKS_QUERY = `
   }
 `;
 
+export const TARGET_PULL_COMMITS_QUERY = `
+  query TargetAuthoredPullCommits(
+    $owner: String!
+    $name: String!
+    $number: Int!
+    $searchQuery: String!
+    $after: String
+  ) {
+    viewer {
+      login
+    }
+    repository(owner: $owner, name: $name) {
+      pullRequest(number: $number) {
+        ${TARGET_PULL_FIELDS}
+        commits(first: 1) {
+          totalCount
+        }
+      }
+    }
+    search(query: $searchQuery, type: ISSUE, first: 100, after: $after) {
+      issueCount
+      pageInfo {
+        endCursor
+        hasNextPage
+      }
+      nodes {
+        ... on PullRequest {
+          ${TARGET_PULL_FIELDS}
+        }
+      }
+    }
+  }
+`;
+
 export const TARGET_CONTEXTS_QUERY = `
   query TargetPullContexts(
     $owner: String!
@@ -414,10 +469,6 @@ export const EVIDENCE_STATES_QUERY = `
           totalCount
         }
       }
-      ... on IssueComment {
-        id
-        updatedAt
-      }
       ... on PullRequestReviewComment {
         id
         updatedAt
@@ -493,6 +544,7 @@ const DOCUMENTS = new Set([
   PULL_QUERY,
   TARGET_CHECKS_QUERY,
   TARGET_CONTEXTS_QUERY,
+  TARGET_PULL_COMMITS_QUERY,
   TARGET_PULL_QUERY,
   THREAD_COMMENTS_QUERY,
   THREADS_QUERY,
@@ -511,13 +563,7 @@ const FAILED_CONCLUSIONS = new Set([
   "STARTUP_FAILURE",
   "TIMED_OUT",
 ]);
-const RUNNING_STATUSES = new Set([
-  "IN_PROGRESS",
-  "PENDING",
-  "QUEUED",
-  "REQUESTED",
-  "WAITING",
-]);
+const QUEUED_STATUSES = new Set(["PENDING", "QUEUED", "REQUESTED", "WAITING"]);
 
 export class GithubError extends Error {
   constructor(message, options) {
@@ -804,8 +850,10 @@ function normalizeCheckRun(node) {
     state =
       PASSED_CONCLUSIONS.get(node.conclusion) ??
       (FAILED_CONCLUSIONS.has(node.conclusion) ? "failure" : "unknown");
-  } else if (RUNNING_STATUSES.has(node.status) && node.conclusion === null) {
-    state = "pending";
+  } else if (node.status === "IN_PROGRESS" && node.conclusion === null) {
+    state = "in_progress";
+  } else if (QUEUED_STATUSES.has(node.status) && node.conclusion === null) {
+    state = "queued";
   }
 
   return {
@@ -839,7 +887,7 @@ function normalizeStatusContext(node) {
       : node.state === "ERROR" || node.state === "FAILURE"
         ? "failure"
         : node.state === "EXPECTED" || node.state === "PENDING"
-          ? "pending"
+          ? "queued"
           : "unknown";
 
   return {
@@ -897,7 +945,9 @@ function emptyCi(state, complete) {
     checks: [],
     complete,
     failed: 0,
+    inProgress: 0,
     passed: 0,
+    queued: 0,
     running: 0,
     state,
     total: 0,
@@ -974,7 +1024,8 @@ function finalizeCi(internal) {
   const checkIds = new Set();
   let passed = 0;
   let failed = 0;
-  let running = 0;
+  let inProgress = 0;
+  let queued = 0;
   let unknown = 0;
   let checkRuns = 0;
   let statusContexts = 0;
@@ -995,8 +1046,10 @@ function finalizeCi(internal) {
       passed += 1;
     } else if (context.check.state === "failure") {
       failed += 1;
-    } else if (context.check.state === "pending") {
-      running += 1;
+    } else if (context.check.state === "in_progress") {
+      inProgress += 1;
+    } else if (context.check.state === "queued") {
+      queued += 1;
     } else {
       unknown += 1;
     }
@@ -1009,6 +1062,7 @@ function finalizeCi(internal) {
   if (expected !== null && expected > internal.contexts.length) {
     unknown += expected - internal.contexts.length;
   }
+  const running = inProgress + queued;
   const total = passed + failed + running + unknown;
   const countsMatch =
     expected !== null &&
@@ -1038,7 +1092,9 @@ function finalizeCi(internal) {
     checks,
     complete,
     failed,
+    inProgress,
     passed,
+    queued,
     running,
     state,
     total,
@@ -1055,7 +1111,7 @@ function isPull(node) {
     typeof node.title === "string" &&
     typeof node.url === "string" &&
     typeof node.updatedAt === "string" &&
-    typeof node.state === "string" &&
+    PULL_STATES.has(node.state) &&
     typeof author === "string" &&
     typeof node.baseRefOid === "string" &&
     SHA.test(node.baseRefOid) &&
@@ -1357,21 +1413,16 @@ function stripInternalFields(pull) {
 }
 
 function evidenceForPull(pull) {
+  const threads = pull.reviewThreads.filter(({ isResolved }) => !isResolved);
   return {
-    issueComments: pull.comments.map(({ id, updatedAt }) => ({
-      id,
-      updatedAt,
-    })),
-    reviewComments: pull.reviewThreads.flatMap((thread) =>
+    reviewComments: threads.flatMap((thread) =>
       thread.comments.map(({ id, updatedAt }) => ({ id, updatedAt })),
     ),
-    reviewThreads: pull.reviewThreads.map(
-      ({ commentCount, id, isResolved }) => ({
-        commentCount,
-        id,
-        isResolved,
-      }),
-    ),
+    reviewThreads: threads.map(({ commentCount, id, isResolved }) => ({
+      commentCount,
+      id,
+      isResolved,
+    })),
   };
 }
 
@@ -1462,6 +1513,7 @@ export async function fetchAuthoredPulls({ graphql, maximum = SEARCH_LIMIT }) {
         );
         continue;
       }
+      if (node.state !== "OPEN") continue;
       const pull = normalizePull(node);
       await completePull(graphql, pull);
       pulls.push(stripInternalFields(pull));
@@ -1839,6 +1891,7 @@ async function completeTargetChecks({
 async function fetchTargetedPull({
   graphql,
   includeChecks,
+  includeCommits = false,
   number,
   repository,
   signal,
@@ -1850,7 +1903,11 @@ async function fetchTargetedPull({
   if (typeof graphql !== "function")
     throw new TypeError("graphql must be a function.");
 
-  const document = includeChecks ? TARGET_CHECKS_QUERY : TARGET_PULL_QUERY;
+  const document = includeChecks
+    ? TARGET_CHECKS_QUERY
+    : includeCommits
+      ? TARGET_PULL_COMMITS_QUERY
+      : TARGET_PULL_QUERY;
   const searchQuery = targetSearchQuery(repository);
   const cursors = new Set();
   let after = null;
@@ -1858,6 +1915,8 @@ async function fetchTargetedPull({
   let complete = true;
   let consumed = 0;
   let exact = null;
+  let exactCommitCount = null;
+  let exactCommitCountObserved = false;
   let exactNode = null;
   let exactObserved = false;
   let issueCount = null;
@@ -1900,6 +1959,18 @@ async function fetchTargetedPull({
       complete = false;
     } else {
       exactNode = node;
+    }
+    if (includeCommits) {
+      const commitCount = node?.commits?.totalCount;
+      const valid = Number.isSafeInteger(commitCount) && commitCount >= 0;
+      if (!valid) {
+        complete = false;
+      } else if (!exactCommitCountObserved) {
+        exactCommitCount = commitCount;
+        exactCommitCountObserved = true;
+      } else if (exactCommitCount !== commitCount) {
+        complete = false;
+      }
     }
 
     const search = data.search;
@@ -1970,6 +2041,13 @@ async function fetchTargetedPull({
     viewerLogin,
     viewerPermission: exact?.viewerPermission ?? null,
   };
+  if (includeCommits) {
+    return {
+      ...result,
+      commitCount: exactCommitCount,
+      complete: result.complete && exactCommitCountObserved,
+    };
+  }
   if (!includeChecks) return result;
 
   if (!available || !authored || !result.complete) {
@@ -2003,6 +2081,22 @@ export function fetchPullAuthorization({
   return fetchTargetedPull({
     graphql,
     includeChecks: false,
+    number,
+    repository,
+    signal,
+  });
+}
+
+export function fetchPullCommitsAuthorization({
+  graphql,
+  number,
+  repository,
+  signal,
+}) {
+  return fetchTargetedPull({
+    graphql,
+    includeChecks: false,
+    includeCommits: true,
     number,
     repository,
     signal,
@@ -2043,6 +2137,7 @@ async function fetchExactPull({ graphql, number, repository }) {
       ciFingerprint: null,
       complete: true,
       evidence: null,
+      evidenceFingerprint: null,
       headRefOid: null,
       number,
       open: false,
@@ -2062,6 +2157,7 @@ async function fetchExactPull({ graphql, number, repository }) {
       ciFingerprint: null,
       complete: false,
       evidence: null,
+      evidenceFingerprint: null,
       headRefOid: null,
       number,
       open: false,
@@ -2094,6 +2190,10 @@ async function fetchExactPull({ graphql, number, repository }) {
     ciFingerprint: normalizePollRollup(node.statusCheckRollup, node.headRefOid),
     complete,
     evidence: evidenceForPull(pull),
+    evidenceFingerprint: compactEvidenceFingerprint(
+      pull.comments,
+      pull.reviewThreads,
+    ),
     headRefOid: pull.headRefOid,
     number: pull.number,
     open: pull.state === "OPEN",
@@ -2108,10 +2208,101 @@ async function fetchExactPull({ graphql, number, repository }) {
 
 function nonNegativeCount(connection) {
   return isRecord(connection) &&
-    Number.isInteger(connection.totalCount) &&
+    Number.isSafeInteger(connection.totalCount) &&
     connection.totalCount >= 0
     ? connection.totalCount
     : null;
+}
+
+function validPollPageInfo(pageInfo) {
+  return (
+    isRecord(pageInfo) &&
+    typeof pageInfo.hasNextPage === "boolean" &&
+    (pageInfo.endCursor === null || isCursor(pageInfo.endCursor)) &&
+    (!pageInfo.hasNextPage || isCursor(pageInfo.endCursor))
+  );
+}
+
+function normalizePollConnection(connection, normalizeNode) {
+  const totalCount = nonNegativeCount(connection);
+  const nodesValid = isRecord(connection) && Array.isArray(connection.nodes);
+  const pageInfoValid = validPollPageInfo(connection?.pageInfo);
+  const normalized = nodesValid ? connection.nodes.map(normalizeNode) : [];
+  const identifiers = new Set();
+  const nodes = [];
+  let unique = nodesValid;
+
+  for (const node of normalized) {
+    if (node === null || identifiers.has(node.id)) {
+      unique = false;
+      continue;
+    }
+    identifiers.add(node.id);
+    nodes.push(node);
+  }
+
+  const complete =
+    totalCount !== null &&
+    unique &&
+    pageInfoValid &&
+    connection.pageInfo.hasNextPage === false &&
+    totalCount <= PAGE_SIZE &&
+    nodes.length === totalCount;
+
+  return { complete, nodes, totalCount };
+}
+
+function normalizePollIssueComment(comment) {
+  const author = normalizeActor(comment?.author);
+  if (
+    !isRecord(comment) ||
+    author === undefined ||
+    typeof comment.id !== "string" ||
+    comment.id.length === 0 ||
+    typeof comment.updatedAt !== "string" ||
+    Number.isNaN(Date.parse(comment.updatedAt))
+  ) {
+    return null;
+  }
+
+  return {
+    author,
+    id: comment.id,
+    updatedAt: comment.updatedAt,
+  };
+}
+
+function normalizePollThread(thread) {
+  if (
+    !isRecord(thread) ||
+    typeof thread.id !== "string" ||
+    thread.id.length === 0 ||
+    typeof thread.isResolved !== "boolean"
+  ) {
+    return null;
+  }
+
+  return {
+    id: thread.id,
+    isResolved: thread.isResolved,
+  };
+}
+
+function sortedFingerprint(items, normalize) {
+  return items
+    .map(normalize)
+    .sort(([left], [right]) => left.localeCompare(right));
+}
+
+function compactEvidenceFingerprint(comments, threads) {
+  return JSON.stringify([
+    sortedFingerprint(comments, ({ author, id, updatedAt }) => [
+      id,
+      author,
+      author === GREPTILE_LOGIN ? updatedAt : null,
+    ]),
+    sortedFingerprint(threads, ({ id, isResolved }) => [id, isResolved]),
+  ]);
 }
 
 function normalizePollCounts(connection, countField, statesField) {
@@ -2177,16 +2368,25 @@ function normalizePollPull(node) {
     return null;
   }
 
-  const comments = nonNegativeCount(node.comments);
-  const threads = nonNegativeCount(node.reviewThreads);
+  const comments = normalizePollConnection(
+    node.comments,
+    normalizePollIssueComment,
+  );
+  const threads = normalizePollConnection(
+    node.reviewThreads,
+    normalizePollThread,
+  );
   const ciFingerprint = normalizePollRollup(
     node.statusCheckRollup,
     node.headRefOid,
   );
-  if (comments === null || threads === null || ciFingerprint === null)
-    return null;
+  if (ciFingerprint === null) return null;
 
   const repository = node.repository.nameWithOwner;
+  const evidenceComplete = comments.complete && threads.complete;
+  const evidenceFingerprint = evidenceComplete
+    ? compactEvidenceFingerprint(comments.nodes, threads.nodes)
+    : null;
   const identityFingerprint = JSON.stringify([
     node.id,
     node.author.login,
@@ -2199,15 +2399,17 @@ function normalizePollPull(node) {
     node.title,
     node.updatedAt,
     node.url,
-    comments,
-    threads,
+    comments.totalCount,
+    threads.totalCount,
   ]);
 
   return {
     authorLogin: node.author.login,
     baseRefOid: node.baseRefOid.toLowerCase(),
     ciFingerprint,
-    comments,
+    comments: comments.totalCount,
+    evidenceComplete,
+    evidenceFingerprint,
     headRefOid: node.headRefOid.toLowerCase(),
     id: node.id,
     identityFingerprint,
@@ -2217,7 +2419,7 @@ function normalizePollPull(node) {
     repository,
     repositoryUrl: node.repository.url,
     state: node.state,
-    threads,
+    threads: threads.totalCount,
     title: node.title,
     updatedAt: node.updatedAt,
     url: node.url,
@@ -2301,12 +2503,7 @@ async function fetchPollIndex({ graphql, maximum }) {
         );
         continue;
       }
-      if (pull.state !== "OPEN") {
-        warn(
-          "GitHub returned closed pull requests for the open-pull search; they were skipped.",
-        );
-        continue;
-      }
+      if (pull.state !== "OPEN") continue;
       const identity = `${pull.repository.toLowerCase()}#${pull.number}`;
       if (identities.has(identity)) {
         warn(
@@ -2372,9 +2569,11 @@ function matchesIndexedPull(exact, indexed) {
     exact.pull.title === indexed.title &&
     exact.pull.updatedAt === indexed.updatedAt &&
     exact.pull.commentsComplete === true &&
-    exact.pull.comments.length === indexed.comments &&
     exact.pull.threadsComplete === true &&
-    exact.pull.reviewThreads.length === indexed.threads
+    (indexed.evidenceComplete !== true ||
+      (exact.pull.comments.length === indexed.comments &&
+        exact.pull.reviewThreads.length === indexed.threads &&
+        exact.evidenceFingerprint === indexed.evidenceFingerprint))
   );
 }
 
@@ -2509,24 +2708,32 @@ async function mapConcurrent(values, task) {
 
 async function changedEvidence(graphql, entries) {
   const expected = new Map();
+  const unavailable = new Set();
+  const add = (id, evidence) => {
+    if (typeof id !== "string" || id.length === 0) {
+      unavailable.add(evidence.key);
+      return;
+    }
+    const duplicate = expected.get(id);
+    if (duplicate) {
+      unavailable.add(duplicate.key);
+      unavailable.add(evidence.key);
+      return;
+    }
+    expected.set(id, evidence);
+  };
+
   for (const [key, entry] of entries) {
     for (const thread of entry.evidence?.reviewThreads ?? []) {
-      expected.set(thread.id, {
+      add(thread.id, {
         commentCount: thread.commentCount,
         isResolved: thread.isResolved,
         key,
         type: "PullRequestReviewThread",
       });
     }
-    for (const comment of entry.evidence?.issueComments ?? []) {
-      expected.set(comment.id, {
-        key,
-        type: "IssueComment",
-        updatedAt: comment.updatedAt,
-      });
-    }
     for (const comment of entry.evidence?.reviewComments ?? []) {
-      expected.set(comment.id, {
+      add(comment.id, {
         key,
         type: "PullRequestReviewComment",
         updatedAt: comment.updatedAt,
@@ -2534,11 +2741,12 @@ async function changedEvidence(graphql, entries) {
     }
   }
   if (expected.size === 0)
-    return { changed: new Set(), unavailable: new Set() };
+    return { changed: new Set(), unavailable };
 
   const changed = new Set();
-  const unavailable = new Set();
-  const identifiers = [...expected.keys()];
+  const identifiers = [...expected]
+    .filter(([, evidence]) => !unavailable.has(evidence.key))
+    .map(([id]) => id);
   for (let offset = 0; offset < identifiers.length; offset += PAGE_SIZE) {
     const ids = identifiers.slice(offset, offset + PAGE_SIZE);
     let data;
@@ -2548,27 +2756,58 @@ async function changedEvidence(graphql, entries) {
       for (const id of ids) unavailable.add(expected.get(id).key);
       continue;
     }
-    const nodes = Array.isArray(data?.nodes) ? data.nodes : [];
-    const observed = new Map(
-      nodes
-        .filter((node) => isRecord(node) && typeof node.id === "string")
-        .map((node) => [node.id, node]),
-    );
+
+    const nodes = data?.nodes;
+    const requested = new Set(ids);
+    const observed = new Map();
+    const malformed =
+      !Array.isArray(nodes) ||
+      nodes.length !== ids.length ||
+      nodes.some((node) => {
+        if (node === null) return false;
+        if (
+          !isRecord(node) ||
+          typeof node.id !== "string" ||
+          !requested.has(node.id) ||
+          observed.has(node.id)
+        ) {
+          return true;
+        }
+        observed.set(node.id, node);
+        return false;
+      });
+    if (malformed) {
+      for (const id of ids) unavailable.add(expected.get(id).key);
+      continue;
+    }
+
     for (const id of ids) {
       const evidence = expected.get(id);
-      const node = observed.get(id);
-      const changedThread =
-        evidence.type === "PullRequestReviewThread" &&
-        (node?.isResolved !== evidence.isResolved ||
-          nonNegativeCount(node?.comments) !== evidence.commentCount);
-      const changedComment =
-        evidence.type !== "PullRequestReviewThread" &&
-        node?.updatedAt !== evidence.updatedAt;
-      if (
-        node?.__typename !== evidence.type ||
-        changedThread ||
-        changedComment
+      const node = observed.get(id) ?? null;
+      if (node === null || node.__typename !== evidence.type) {
+        changed.add(evidence.key);
+        continue;
+      }
+
+      if (evidence.type === "PullRequestReviewThread") {
+        const commentCount = nonNegativeCount(node.comments);
+        if (
+          typeof node.isResolved !== "boolean" ||
+          commentCount === null
+        ) {
+          unavailable.add(evidence.key);
+        } else if (
+          node.isResolved !== evidence.isResolved ||
+          commentCount !== evidence.commentCount
+        ) {
+          changed.add(evidence.key);
+        }
+      } else if (
+        typeof node.updatedAt !== "string" ||
+        Number.isNaN(Date.parse(node.updatedAt))
       ) {
+        unavailable.add(evidence.key);
+      } else if (node.updatedAt !== evidence.updatedAt) {
         changed.add(evidence.key);
       }
     }
@@ -2584,7 +2823,9 @@ function incompleteCi(pull) {
     checks: [],
     complete: false,
     failed: state === "FAILURE" || state === "ERROR" ? 1 : 0,
+    inProgress: 0,
     passed: state === "SUCCESS" ? 1 : 0,
+    queued: state === "PENDING" || state === "EXPECTED" ? 1 : 0,
     running: state === "PENDING" || state === "EXPECTED" ? 1 : 0,
     state: "unknown",
     total: 1,
@@ -2634,6 +2875,7 @@ function degradedEntry(pull, entry, options) {
     ciFingerprint: entry?.ciFingerprint ?? null,
     ciRefreshedAt: entry?.ciRefreshedAt ?? Number.NEGATIVE_INFINITY,
     evidence: entry?.evidence ?? null,
+    evidenceFingerprint: entry?.evidenceFingerprint ?? null,
     identityFingerprint: entry?.identityFingerprint ?? "",
     needsFull: options?.ciOnly !== true,
     pull: degradedPull(pull, entry, options),
@@ -2673,15 +2915,16 @@ export function createAuthoredPullPoller({
     };
 
     const indexed = new Map(index.pulls.map((pull) => [cacheKey(pull), pull]));
-    const unchanged = new Map(
-      [...indexed].filter(
-        ([key, pull]) =>
-          cached.get(key)?.identityFingerprint === pull.identityFingerprint,
-      ),
-    );
-    const probeable = [...unchanged].filter(
-      ([key]) => cached.get(key).needsFull !== true,
-    );
+    const probeable = [...indexed].filter(([key, pull]) => {
+      const entry = cached.get(key);
+      return (
+        entry?.needsFull !== true &&
+        entry?.identityFingerprint === pull.identityFingerprint &&
+        pull.evidenceComplete === true &&
+        entry.evidenceFingerprint === pull.evidenceFingerprint &&
+        !promotesCi(entry, pull)
+      );
+    });
     const { changed: evidenceChanges, unavailable: evidenceUnavailable } =
       await changedEvidence(
         graphql,
@@ -2701,6 +2944,8 @@ export function createAuthoredPullPoller({
         entry === undefined ||
         entry.needsFull === true ||
         entry.identityFingerprint !== pull.identityFingerprint ||
+        pull.evidenceComplete !== true ||
+        entry.evidenceFingerprint !== pull.evidenceFingerprint ||
         evidenceChanges.has(key) ||
         promotesCi(entry, pull)
       ) {
@@ -2753,6 +2998,7 @@ export function createAuthoredPullPoller({
               ciFingerprint: pull.ciFingerprint,
               ciRefreshedAt: checkedAt,
               evidence: exact.evidence,
+              evidenceFingerprint: pull.evidenceFingerprint,
               identityFingerprint: pull.identityFingerprint,
               needsFull: exact.complete !== true,
               pull: exact.pull,
@@ -2822,6 +3068,7 @@ export function createAuthoredPullPoller({
               ciFingerprint: pull.ciFingerprint,
               ciRefreshedAt: checkedAt,
               evidence: exact.evidence,
+              evidenceFingerprint: pull.evidenceFingerprint,
               identityFingerprint: pull.identityFingerprint,
               needsFull: exact.complete !== true,
               pull: exact.pull,
@@ -2845,6 +3092,7 @@ export function createAuthoredPullPoller({
             ciFingerprint: pull.ciFingerprint,
             ciRefreshedAt: checkedAt,
             evidence: entry.evidence,
+            evidenceFingerprint: entry.evidenceFingerprint,
             identityFingerprint: pull.identityFingerprint,
             needsFull: false,
             pull: { ...entry.pull, ci: result.ci },
@@ -2885,6 +3133,7 @@ export function createAuthoredPullPoller({
         next.set(key, {
           ...entry,
           ciFingerprint: pull.ciFingerprint,
+          evidenceFingerprint: pull.evidenceFingerprint,
           identityFingerprint: pull.identityFingerprint,
         });
       }
@@ -2912,6 +3161,13 @@ export function createGithubLoader({ executor, graphql } = {}) {
     loadAuthoredPulls,
     loadPullAuthorization: ({ number, repository }, signal) =>
       fetchPullAuthorization({ graphql: request, number, repository, signal }),
+    loadPullCommitsAuthorization: ({ number, repository }, signal) =>
+      fetchPullCommitsAuthorization({
+        graphql: request,
+        number,
+        repository,
+        signal,
+      }),
     loadPull: ({ number, repository }) =>
       fetchPull({ graphql: request, number, repository }),
   });

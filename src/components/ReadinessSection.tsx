@@ -1,4 +1,4 @@
-import { memo, useCallback, useState } from "react";
+import { memo, useCallback, useLayoutEffect, useRef, useState } from "react";
 import { AnimatePresence } from "motion/react";
 
 import { Badge } from "@/components/ui/badge";
@@ -11,13 +11,18 @@ import {
 } from "../diffs";
 import type { PullMovement } from "../movements";
 import type { PullKey, PullSectionItem } from "../preferences";
+import { usePullRowContinuity, type PullRowVariant } from "../row-continuity";
 import { IDLE_RUN_STATE, type PullRuns } from "../runs";
-import type { MergePullResponse, PullReadiness } from "../types";
+import type { Agent, MergePullResponse, PullReadiness } from "../types";
 import PullRow from "./PullRow";
-import SectionPager, { useSectionPager } from "./SectionPager";
+import SectionPager, {
+  SECTION_PAGE_SIZE,
+  useSectionPager,
+} from "./SectionPager";
 import TaskRow from "./TaskRow";
 
 export type ReadinessSectionProps = {
+  agent?: Agent;
   artifactEpoch: number;
   defaultPage?: number;
   emptyMessage: string;
@@ -48,7 +53,43 @@ type ListTransition = {
   signature: string;
 };
 
+const hasActivePullIdentity = (identity: PullKey): boolean => {
+  if (typeof document === "undefined") return false;
+  const active = document.activeElement;
+  if (!(active instanceof Element)) return false;
+  return (
+    active.closest<HTMLElement>("[data-pull-identity]")?.dataset
+      .pullIdentity === identity
+  );
+};
+
+function FocusedPageReveal({
+  index,
+  pull,
+  reveal,
+  variant,
+}: {
+  index: number;
+  pull: PullKey;
+  reveal: (key: PullKey) => boolean;
+  variant: PullRowVariant;
+}) {
+  const { entry } = usePullRowContinuity(pull);
+  const focusWasActive = useRef(false);
+  if (hasActivePullIdentity(pull)) focusWasActive.current = true;
+  if (entry.focus === null) focusWasActive.current = false;
+
+  useLayoutEffect(() => {
+    if (entry.focus === null || entry.variant === variant) return;
+    if (!focusWasActive.current && !hasActivePullIdentity(pull)) return;
+    reveal(pull);
+  }, [entry.focus, entry.variant, index, pull, reveal, variant]);
+
+  return null;
+}
+
 function ReadinessSection({
+  agent = "claude",
   artifactEpoch,
   defaultPage,
   emptyMessage,
@@ -82,6 +123,19 @@ function ReadinessSection({
     page,
     resetKey: pageResetKey,
   });
+  const itemsRef = useRef(items);
+  const setPageRef = useRef(pagination.setPage);
+  itemsRef.current = items;
+  setPageRef.current = pagination.setPage;
+  const revealFocusedPull = useCallback((key: PullKey): boolean => {
+    const index = itemsRef.current.findIndex(
+      (item) => item.kind === "pull" && item.identity === key,
+    );
+    if (index < 0) return false;
+
+    setPageRef.current(Math.floor(index / SECTION_PAGE_SIZE) + 1);
+    return true;
+  }, []);
   const pageItems = items.slice(pagination.start, pagination.end);
   const keys = pageItems.map((item) => item.key);
   const signature = JSON.stringify(keys);
@@ -126,7 +180,7 @@ function ReadinessSection({
       data-readiness-section={variant}
     >
       <header
-        className="readiness-section-header sticky top-0 z-20 flex items-center justify-between gap-3 bg-background/95 px-0.5 py-2 backdrop-blur-sm"
+        className="readiness-section-header sticky top-0 z-40 flex items-center justify-between gap-3 bg-background/95 px-0.5 py-2 shadow-none backdrop-blur-sm"
         data-readiness-section-header=""
       >
         <h2
@@ -141,10 +195,21 @@ function ReadinessSection({
       </header>
 
       <div
-        className="readiness-section-body space-y-2.5"
+        className="readiness-section-body relative space-y-2.5 pt-2"
         data-readiness-section-body=""
         data-section-page={pagination.page}
       >
+        {items.map((item, index) =>
+          item.kind === "pull" ? (
+            <FocusedPageReveal
+              index={index}
+              key={`focus:${item.identity}`}
+              pull={item.identity}
+              reveal={revealFocusedPull}
+              variant={variant}
+            />
+          ) : null,
+        )}
         {currentTransition.showList ? (
           <ul
             className="relative grid list-none gap-2 p-0"
@@ -165,15 +230,19 @@ function ReadinessSection({
                   ) : null
                 ) : (
                   <PullRow
+                    agent={agent}
                     artifactEpoch={artifactEpoch}
                     cancelRun={runs.cancel}
+                    clearReviewRetry={runs.clearReviewRetry}
                     favorite={item.favorite}
                     hidePull={hidePull}
                     key={item.key}
+                    loadTranscript={runs.loadTranscript}
                     movement={movements?.get(item.identity) ?? null}
                     onMutationComplete={onMutationComplete}
                     onToggleViewed={onToggleViewed}
                     pull={item.pull}
+                    revealFocusedPull={revealFocusedPull}
                     run={runs.states.get(item.pull.url) ?? IDLE_RUN_STATE}
                     setFavorite={rowSetFavorite}
                     setRunMessage={runs.setMessage}

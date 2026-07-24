@@ -356,8 +356,19 @@ export function createVerificationMemoryCapture(options = {}) {
     }
   }
 
+  function observeText(text) {
+    finalSeen = true;
+    final =
+      typeof text === "string" &&
+      text.length > 0 &&
+      byteLength(text) <= limits.finalMessageBytes
+        ? text
+        : null;
+  }
+
   return Object.freeze({
     observe,
+    observeText,
     result: () =>
       parseVerificationMemoryMarker(finalSeen ? final : fallback, limits),
   });

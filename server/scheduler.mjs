@@ -4,7 +4,7 @@ function cancelled() {
   return new ActionError(
     499,
     "run_cancelled",
-    "The queued Claude Code run was cancelled.",
+    "The queued agent run was cancelled.",
   );
 }
 
@@ -21,7 +21,7 @@ export function createRunScheduler({
     typeof coordinator.activeCount !== "function" ||
     typeof coordinator.shutdown !== "function"
   ) {
-    throw new TypeError("A Claude Code run coordinator is required.");
+    throw new TypeError("An agent run coordinator is required.");
   }
 
   const keys = new Set();
@@ -120,6 +120,22 @@ export function createRunScheduler({
     }
   }
 
+  function reserveKey(rawOptions) {
+    const options = validate(rawOptions);
+    if (stopping) throw shuttingDown();
+    if (keys.has(options.key)) throw duplicate(options);
+    keys.add(options.key);
+    let released = false;
+    return Object.freeze({
+      release() {
+        if (released) return;
+        released = true;
+        keys.delete(options.key);
+        drain();
+      },
+    });
+  }
+
   function reserveQueued(rawOptions, { signal } = {}) {
     const options = validate(rawOptions);
     if (
@@ -171,6 +187,7 @@ export function createRunScheduler({
         ? coordinator.activeWorkspaceCount.bind(coordinator)
         : () => 0,
     queuedCount: () => queue.length,
+    reserveKey,
     reserveQueued,
     reserveRun,
     shutdown,

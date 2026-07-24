@@ -3,24 +3,41 @@
 import "@testing-library/jest-dom/vitest";
 
 import {
+  act,
   cleanup,
   fireEvent,
-  render,
+  render as renderBase,
   screen,
   waitFor,
   within,
 } from "@testing-library/react";
-import { useState } from "react";
+import {
+  type ReactElement,
+  type ReactNode,
+  useLayoutEffect,
+  useState,
+} from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { PullMovement } from "@/movements";
 import { getPullKey, type PullSectionItem } from "@/preferences";
 import type { PullRuns } from "@/runs";
+import {
+  PullRowContinuityProvider,
+  usePullRowContinuity,
+} from "@/row-continuity";
 import { createPullsResponse } from "@/test/fixtures";
 
 import ReadinessSection, {
   type ReadinessSectionProps,
 } from "./ReadinessSection";
+
+const render = (ui: ReactElement) =>
+  renderBase(ui, {
+    wrapper: ({ children }: { children: ReactNode }) => (
+      <PullRowContinuityProvider>{children}</PullRowContinuityProvider>
+    ),
+  });
 
 vi.mock("./PullRow", () => ({
   default: ({
@@ -118,14 +135,31 @@ describe("ReadinessSection", () => {
     );
 
     expect(section).toHaveClass("readiness-section", "relative");
-    expect(header).toHaveClass("readiness-section-header", "sticky");
-    expect(body).toHaveClass("readiness-section-body");
+    expect(header).toHaveClass(
+      "readiness-section-header",
+      "sticky",
+      "top-0",
+      "z-40",
+      "shadow-none",
+    );
+    expect(body).toHaveClass("readiness-section-body", "relative", "pt-2");
+    expect(body).not.toHaveClass("z-0");
     expect(section).toContainElement(header);
     expect(section).toContainElement(body);
     expect(screen.getAllByText(/^Pull \d+$/)).toHaveLength(20);
     expect(
       screen.queryByRole("navigation", { name: "Ready pagination" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("keeps an empty-state card separated from the header divider", () => {
+    const view = render(<ReadinessSection {...props([])} />);
+    const body = view.container.querySelector<HTMLElement>(
+      "[data-readiness-section-body]",
+    );
+
+    expect(body).toHaveClass("pt-2");
+    expect(screen.getByText("Nothing ready.")).toBeVisible();
   });
 
   it("paginates 21 fully sorted rows before rendering the second page", () => {
@@ -151,6 +185,90 @@ describe("ReadinessSection", () => {
     expect(screen.getByText("Page 3 of 3")).toBeVisible();
     expect(screen.getByText("Pull 41")).toBeVisible();
     expect(screen.getAllByText(/^Pull \d+$/)).toHaveLength(1);
+  });
+
+  it("reveals only the destination page of a pull with current source focus", async () => {
+    const items = pullItems(41);
+    const focused = items[40]!;
+
+    function Harness() {
+      const continuity = usePullRowContinuity(focused.identity!);
+      useLayoutEffect(() => {
+        continuity.ensureDiffKey("stable", "blocked");
+      }, [continuity.ensureDiffKey]);
+      const capture = () =>
+        continuity.update({
+          focus: {
+            generation: 1,
+            pending: false,
+            token: "diff",
+            variant: "blocked",
+          },
+        });
+
+      return (
+        <>
+          <div data-pull-identity={focused.identity}>
+            <button
+              data-pull-focus-token="diff"
+              onFocus={capture}
+              type="button"
+            >
+              Focused source
+            </button>
+          </div>
+          <ReadinessSection {...props(items)} />
+        </>
+      );
+    }
+
+    render(<Harness />);
+
+    expect(screen.getByText("Page 1 of 3")).toBeVisible();
+    act(() => screen.getByRole("button", { name: "Focused source" }).focus());
+
+    await waitFor(() => expect(screen.getByText("Page 3 of 3")).toBeVisible());
+    expect(screen.getByText("Pull 41")).toBeVisible();
+  });
+
+  it("does not reveal a page from a stale focus token after focus left the pull", async () => {
+    const items = pullItems(41);
+    const focused = items[40]!;
+
+    function Harness() {
+      const continuity = usePullRowContinuity(focused.identity!);
+      useLayoutEffect(() => {
+        continuity.ensureDiffKey("stable", "blocked");
+      }, [continuity.ensureDiffKey]);
+
+      return (
+        <>
+          <button
+            onFocus={() =>
+              continuity.update({
+                focus: {
+                  generation: 1,
+                  pending: false,
+                  token: "diff",
+                  variant: "blocked",
+                },
+              })
+            }
+            type="button"
+          >
+            Outside pull
+          </button>
+          <ReadinessSection {...props(items)} />
+        </>
+      );
+    }
+
+    render(<Harness />);
+    act(() => screen.getByRole("button", { name: "Outside pull" }).focus());
+    await act(async () => Promise.resolve());
+
+    expect(screen.getByText("Page 1 of 3")).toBeVisible();
+    expect(screen.queryByText("Pull 41")).not.toBeInTheDocument();
   });
 
   it("keeps ready, in progress, and not ready page state independent", () => {

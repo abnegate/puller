@@ -14,6 +14,7 @@ import {
   SEARCH_QUERY,
   TARGET_CHECKS_QUERY,
   TARGET_CONTEXTS_QUERY,
+  TARGET_PULL_COMMITS_QUERY,
   TARGET_PULL_QUERY,
   TARGET_SEARCH_QUERY,
   THREAD_COMMENTS_QUERY,
@@ -25,6 +26,7 @@ import {
   fetchCheckAuthorization,
   fetchPull,
   fetchPullAuthorization,
+  fetchPullCommitsAuthorization,
   targetSearchQuery,
 } from "../github.mjs";
 import { assessPull } from "../readiness.mjs";
@@ -156,14 +158,6 @@ function issueComment(id, body = "body") {
   };
 }
 
-function issueCommentEvidence(comment) {
-  return {
-    __typename: "IssueComment",
-    id: comment.id,
-    updatedAt: comment.updatedAt,
-  };
-}
-
 function reviewCommentEvidence(comment) {
   return {
     __typename: "PullRequestReviewComment",
@@ -172,13 +166,10 @@ function reviewCommentEvidence(comment) {
   };
 }
 
-function threadEvidence(
-  value,
-  { commentCount = value.comments.totalCount } = {},
-) {
+function threadEvidence(value) {
   return {
     __typename: "PullRequestReviewThread",
-    comments: { totalCount: commentCount },
+    comments: { totalCount: value.comments.totalCount },
     id: value.id,
     isResolved: value.isResolved,
   };
@@ -265,7 +256,7 @@ function target(
   };
 }
 
-function pollNode(number, overrides = {}) {
+function pollNode(number, overrides = {}, compactOverrides = {}) {
   const exact = node(number, overrides);
   const fallbackContexts = contexts([
     checkRun(
@@ -278,11 +269,27 @@ function pollNode(number, overrides = {}) {
     ),
   ]);
   const rollupContexts = exact.statusCheckRollup?.contexts ?? fallbackContexts;
+  const comments = exact.comments.nodes.map(({ author, id, updatedAt }) => ({
+    author,
+    id,
+    updatedAt,
+  }));
+  const reviewThreads = exact.reviewThreads.nodes.map(
+    ({ id, isResolved }) => ({ id, isResolved }),
+  );
   return {
     ...exact,
-    comments: { totalCount: exact.comments.nodes.length },
+    comments: {
+      nodes: comments,
+      pageInfo: exact.comments.pageInfo,
+      totalCount: comments.length,
+    },
     id: `pull-${number}`,
-    reviewThreads: { totalCount: exact.reviewThreads.nodes.length },
+    reviewThreads: {
+      nodes: reviewThreads,
+      pageInfo: exact.reviewThreads.pageInfo,
+      totalCount: reviewThreads.length,
+    },
     statusCheckRollup:
       exact.statusCheckRollup === null
         ? null
@@ -297,6 +304,7 @@ function pollNode(number, overrides = {}) {
             },
             state: exact.statusCheckRollup.state,
           },
+    ...compactOverrides,
   };
 }
 
@@ -338,9 +346,15 @@ describe("GitHub CI evidence", () => {
     },
   );
 
-  it.each(["REQUESTED", "QUEUED", "IN_PROGRESS", "WAITING", "PENDING"])(
-    "normalizes non-completed CheckRun status %s as running",
-    async (status) => {
+  it.each([
+    ["IN_PROGRESS", 1, 0, "in_progress"],
+    ["REQUESTED", 0, 1, "queued"],
+    ["QUEUED", 0, 1, "queued"],
+    ["WAITING", 0, 1, "queued"],
+    ["PENDING", 0, 1, "queued"],
+  ])(
+    "normalizes non-completed CheckRun status %s with its exact execution phase",
+    async (status, inProgress, queued, checkState) => {
       const result = await fetchAuthoredPulls({
         graphql: async () =>
           search([
@@ -355,11 +369,14 @@ describe("GitHub CI evidence", () => {
       });
       expect(result.pulls[0].ci).toMatchObject({
         complete: true,
+        inProgress,
         passed: 0,
+        queued,
         running: 1,
         state: "pending",
         total: 1,
       });
+      expect(result.pulls[0].ci.checks[0].state).toBe(checkState);
     },
   );
 
@@ -475,7 +492,9 @@ describe("GitHub CI evidence", () => {
       checks: [],
       complete: true,
       failed: 0,
+      inProgress: 0,
       passed: 0,
+      queued: 0,
       running: 0,
       state: "none",
       total: 0,
@@ -704,6 +723,46 @@ describe("authored search and exact loader", () => {
     );
   });
 
+  it.each(["CLOSED", "MERGED"])(
+    "silently skips a terminal %s result before legacy hydration",
+    async (state) => {
+      const terminal = node(1, {
+        comments: {
+          nodes: [],
+          pageInfo: pageInfo(true, "terminal-comments"),
+        },
+        reviewThreads: {
+          nodes: [],
+          pageInfo: pageInfo(true, "terminal-threads"),
+        },
+        state,
+        statusCheckRollup: {
+          commit: { oid: SHA },
+          contexts: contexts([], {
+            checkRunCount: 1,
+            cursor: "terminal-contexts",
+            next: true,
+          }),
+          state: "SUCCESS",
+        },
+      });
+      const graphql = vi.fn(async (document) => {
+        if (document === OUTER_QUERY) return search([terminal]);
+        throw new Error("terminal pull was hydrated");
+      });
+
+      await expect(fetchAuthoredPulls({ graphql })).resolves.toEqual({
+        partial: false,
+        pulls: [],
+        viewerLogin: "viewer",
+        warnings: [],
+      });
+      expect(graphql.mock.calls.map(([document]) => document)).toEqual([
+        OUTER_QUERY,
+      ]);
+    },
+  );
+
   it("keeps delegated author:@me results while reporting malformed evidence", async () => {
     const result = await fetchAuthoredPulls({
       graphql: async () =>
@@ -878,6 +937,58 @@ describe("targeted authored pull authorization", () => {
       isCrossRepository: false,
       viewerLogin: "viewer",
       viewerPermission: "WRITE",
+    });
+  });
+
+  it("loads a purpose-specific commit-count proof without weakening authored membership", async () => {
+    const exact = node(7, {
+      commits: { totalCount: 3 },
+    });
+    const graphql = vi.fn(async (document) => {
+      expect(document).toBe(TARGET_PULL_COMMITS_QUERY);
+      return target(exact, [exact]);
+    });
+
+    await expect(
+      fetchPullCommitsAuthorization({
+        graphql,
+        number: 7,
+        repository: "example/repo",
+      }),
+    ).resolves.toMatchObject({
+      authored: true,
+      commitCount: 3,
+      complete: true,
+      headRefName: "fix/review",
+      headRepository: "example/repo",
+      isCrossRepository: false,
+    });
+  });
+
+  it("fails the commit-count proof closed when the count drifts across search pages", async () => {
+    const exact = node(7, { commits: { totalCount: 3 } });
+    const graphql = vi.fn(async (_document, variables) =>
+      variables.after === null
+        ? target(exact, [node(1)], {
+            count: 2,
+            cursor: "next",
+            next: true,
+          })
+        : target(node(7, { commits: { totalCount: 4 } }), [exact], {
+            count: 2,
+          }),
+    );
+
+    await expect(
+      fetchPullCommitsAuthorization({
+        graphql,
+        number: 7,
+        repository: "example/repo",
+      }),
+    ).resolves.toMatchObject({
+      authored: false,
+      commitCount: 3,
+      complete: false,
     });
   });
 
@@ -1173,6 +1284,125 @@ describe("rate-efficient authored pull polling", () => {
     ]);
   });
 
+  it.each(["CLOSED", "MERGED"])(
+    "silently skips an initial terminal %s poll result",
+    async (state) => {
+      const graphql = vi.fn(async (document) => {
+        if (document === POLL_QUERY) {
+          return search([pollNode(1, { state })]);
+        }
+        throw new Error("terminal pull was hydrated");
+      });
+      const poll = createAuthoredPullPoller({ graphql });
+
+      await expect(poll()).resolves.toEqual({
+        partial: false,
+        pulls: [],
+        viewerLogin: "viewer",
+        warnings: [],
+      });
+      expect(graphql.mock.calls.map(([document]) => document)).toEqual([
+        POLL_QUERY,
+      ]);
+    },
+  );
+
+  it("hydrates only open members from mixed terminal poll results", async () => {
+    const graphql = vi.fn(async (document, variables) => {
+      if (document === POLL_QUERY) {
+        return search([
+          pollNode(1, { state: "CLOSED" }),
+          pollNode(2),
+          pollNode(3, { state: "MERGED" }),
+        ]);
+      }
+      if (document === PULL_QUERY) {
+        expect(variables).toEqual({
+          name: "repo",
+          number: 2,
+          owner: "example",
+        });
+        return {
+          repository: { pullRequest: node(2) },
+          viewer: { login: "viewer" },
+        };
+      }
+      throw new Error("unexpected query");
+    });
+    const poll = createAuthoredPullPoller({ graphql });
+
+    const result = await poll();
+
+    expect(result).toMatchObject({
+      partial: false,
+      viewerLogin: "viewer",
+      warnings: [],
+    });
+    expect(result.pulls.map(({ number }) => number)).toEqual([2]);
+    expect(graphql.mock.calls.map(([document]) => document)).toEqual([
+      POLL_QUERY,
+      PULL_QUERY,
+    ]);
+  });
+
+  it("evicts terminal members and rehydrates them if they later reopen", async () => {
+    let polls = 0;
+    const graphql = vi.fn(async (document) => {
+      if (document === POLL_QUERY) {
+        polls += 1;
+        return search([
+          pollNode(1, { state: polls === 2 ? "CLOSED" : "OPEN" }),
+        ]);
+      }
+      if (document === PULL_QUERY) {
+        return {
+          repository: { pullRequest: node(1) },
+          viewer: { login: "viewer" },
+        };
+      }
+      throw new Error("unexpected query");
+    });
+    const poll = createAuthoredPullPoller({ graphql });
+
+    expect((await poll()).pulls).toHaveLength(1);
+    await expect(poll()).resolves.toEqual({
+      partial: false,
+      pulls: [],
+      viewerLogin: "viewer",
+      warnings: [],
+    });
+    expect((await poll()).pulls).toHaveLength(1);
+    expect(graphql.mock.calls.map(([document]) => document)).toEqual([
+      POLL_QUERY,
+      PULL_QUERY,
+      POLL_QUERY,
+      POLL_QUERY,
+      PULL_QUERY,
+    ]);
+  });
+
+  it("keeps unknown pull states malformed and partial", async () => {
+    const graphql = vi.fn(async (document) => {
+      if (document === POLL_QUERY) {
+        return search([pollNode(1, { state: "PAUSED" })]);
+      }
+      throw new Error("an unknown pull state was hydrated");
+    });
+    const poll = createAuthoredPullPoller({ graphql });
+
+    await expect(poll()).resolves.toEqual({
+      partial: true,
+      pulls: [],
+      viewerLogin: "viewer",
+      warnings: [
+        "GitHub returned malformed search result nodes; some pull requests were skipped.",
+      ],
+    });
+    expect(graphql.mock.calls.map(([document]) => document)).toEqual([
+      POLL_QUERY,
+    ]);
+  });
+
   it("reuses complete evidence when the lightweight poll fingerprint is unchanged", async () => {
     const graphql = vi.fn(async (document) => {
       if (document === POLL_QUERY) return search([pollNode(1)]);
@@ -1195,9 +1425,230 @@ describe("rate-efficient authored pull polling", () => {
       PULL_QUERY,
       POLL_QUERY,
     ]);
-    expect(POLL_QUERY).not.toContain("comments(first: 100)");
-    expect(POLL_QUERY).not.toContain("reviewThreads(first: 100)");
+    expect(POLL_QUERY).toContain("comments(first: 100)");
+    expect(POLL_QUERY).toContain("reviewThreads(first: 100)");
+    expect(POLL_QUERY).not.toContain("body");
+    expect(POLL_QUERY).not.toContain("createdAt");
+    expect(POLL_QUERY).not.toContain("isOutdated");
     expect(POLL_QUERY).not.toContain("contexts(first: 100)");
+  });
+
+  it("keeps the compact poll at an estimated three GraphQL points per search page", () => {
+    const start = POLL_QUERY.indexOf("reviewThreads(first: 100)");
+    const open = POLL_QUERY.indexOf("{", start);
+    let depth = 1;
+    let close = open + 1;
+    while (depth > 0 && close < POLL_QUERY.length) {
+      if (POLL_QUERY[close] === "{") depth += 1;
+      if (POLL_QUERY[close] === "}") depth -= 1;
+      close += 1;
+    }
+    const selection = POLL_QUERY.slice(open + 1, close - 1);
+    expect(selection).toContain("totalCount");
+    expect(selection).toContain("pageInfo");
+    expect(selection).toContain("nodes");
+    expect(selection).toContain("id");
+    expect(selection).toContain("isResolved");
+    expect(selection).not.toMatch(/\b[A-Za-z_]\w*\s*\(/);
+
+    expect(
+      POLL_QUERY.match(
+        /\b[A-Za-z_]\w*\s*\(\s*[^)]*\b(?:first|last)\s*:/g,
+      ),
+    ).toHaveLength(4);
+
+    // GitHub estimates primary cost by counting connection requests, dividing
+    // by 100, and rounding. At 100 pulls this is 1 search + 100 CI contexts +
+    // 100 review-thread connections + 100 issue-comment connections = 301,
+    // or about 3 points. Nesting comments below 100 threads made it 10,301,
+    // or about 103 points.
+    const pulls = 100;
+    const threads = 100;
+    const compactRequests = 1 + pulls + pulls + pulls;
+    const nestedRequests = compactRequests + pulls * threads;
+    expect(Math.round(compactRequests / 100)).toBe(3);
+    expect(Math.round(nestedRequests / 100)).toBe(103);
+  });
+
+  it.each([
+    [
+      "duplicate issue-comment identities",
+      (indexed) => ({
+        ...indexed,
+        comments: {
+          ...indexed.comments,
+          nodes: [indexed.comments.nodes[0], indexed.comments.nodes[0]],
+          totalCount: 2,
+        },
+      }),
+    ],
+    [
+      "inconsistent issue-comment totals",
+      (indexed) => ({
+        ...indexed,
+        comments: { ...indexed.comments, totalCount: 2 },
+      }),
+    ],
+    [
+      "more than 100 issue comments",
+      (indexed) => ({
+        ...indexed,
+        comments: {
+          ...indexed.comments,
+          pageInfo: pageInfo(true, "more-comments"),
+          totalCount: 101,
+        },
+      }),
+    ],
+    [
+      "malformed issue-comment page information",
+      (indexed) => ({
+        ...indexed,
+        comments: {
+          ...indexed.comments,
+          pageInfo: { endCursor: 7, hasNextPage: false },
+        },
+      }),
+    ],
+    [
+      "missing issue-comment author identity",
+      (indexed) => ({
+        ...indexed,
+        comments: {
+          ...indexed.comments,
+          nodes: [{ ...indexed.comments.nodes[0], author: undefined }],
+        },
+      }),
+    ],
+    [
+      "duplicate review-thread identities",
+      (indexed) => ({
+        ...indexed,
+        reviewThreads: {
+          ...indexed.reviewThreads,
+          nodes: [
+            indexed.reviewThreads.nodes[0],
+            indexed.reviewThreads.nodes[0],
+          ],
+          totalCount: 2,
+        },
+      }),
+    ],
+    [
+      "inconsistent review-thread totals",
+      (indexed) => ({
+        ...indexed,
+        reviewThreads: { ...indexed.reviewThreads, totalCount: 2 },
+      }),
+    ],
+    [
+      "more than 100 review threads",
+      (indexed) => ({
+        ...indexed,
+        reviewThreads: {
+          ...indexed.reviewThreads,
+          pageInfo: pageInfo(true, "more-threads"),
+          totalCount: 101,
+        },
+      }),
+    ],
+    [
+      "malformed review-thread page information",
+      (indexed) => ({
+        ...indexed,
+        reviewThreads: {
+          ...indexed.reviewThreads,
+          pageInfo: { endCursor: 7, hasNextPage: false },
+        },
+      }),
+    ],
+    [
+      "malformed review-thread resolution",
+      (indexed) => ({
+        ...indexed,
+        reviewThreads: {
+          ...indexed.reviewThreads,
+          nodes: [
+            {
+              ...indexed.reviewThreads.nodes[0],
+              isResolved: "false",
+            },
+          ],
+        },
+      }),
+    ],
+  ])(
+    "hydrates every poll and never reuses ready evidence for %s",
+    async (_label, corrupt) => {
+      let fullLoads = 0;
+      const comment = summaryComment(1);
+      const resolved = thread(1, { resolved: true });
+      const overrides = {
+        comments: { nodes: [comment], pageInfo: pageInfo() },
+        reviewThreads: { nodes: [resolved], pageInfo: pageInfo() },
+      };
+      const indexed = corrupt(pollNode(1, overrides));
+      const graphql = vi.fn(async (document) => {
+        if (document === POLL_QUERY) return search([indexed]);
+        if (document === PULL_QUERY) {
+          fullLoads += 1;
+          return {
+            repository: { pullRequest: node(1, overrides) },
+            viewer: { login: "viewer" },
+          };
+        }
+        throw new Error("unexpected query");
+      });
+      const poll = createAuthoredPullPoller({ graphql });
+
+      expect(assessPull((await poll()).pulls[0], 1).ready).toBe(true);
+      expect(assessPull((await poll()).pulls[0], 1).ready).toBe(true);
+      expect(fullLoads).toBe(2);
+      expect(
+        graphql.mock.calls.filter(
+          ([document]) => document === EVIDENCE_STATES_QUERY,
+        ),
+      ).toHaveLength(0);
+    },
+  );
+
+  it("reuses complete compact evidence at the 100-node connection boundary", async () => {
+    let fullLoads = 0;
+    const comments = [
+      ...Array.from({ length: 99 }, (_, index) => ({
+        ...issueComment(index + 1, `Ordinary comment ${index + 1}`),
+        author: { login: "reviewer" },
+      })),
+      summaryComment(100),
+    ];
+    const reviewThreads = Array.from({ length: 100 }, (_, index) =>
+      thread(index + 1, { resolved: true }),
+    );
+    const overrides = {
+      comments: { nodes: comments, pageInfo: pageInfo() },
+      reviewThreads: { nodes: reviewThreads, pageInfo: pageInfo() },
+    };
+    const graphql = vi.fn(async (document) => {
+      if (document === POLL_QUERY) return search([pollNode(1, overrides)]);
+      if (document === PULL_QUERY) {
+        fullLoads += 1;
+        return {
+          repository: { pullRequest: node(1, overrides) },
+          viewer: { login: "viewer" },
+        };
+      }
+      throw new Error("unexpected query");
+    });
+    const poll = createAuthoredPullPoller({ graphql });
+
+    expect(assessPull((await poll()).pulls[0], 1).ready).toBe(true);
+    expect(assessPull((await poll()).pulls[0], 1).ready).toBe(true);
+    expect(fullLoads).toBe(1);
+    expect(
+      graphql.mock.calls.filter(
+        ([document]) => document === EVIDENCE_STATES_QUERY,
+      ),
+    ).toHaveLength(0);
   });
 
   it("retries full hydration while any exact readiness evidence is incomplete", async () => {
@@ -1472,7 +1923,9 @@ describe("rate-efficient authored pull polling", () => {
     const second = await poll();
 
     expect(second.pulls[0].ci).toMatchObject({
+      inProgress: 1,
       passed: 1,
+      queued: 0,
       running: 1,
       total: 2,
     });
@@ -1664,22 +2117,12 @@ describe("rate-efficient authored pull polling", () => {
           pollNode(1, {
             comments: { nodes: [comment], pageInfo: pageInfo() },
             reviewThreads: {
-              nodes: [thread(1, { resolved: true })],
+              nodes: [thread(1, { resolved: polls === 1 })],
               pageInfo: pageInfo(),
             },
             statusCheckRollup,
           }),
         ]);
-      }
-      if (document === EVIDENCE_STATES_QUERY) {
-        const current = thread(1, { resolved: true });
-        return {
-          nodes: [
-            threadEvidence(current),
-            issueCommentEvidence(comment),
-            reviewCommentEvidence(current.comments.nodes[0]),
-          ],
-        };
       }
       if (document === PULL_QUERY) {
         fullLoads += 1;
@@ -1720,7 +2163,7 @@ describe("rate-efficient authored pull polling", () => {
       graphql.mock.calls.filter(
         ([document]) => document === EVIDENCE_STATES_QUERY,
       ),
-    ).toHaveLength(1);
+    ).toHaveLength(0);
   });
 
   it("fully hydrates successful CI after degraded evidence before restoring readiness", async () => {
@@ -1744,22 +2187,12 @@ describe("rate-efficient authored pull polling", () => {
           pollNode(1, {
             comments: { nodes: [comment], pageInfo: pageInfo() },
             reviewThreads: {
-              nodes: [thread(1, { resolved: true })],
+              nodes: [thread(1, { resolved: polls < 3 })],
               pageInfo: pageInfo(),
             },
             statusCheckRollup: polls === 1 ? firstRollup : indexedRollup,
           }),
         ]);
-      }
-      if (document === EVIDENCE_STATES_QUERY) {
-        const current = thread(1, { resolved: true });
-        return {
-          nodes: [
-            threadEvidence(current),
-            issueCommentEvidence(comment),
-            reviewCommentEvidence(current.comments.nodes[0]),
-          ],
-        };
       }
       if (document === PULL_QUERY) {
         fullLoads += 1;
@@ -1810,17 +2243,23 @@ describe("rate-efficient authored pull polling", () => {
       graphql.mock.calls.filter(
         ([document]) => document === EVIDENCE_STATES_QUERY,
       ),
-    ).toHaveLength(2);
+    ).toHaveLength(0);
   });
 
   it("probes unchanged non-ready evidence without rehydrating when it has not changed", async () => {
     let fullLoads = 0;
+    const comment = summaryComment(1);
     const current = thread(1);
+    const resolved = thread(2, { resolved: true });
     const graphql = vi.fn(async (document) => {
       if (document === POLL_QUERY) {
         return search([
           pollNode(1, {
-            reviewThreads: { nodes: [current], pageInfo: pageInfo() },
+            comments: { nodes: [comment], pageInfo: pageInfo() },
+            reviewThreads: {
+              nodes: [current, resolved],
+              pageInfo: pageInfo(),
+            },
           }),
         ]);
       }
@@ -1837,8 +2276,9 @@ describe("rate-efficient authored pull polling", () => {
         return {
           repository: {
             pullRequest: node(1, {
+              comments: { nodes: [comment], pageInfo: pageInfo() },
               reviewThreads: {
-                nodes: [current],
+                nodes: [current, resolved],
                 pageInfo: pageInfo(),
               },
             }),
@@ -1854,10 +2294,127 @@ describe("rate-efficient authored pull polling", () => {
     expect((await poll()).pulls[0].unresolvedThreads).toHaveLength(1);
     expect(fullLoads).toBe(1);
     expect(
-      graphql.mock.calls.filter(
+      graphql.mock.calls.find(
         ([document]) => document === EVIDENCE_STATES_QUERY,
+      )?.[1].ids,
+    ).toEqual(["thread-1", "review-comment-1"]);
+    expect(EVIDENCE_STATES_QUERY).toContain(
+      "... on PullRequestReviewThread",
+    );
+    expect(EVIDENCE_STATES_QUERY).toContain("comments(first: 1)");
+    expect(EVIDENCE_STATES_QUERY).not.toContain("... on IssueComment");
+  });
+
+  it("batches more than 100 unresolved evidence node IDs without rehydrating", async () => {
+    let fullLoads = 0;
+    const reviewThreads = Array.from({ length: 51 }, (_, index) =>
+      thread(index + 1),
+    );
+    const evidence = new Map([
+      ...reviewThreads.map((value) => [value.id, threadEvidence(value)]),
+      ...reviewThreads.flatMap((value) =>
+        value.comments.nodes.map((comment) => [
+          comment.id,
+          reviewCommentEvidence(comment),
+        ]),
       ),
-    ).toHaveLength(1);
+    ]);
+    const graphql = vi.fn(async (document, variables) => {
+      if (document === POLL_QUERY) {
+        return search([
+          pollNode(1, {
+            reviewThreads: { nodes: reviewThreads, pageInfo: pageInfo() },
+          }),
+        ]);
+      }
+      if (document === EVIDENCE_STATES_QUERY) {
+        expect(variables.ids.length).toBeLessThanOrEqual(100);
+        return { nodes: variables.ids.map((id) => evidence.get(id)) };
+      }
+      if (document === PULL_QUERY) {
+        fullLoads += 1;
+        return {
+          repository: {
+            pullRequest: node(1, {
+              reviewThreads: { nodes: reviewThreads, pageInfo: pageInfo() },
+            }),
+          },
+          viewer: { login: "viewer" },
+        };
+      }
+      throw new Error("unexpected query");
+    });
+    const poll = createAuthoredPullPoller({ graphql });
+
+    expect((await poll()).pulls[0].unresolvedThreads).toHaveLength(51);
+    expect((await poll()).pulls[0].unresolvedThreads).toHaveLength(51);
+    expect(fullLoads).toBe(1);
+    expect(
+      graphql.mock.calls
+        .filter(([document]) => document === EVIDENCE_STATES_QUERY)
+        .map(([, variables]) => variables.ids.length),
+    ).toEqual([100, 2]);
+  });
+
+  it.each([
+    [
+      "an incomplete node list",
+      (current) => [threadEvidence(current)],
+    ],
+    [
+      "duplicate node identities",
+      (current) => [threadEvidence(current), threadEvidence(current)],
+    ],
+    [
+      "malformed thread totals",
+      (current) => [
+        {
+          ...threadEvidence(current),
+          comments: { totalCount: "1" },
+        },
+        reviewCommentEvidence(current.comments.nodes[0]),
+      ],
+    ],
+  ])("fails closed when an evidence probe returns %s", async (_label, reply) => {
+    let fullLoads = 0;
+    const current = thread(1);
+    const graphql = vi.fn(async (document) => {
+      if (document === POLL_QUERY) {
+        return search([
+          pollNode(1, {
+            reviewThreads: { nodes: [current], pageInfo: pageInfo() },
+          }),
+        ]);
+      }
+      if (document === EVIDENCE_STATES_QUERY) {
+        return { nodes: reply(current) };
+      }
+      if (document === PULL_QUERY) {
+        fullLoads += 1;
+        return {
+          repository: {
+            pullRequest: node(1, {
+              reviewThreads: { nodes: [current], pageInfo: pageInfo() },
+            }),
+          },
+          viewer: { login: "viewer" },
+        };
+      }
+      throw new Error("unexpected query");
+    });
+    const poll = createAuthoredPullPoller({ graphql });
+
+    await poll();
+    const result = await poll();
+
+    expect(result.warnings).toContain(
+      "GitHub could not refresh cached pull request evidence; affected pull requests were marked incomplete.",
+    );
+    expect(result.pulls[0]).toMatchObject({
+      commentsComplete: false,
+      threadsComplete: false,
+    });
+    expect(fullLoads).toBe(1);
   });
 
   it("marks an unchanged non-ready pull incomplete when its evidence probe fails", async () => {
@@ -1901,7 +2458,7 @@ describe("rate-efficient authored pull polling", () => {
     ).toHaveLength(1);
   });
 
-  it("rehydrates an unchanged non-ready pull when an ordinary issue comment is edited", async () => {
+  it("ignores ordinary issue-comment edits that cannot change readiness", async () => {
     let fullLoads = 0;
     const original = {
       ...issueComment(1, "Please handle this edge case."),
@@ -1919,9 +2476,6 @@ describe("rate-efficient authored pull polling", () => {
             comments: { nodes: [original], pageInfo: pageInfo() },
           }),
         ]);
-      }
-      if (document === EVIDENCE_STATES_QUERY) {
-        return { nodes: [issueCommentEvidence(edited)] };
       }
       if (document === PULL_QUERY) {
         fullLoads += 1;
@@ -1942,16 +2496,17 @@ describe("rate-efficient authored pull polling", () => {
     const poll = createAuthoredPullPoller({ graphql });
 
     expect((await poll()).pulls[0].comments[0].body).toBe(original.body);
-    expect((await poll()).pulls[0].comments[0].body).toBe(edited.body);
-    expect(fullLoads).toBe(2);
+    expect((await poll()).pulls[0].comments[0].body).toBe(original.body);
+    expect(fullLoads).toBe(1);
     expect(
-      graphql.mock.calls.find(
+      graphql.mock.calls.filter(
         ([document]) => document === EVIDENCE_STATES_QUERY,
-      )?.[1].ids,
-    ).toEqual(["comment-1"]);
+      ),
+    ).toHaveLength(0);
   });
 
   it("rehydrates an unchanged non-ready pull when an existing review thread gets a reply", async () => {
+    let polls = 0;
     let fullLoads = 0;
     const root = reviewComment(1);
     const reply = {
@@ -1963,16 +2518,20 @@ describe("rate-efficient authored pull polling", () => {
     const replied = thread(1, { comments: [root, reply] });
     const graphql = vi.fn(async (document) => {
       if (document === POLL_QUERY) {
+        polls += 1;
         return search([
           pollNode(1, {
-            reviewThreads: { nodes: [original], pageInfo: pageInfo() },
+            reviewThreads: {
+              nodes: [polls === 1 ? original : replied],
+              pageInfo: pageInfo(),
+            },
           }),
         ]);
       }
       if (document === EVIDENCE_STATES_QUERY) {
         return {
           nodes: [
-            threadEvidence(original, { commentCount: 2 }),
+            threadEvidence(replied),
             reviewCommentEvidence(root),
           ],
         };
@@ -2002,6 +2561,56 @@ describe("rate-efficient authored pull polling", () => {
       2,
     );
     expect(fullLoads).toBe(2);
+    expect(
+      graphql.mock.calls.find(
+        ([document]) => document === EVIDENCE_STATES_QUERY,
+      )?.[1].ids,
+    ).toEqual(["thread-1", "review-comment-1"]);
+  });
+
+  it("detects a same-count review-thread replacement from compact identities", async () => {
+    let fullLoads = 0;
+    let polls = 0;
+    const original = thread(1);
+    const replacement = thread(2);
+    const graphql = vi.fn(async (document) => {
+      if (document === POLL_QUERY) {
+        polls += 1;
+        return search([
+          pollNode(1, {
+            reviewThreads: {
+              nodes: [polls === 1 ? original : replacement],
+              pageInfo: pageInfo(),
+            },
+          }),
+        ]);
+      }
+      if (document === PULL_QUERY) {
+        fullLoads += 1;
+        return {
+          repository: {
+            pullRequest: node(1, {
+              reviewThreads: {
+                nodes: [fullLoads === 1 ? original : replacement],
+                pageInfo: pageInfo(),
+              },
+            }),
+          },
+          viewer: { login: "viewer" },
+        };
+      }
+      throw new Error("unexpected query");
+    });
+    const poll = createAuthoredPullPoller({ graphql });
+
+    expect((await poll()).pulls[0].unresolvedThreads[0].id).toBe("thread-1");
+    expect((await poll()).pulls[0].unresolvedThreads[0].id).toBe("thread-2");
+    expect(fullLoads).toBe(2);
+    expect(
+      graphql.mock.calls.filter(
+        ([document]) => document === EVIDENCE_STATES_QUERY,
+      ),
+    ).toHaveLength(0);
   });
 
   it("rehydrates an unchanged non-ready pull when a review comment is edited", async () => {
@@ -2057,30 +2666,71 @@ describe("rate-efficient authored pull polling", () => {
     expect(fullLoads).toBe(2);
   });
 
-  it("detects a reopened thread on a ready pull without relying on pull updatedAt or totalCount", async () => {
+  it("rehydrates an unresolved thread when a review comment is deleted and replaced", async () => {
     let fullLoads = 0;
-    const comment = summaryComment(1);
-    const graphql = vi.fn(async (document, variables) => {
+    const original = reviewComment(1, "Please cover the failure path.");
+    const replacement = reviewComment(2, "Please cover the retry path.");
+    const originalThread = thread(1, { comments: [original] });
+    const replacedThread = thread(1, { comments: [replacement] });
+    const graphql = vi.fn(async (document) => {
       if (document === POLL_QUERY) {
         return search([
           pollNode(1, {
-            comments: { nodes: [comment], pageInfo: pageInfo() },
             reviewThreads: {
-              nodes: [thread(1, { resolved: true })],
+              nodes: [replacedThread],
               pageInfo: pageInfo(),
             },
           }),
         ]);
       }
       if (document === EVIDENCE_STATES_QUERY) {
-        const current = thread(1, { resolved: false });
+        return { nodes: [threadEvidence(replacedThread), null] };
+      }
+      if (document === PULL_QUERY) {
+        fullLoads += 1;
         return {
-          nodes: [
-            threadEvidence(current),
-            issueCommentEvidence(comment),
-            reviewCommentEvidence(current.comments.nodes[0]),
-          ],
+          repository: {
+            pullRequest: node(1, {
+              reviewThreads: {
+                nodes: [
+                  fullLoads === 1 ? originalThread : replacedThread,
+                ],
+                pageInfo: pageInfo(),
+              },
+            }),
+          },
+          viewer: { login: "viewer" },
         };
+      }
+      throw new Error("unexpected query");
+    });
+    const poll = createAuthoredPullPoller({ graphql });
+
+    expect(
+      (await poll()).pulls[0].unresolvedThreads[0].comments[0].id,
+    ).toBe(original.id);
+    expect(
+      (await poll()).pulls[0].unresolvedThreads[0].comments[0].id,
+    ).toBe(replacement.id);
+    expect(fullLoads).toBe(2);
+  });
+
+  it("detects a reopened thread on a ready pull without relying on pull updatedAt or totalCount", async () => {
+    let fullLoads = 0;
+    let polls = 0;
+    const comment = summaryComment(1);
+    const graphql = vi.fn(async (document) => {
+      if (document === POLL_QUERY) {
+        polls += 1;
+        return search([
+          pollNode(1, {
+            comments: { nodes: [comment], pageInfo: pageInfo() },
+            reviewThreads: {
+              nodes: [thread(1, { resolved: polls === 1 })],
+              pageInfo: pageInfo(),
+            },
+          }),
+        ]);
       }
       if (document === PULL_QUERY) {
         fullLoads += 1;
@@ -2108,13 +2758,65 @@ describe("rate-efficient authored pull polling", () => {
     });
     expect(fullLoads).toBe(2);
     expect(
-      graphql.mock.calls.find(
+      graphql.mock.calls.filter(
         ([document]) => document === EVIDENCE_STATES_QUERY,
-      )?.[1].ids,
-    ).toEqual(["thread-1", "comment-1", "review-comment-1"]);
+      ),
+    ).toHaveLength(0);
   });
 
-  it("demotes a ready pull when its targeted evidence probe fails", async () => {
+  it("detects a resolved thread from the compact fingerprint", async () => {
+    let fullLoads = 0;
+    let polls = 0;
+    const comment = summaryComment(1);
+    const graphql = vi.fn(async (document) => {
+      if (document === POLL_QUERY) {
+        polls += 1;
+        return search([
+          pollNode(1, {
+            comments: { nodes: [comment], pageInfo: pageInfo() },
+            reviewThreads: {
+              nodes: [thread(1, { resolved: polls > 1 })],
+              pageInfo: pageInfo(),
+            },
+          }),
+        ]);
+      }
+      if (document === PULL_QUERY) {
+        fullLoads += 1;
+        return {
+          repository: {
+            pullRequest: node(1, {
+              comments: { nodes: [comment], pageInfo: pageInfo() },
+              reviewThreads: {
+                nodes: [thread(1, { resolved: fullLoads > 1 })],
+                pageInfo: pageInfo(),
+              },
+            }),
+          },
+          viewer: { login: "viewer" },
+        };
+      }
+      throw new Error("unexpected query");
+    });
+    const poll = createAuthoredPullPoller({ graphql });
+
+    expect(assessPull((await poll()).pulls[0], 1)).toMatchObject({
+      ready: false,
+      unresolved: 1,
+    });
+    expect(assessPull((await poll()).pulls[0], 1)).toMatchObject({
+      ready: true,
+      unresolved: 0,
+    });
+    expect(fullLoads).toBe(2);
+    expect(
+      graphql.mock.calls.filter(
+        ([document]) => document === EVIDENCE_STATES_QUERY,
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("uses compact evidence without a secondary probe for a ready pull", async () => {
     const comment = summaryComment(1);
     const graphql = vi.fn(async (document) => {
       if (document === POLL_QUERY) {
@@ -2124,8 +2826,6 @@ describe("rate-efficient authored pull polling", () => {
           }),
         ]);
       }
-      if (document === EVIDENCE_STATES_QUERY)
-        throw new Error("temporary evidence failure");
       if (document === PULL_QUERY) {
         return {
           repository: {
@@ -2144,50 +2844,134 @@ describe("rate-efficient authored pull polling", () => {
     const changed = await poll();
 
     expect(changed.partial).toBe(false);
-    expect(changed.warnings).not.toHaveLength(0);
-    expect(assessPull(changed.pulls[0], 1).ready).toBe(false);
-    expect(changed.pulls[0]).toMatchObject({
-      commentsComplete: false,
-      threadsComplete: false,
-    });
+    expect(changed.warnings).toEqual([]);
+    expect(assessPull(changed.pulls[0], 1).ready).toBe(true);
     expect(
       graphql.mock.calls.filter(([document]) => document === PULL_QUERY),
     ).toHaveLength(1);
+    expect(
+      graphql.mock.calls.filter(
+        ([document]) => document === EVIDENCE_STATES_QUERY,
+      ),
+    ).toHaveLength(0);
   });
 
-  it("probes every Greptile comment and detects the selected summary edit on a ready pull", async () => {
+  it("detects a same-count ordinary-to-Greptile replacement", async () => {
     let fullLoads = 0;
-    const historical = summaryComment(1, {
-      confidence: 3,
-      createdAt: "2026-07-16T00:00:00Z",
-      updatedAt: "2026-07-18T00:00:00Z",
-    });
-    const graphql = vi.fn(async (document, variables) => {
+    let polls = 0;
+    const ordinary = {
+      ...issueComment(1, "Automated review is still running."),
+      author: { login: "reviewer" },
+    };
+    const summary = summaryComment(2);
+    const graphql = vi.fn(async (document) => {
       if (document === POLL_QUERY) {
+        polls += 1;
         return search([
           pollNode(1, {
             comments: {
-              nodes: [historical, summaryComment(2)],
+              nodes: [polls === 1 ? ordinary : summary],
               pageInfo: pageInfo(),
             },
           }),
         ]);
       }
-      if (document === EVIDENCE_STATES_QUERY) {
+      if (document === PULL_QUERY) {
+        fullLoads += 1;
         return {
-          nodes: [
-            {
-              __typename: "IssueComment",
-              id: "comment-1",
-              updatedAt: historical.updatedAt,
-            },
-            {
-              __typename: "IssueComment",
-              id: "comment-2",
-              updatedAt: "2026-07-17T01:00:00Z",
-            },
-          ],
+          repository: {
+            pullRequest: node(1, {
+              comments: {
+                nodes: [fullLoads === 1 ? ordinary : summary],
+                pageInfo: pageInfo(),
+              },
+            }),
+          },
+          viewer: { login: "viewer" },
         };
+      }
+      throw new Error("unexpected query");
+    });
+    const poll = createAuthoredPullPoller({ graphql });
+
+    expect(assessPull((await poll()).pulls[0], 1).ready).toBe(false);
+    expect(assessPull((await poll()).pulls[0], 1).ready).toBe(true);
+    expect(fullLoads).toBe(2);
+    expect(
+      graphql.mock.calls.filter(
+        ([document]) => document === EVIDENCE_STATES_QUERY,
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("detects deletion of the active Greptile summary", async () => {
+    let fullLoads = 0;
+    let polls = 0;
+    const summary = summaryComment(1);
+    const graphql = vi.fn(async (document) => {
+      if (document === POLL_QUERY) {
+        polls += 1;
+        return search([
+          pollNode(1, {
+            comments: {
+              nodes: polls === 1 ? [summary] : [],
+              pageInfo: pageInfo(),
+            },
+          }),
+        ]);
+      }
+      if (document === PULL_QUERY) {
+        fullLoads += 1;
+        return {
+          repository: {
+            pullRequest: node(1, {
+              comments: {
+                nodes: fullLoads === 1 ? [summary] : [],
+                pageInfo: pageInfo(),
+              },
+            }),
+          },
+          viewer: { login: "viewer" },
+        };
+      }
+      throw new Error("unexpected query");
+    });
+    const poll = createAuthoredPullPoller({ graphql });
+
+    expect(assessPull((await poll()).pulls[0], 1).ready).toBe(true);
+    expect(assessPull((await poll()).pulls[0], 1).ready).toBe(false);
+    expect(fullLoads).toBe(2);
+    expect(
+      graphql.mock.calls.filter(
+        ([document]) => document === EVIDENCE_STATES_QUERY,
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("detects the selected Greptile summary edit from compact evidence", async () => {
+    let fullLoads = 0;
+    let polls = 0;
+    const historical = summaryComment(1, {
+      confidence: 3,
+      createdAt: "2026-07-16T00:00:00Z",
+      updatedAt: "2026-07-18T00:00:00Z",
+    });
+    const graphql = vi.fn(async (document) => {
+      if (document === POLL_QUERY) {
+        polls += 1;
+        const current = summaryComment(2, {
+          confidence: polls > 1 ? 4 : 5,
+          updatedAt:
+            polls > 1 ? "2026-07-17T01:00:00Z" : "2026-07-17T00:00:00Z",
+        });
+        return search([
+          pollNode(1, {
+            comments: {
+              nodes: [historical, current],
+              pageInfo: pageInfo(),
+            },
+          }),
+        ]);
       }
       if (document === PULL_QUERY) {
         fullLoads += 1;
@@ -2216,41 +3000,84 @@ describe("rate-efficient authored pull polling", () => {
     });
     expect(fullLoads).toBe(2);
     expect(
-      graphql.mock.calls.find(
+      graphql.mock.calls.filter(
         ([document]) => document === EVIDENCE_STATES_QUERY,
-      )?.[1].ids,
-    ).toEqual(["comment-1", "comment-2"]);
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("never reuses ready evidence when exact hydration races compact Greptile evidence", async () => {
+    let fullLoads = 0;
+    let polls = 0;
+    const original = summaryComment(1);
+    const edited = summaryComment(1, {
+      confidence: 4,
+      updatedAt: "2026-07-17T01:00:00Z",
+    });
+    const graphql = vi.fn(async (document) => {
+      if (document === POLL_QUERY) {
+        polls += 1;
+        return search([
+          pollNode(1, {
+            comments: {
+              nodes: [polls === 1 ? original : edited],
+              pageInfo: pageInfo(),
+            },
+          }),
+        ]);
+      }
+      if (document === PULL_QUERY) {
+        fullLoads += 1;
+        return {
+          repository: {
+            pullRequest: node(1, {
+              comments: { nodes: [original], pageInfo: pageInfo() },
+            }),
+          },
+          viewer: { login: "viewer" },
+        };
+      }
+      throw new Error("unexpected query");
+    });
+    const poll = createAuthoredPullPoller({ graphql });
+
+    expect(assessPull((await poll()).pulls[0], 1).ready).toBe(true);
+    const raced = await poll();
+
+    expect(assessPull(raced.pulls[0], 1).ready).toBe(false);
+    expect(raced.pulls[0]).toMatchObject({
+      commentsComplete: false,
+      threadsComplete: false,
+    });
+    expect(raced.warnings).toContain(
+      "GitHub returned incomplete evidence for example/repo#1; the pull request was not updated.",
+    );
+    expect(fullLoads).toBe(2);
   });
 
   it("detects when a newer Greptile comment is edited into the active summary", async () => {
     let fullLoads = 0;
+    let polls = 0;
     const active = summaryComment(1);
     const latent = issueComment(2, "Greptile review is still running.");
     latent.createdAt = "2026-07-17T01:00:00Z";
     latent.updatedAt = "2026-07-17T01:00:00Z";
     const graphql = vi.fn(async (document) => {
       if (document === POLL_QUERY) {
+        polls += 1;
+        const latest =
+          polls === 1
+            ? latent
+            : {
+                ...latent,
+                body: `Confidence Score: 2/5\nLast reviewed commit: ${SHA}`,
+                updatedAt: "2026-07-17T02:00:00Z",
+              };
         return search([
           pollNode(1, {
-            comments: { nodes: [active, latent], pageInfo: pageInfo() },
+            comments: { nodes: [active, latest], pageInfo: pageInfo() },
           }),
         ]);
-      }
-      if (document === EVIDENCE_STATES_QUERY) {
-        return {
-          nodes: [
-            {
-              __typename: "IssueComment",
-              id: "comment-1",
-              updatedAt: active.updatedAt,
-            },
-            {
-              __typename: "IssueComment",
-              id: "comment-2",
-              updatedAt: "2026-07-17T02:00:00Z",
-            },
-          ],
-        };
       }
       if (document === PULL_QUERY) {
         fullLoads += 1;
@@ -2282,10 +3109,10 @@ describe("rate-efficient authored pull polling", () => {
     });
     expect(fullLoads).toBe(2);
     expect(
-      graphql.mock.calls.find(
+      graphql.mock.calls.filter(
         ([document]) => document === EVIDENCE_STATES_QUERY,
-      )?.[1].ids,
-    ).toEqual(["comment-1", "comment-2"]);
+      ),
+    ).toHaveLength(0);
   });
 });
 

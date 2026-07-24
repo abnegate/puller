@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ClaudeRunHttpError,
+  type AgentRunRequest,
   type AutoTrigger,
   type ClaudeRunEvent,
   type ClaudeRunRequest,
@@ -17,8 +18,14 @@ import {
   type RunStartOutcome,
   type RunState,
   type RunStatus,
+  type StartRunOptions,
   usePullRuns,
 } from "./runs";
+import {
+  createMemoryRunTranscriptStore,
+  RunTranscriptStoreError,
+  type RunTranscriptStore,
+} from "./run-transcripts";
 import { createPullsResponse } from "./test/fixtures";
 import type { PullReadiness } from "./types";
 
@@ -34,8 +41,8 @@ const repairs = vi.hoisted(() => ({
 
 vi.mock("./fixes", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./fixes")>()),
-  cancelClaudeRun: fixes.cancel,
-  streamClaudeRun: fixes.stream,
+  cancelAgentRun: fixes.cancel,
+  streamAgentRun: fixes.stream,
 }));
 
 vi.mock("./api", () => ({
@@ -96,6 +103,19 @@ const state = (status: RunStatus): RunState => ({
   ...IDLE_RUN_STATE,
   status,
 });
+
+const renderPullRuns = (
+  currentPulls: readonly PullReadiness[],
+  onRepairReady: (pull: PullReadiness) => void = () => undefined,
+) => {
+  const transcriptStore = createMemoryRunTranscriptStore();
+  return {
+    transcriptStore,
+    ...renderHook(() =>
+      usePullRuns(currentPulls, onRepairReady, { transcriptStore }),
+    ),
+  };
+};
 
 afterEach(() => {
   cleanup();
@@ -197,6 +217,34 @@ describe("groupPulls", () => {
     },
   );
 
+  it("keeps a preparing review fix in its current section until the server accepts it", () => {
+    const response = createPullsResponse();
+    const ready = response.ready[0]!;
+    const blocked = response.notReady[0]!;
+    const reviewPreparing: RunState = {
+      ...state("preparing"),
+      source: "review",
+    };
+    const preparing = groupPulls(
+      [ready, blocked],
+      new Map([
+        [ready.url, reviewPreparing],
+        [blocked.url, reviewPreparing],
+      ]),
+    );
+
+    expect(preparing.ready).toEqual([ready]);
+    expect(preparing.blocked).toEqual([blocked]);
+    expect(preparing.progress).toEqual([]);
+
+    const running = groupPulls(
+      [ready],
+      new Map([[ready.url, { ...reviewPreparing, status: "running" }]]),
+    );
+    expect(running.progress).toEqual([ready]);
+    expect(running.ready).toEqual([]);
+  });
+
   it.each(["idle", "completed", "failed", "cancelled", "limited"] as const)(
     "%s is terminal and does not override a Ready snapshot",
     (status) => {
@@ -259,6 +307,58 @@ describe("groupPulls", () => {
 });
 
 describe("usePullRuns", () => {
+  it("snapshots the selected agent for active and historic runs while future runs follow a changed preference", async () => {
+    const pull = pulls()[0];
+    const first = createDeferred<void>();
+    fixes.stream.mockImplementation(async function* (
+      request: AgentRunRequest,
+    ) {
+      yield {
+        agent: request.agent,
+        number: request.number,
+        repository: request.repository,
+        runId: `${request.agent}-run`,
+        type: "start",
+      };
+      if (request.agent === "claude") await first.promise;
+      yield { exitCode: 0, type: "complete" };
+    });
+    const transcriptStore = createMemoryRunTranscriptStore();
+    const view = renderHook(
+      ({ agent }: { agent: "claude" | "codex" }) =>
+        usePullRuns([pull], undefined, { agent, transcriptStore }),
+      { initialProps: { agent: "claude" as "claude" | "codex" } },
+    );
+
+    let claude!: RunStartOutcome;
+    await act(async () => {
+      claude = await view.result.current.start(pull);
+    });
+    expect(view.result.current.states.get(pull.url)?.agent).toBe("claude");
+
+    view.rerender({ agent: "codex" });
+    expect(view.result.current.states.get(pull.url)?.agent).toBe("claude");
+
+    await act(async () => {
+      first.resolve();
+      if (claude.kind !== "accepted") throw new Error("Run was not accepted.");
+      await claude.completion;
+    });
+    await act(async () => {
+      await finishRun(view.result.current.start(pull));
+    });
+
+    expect(fixes.stream.mock.calls.map(([request]) => request.agent)).toEqual([
+      "claude",
+      "codex",
+    ]);
+    expect(
+      view.result.current.states
+        .get(pull.url)
+        ?.history.map((entry) => entry.agent),
+    ).toEqual(["codex", "claude"]);
+  });
+
   it.each([
     { expected: "", instructions: "", label: "empty" },
     { expected: "", instructions: "  \n\t ", label: "whitespace-only" },
@@ -283,7 +383,7 @@ describe("usePullRuns", () => {
         yield { text: "Working.", type: "text" } satisfies ClaudeRunEvent;
         yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
       });
-      const view = renderHook(() => usePullRuns([pull]));
+      const view = renderPullRuns([pull]);
       act(() => view.result.current.setMessage(pull.url, instructions));
 
       await act(async () => {
@@ -292,6 +392,7 @@ describe("usePullRuns", () => {
 
       expect(fixes.stream).toHaveBeenCalledWith(
         {
+          agent: "claude",
           expectedHeadRefOid: pull.headRefOid,
           message: expected,
           number: pull.number,
@@ -301,10 +402,31 @@ describe("usePullRuns", () => {
         expect.any(AbortSignal),
       );
       expect(view.result.current.states.get(pull.url)).toMatchObject({
-        message: instructions,
-        output: "Working.",
+        message: "",
+        output: "",
+        status: "idle",
+      });
+      const [history] = view.result.current.states.get(pull.url)?.history ?? [];
+      expect(history).toMatchObject({
+        headRefOid: pull.headRefOid,
+        id: "run-instructions",
+        instructions: {
+          kind: "manual",
+          text: expected || "Fix every current readiness blocker.",
+        },
+        source: "manual",
         status: "completed",
       });
+      if (!history) throw new Error("Run history was not archived.");
+      await expect(view.result.current.loadTranscript(history)).resolves.toBe(
+        "Working.",
+      );
+      expect(Object.isFrozen(history)).toBe(true);
+      expect(
+        Object.isFrozen(
+          view.result.current.states.get(pull.url)?.history ?? [],
+        ),
+      ).toBe(true);
     },
   );
 
@@ -332,7 +454,7 @@ describe("usePullRuns", () => {
         type: "error",
       } satisfies ClaudeRunEvent;
     });
-    const view = renderHook(() => usePullRuns([pull]));
+    const view = renderPullRuns([pull]);
     act(() =>
       view.result.current.setMessage(pull.url, "Keep my manual draft."),
     );
@@ -340,6 +462,7 @@ describe("usePullRuns", () => {
     let outcome!: RunStartOutcome;
     await act(async () => {
       outcome = await view.result.current.start(pull, {
+        agent: "claude",
         message: "Fix the newly failed check.",
         parallelism: 4,
         source: "auto",
@@ -360,6 +483,7 @@ describe("usePullRuns", () => {
     });
     expect(fixes.stream).toHaveBeenCalledWith(
       {
+        agent: "claude",
         expectedHeadRefOid: pull.headRefOid,
         message: "Fix the newly failed check.",
         number: pull.number,
@@ -378,9 +502,76 @@ describe("usePullRuns", () => {
     });
     expect(view.result.current.states.get(pull.url)).toMatchObject({
       message: "Keep my manual draft.",
+      output: "",
+      source: "manual",
+      status: "idle",
+    });
+    const [history] = view.result.current.states.get(pull.url)?.history ?? [];
+    expect(history).toMatchObject({
+      id: "auto-run",
+      instructions: {
+        kind: "auto",
+        message: "Fix the newly failed check.",
+        triggers: [trigger],
+      },
       source: "auto",
       status: "failed",
     });
+    if (!history) throw new Error("Run history was not archived.");
+    await expect(view.result.current.loadTranscript(history)).resolves.toBe(
+      "[error] The accepted run failed later.\n",
+    );
+  });
+
+  it("uses the validated Auto agent override instead of the current selector", async () => {
+    const [pull] = pulls();
+    fixes.stream.mockImplementation(async function* (
+      request: AgentRunRequest,
+    ) {
+      yield {
+        agent: request.agent,
+        number: request.number,
+        repository: request.repository,
+        runId: "captured-auto-agent",
+        type: "start",
+      };
+      yield { exitCode: 0, type: "complete" };
+    });
+    const transcriptStore = createMemoryRunTranscriptStore();
+    const view = renderHook(() =>
+      usePullRuns([pull], undefined, { agent: "codex", transcriptStore }),
+    );
+
+    await act(async () => {
+      await finishRun(
+        view.result.current.start(pull, {
+          agent: "claude",
+          parallelism: 1,
+          source: "auto",
+          triggers: [automaticTrigger(pull)],
+        }),
+      );
+    });
+    expect(fixes.stream).toHaveBeenCalledWith(
+      expect.objectContaining({ agent: "claude", source: "auto" }),
+      expect.any(AbortSignal),
+    );
+
+    let invalid!: RunStartOutcome;
+    await act(async () => {
+      invalid = await view.result.current.start(pull, {
+        agent: "invalid",
+        parallelism: 1,
+        source: "auto",
+        triggers: [automaticTrigger(pull)],
+      } as unknown as StartRunOptions);
+    });
+    expect(invalid).toMatchObject({
+      code: "agent_invalid",
+      kind: "failed",
+      source: "auto",
+    });
+    expect(fixes.stream).toHaveBeenCalledOnce();
   });
 
   it("accepts a review fix, moves a Ready pull into progress, and streams output without replacing the manual draft", async () => {
@@ -410,7 +601,7 @@ describe("usePullRuns", () => {
       await gate.promise;
       yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
     });
-    const view = renderHook(() => usePullRuns([pull]));
+    const view = renderPullRuns([pull]);
     act(() =>
       view.result.current.setMessage(pull.url, "Keep my manual draft."),
     );
@@ -432,6 +623,7 @@ describe("usePullRuns", () => {
     });
     expect(fixes.stream).toHaveBeenCalledWith(
       {
+        agent: "claude",
         expectedBaseRefOid: pull.baseRefOid,
         expectedHeadRefOid: pull.headRefOid,
         feedback,
@@ -460,10 +652,567 @@ describe("usePullRuns", () => {
       await expect(outcome.completion).resolves.toBe("completed");
     });
     expect(view.result.current.states.get(pull.url)).toMatchObject({
-      output: "Editing the retry path.",
+      message: "Keep my manual draft.",
+      output: "",
+      source: "manual",
+      status: "idle",
+    });
+    const [history] = view.result.current.states.get(pull.url)?.history ?? [];
+    expect(history).toMatchObject({
+      id: "review-fix",
+      instructions: {
+        feedback,
+        kind: "review",
+        message: "",
+      },
       source: "review",
       status: "completed",
     });
+    if (!history) throw new Error("Run history was not archived.");
+    await expect(view.result.current.loadTranscript(history)).resolves.toBe(
+      "Editing the retry path.",
+    );
+  });
+
+  it.each([
+    {
+      status: "failed",
+      terminal: {
+        message: "The review worker failed.",
+        type: "error",
+      } satisfies ClaudeRunEvent,
+    },
+    {
+      status: "cancelled",
+      terminal: { type: "cancelled" } satisfies ClaudeRunEvent,
+    },
+    {
+      status: "limited",
+      terminal: {
+        message: "Review capacity reached.",
+        type: "limit",
+      } satisfies ClaudeRunEvent,
+    },
+  ] as const)(
+    "preserves the exact review draft and coordinates after a $status run",
+    async ({ status, terminal }) => {
+      const pull = createPullsResponse().ready[0]!;
+      const draft = "  Keep this exact retry draft.\n  Including spacing.  ";
+      const feedback = {
+        body: "Keep this exact retry draft.\n  Including spacing.",
+        line: 88,
+        path: "src/Retry.php",
+        side: "LEFT",
+        startLine: 84,
+        startSide: "LEFT",
+      } satisfies ReviewFeedback;
+      fixes.stream.mockImplementation(async function* (
+        request: ClaudeRunRequest,
+      ) {
+        yield {
+          number: request.number,
+          repository: request.repository,
+          runId: `review-${status}`,
+          type: "start",
+        } satisfies ClaudeRunEvent;
+        yield terminal;
+      });
+      const view = renderPullRuns([pull]);
+
+      await act(async () => {
+        const outcome = await view.result.current.start(pull, {
+          draft,
+          expectedBaseRefOid: pull.baseRefOid,
+          feedback,
+          source: "review",
+        });
+        if (outcome.kind !== "accepted") {
+          throw new Error("Review fix was not accepted.");
+        }
+        await expect(outcome.completion).resolves.toBe(status);
+      });
+
+      const retry = view.result.current.states.get(pull.url)?.reviewRetry;
+      expect(retry).toEqual({
+        attemptToken: expect.any(String),
+        baseRefOid: pull.baseRefOid,
+        draft,
+        feedback,
+        headRefOid: pull.headRefOid,
+        runId: `review-${status}`,
+        status,
+      });
+      expect(Object.isFrozen(retry)).toBe(true);
+      expect(
+        view.result.current.states.get(pull.url)?.reviewAttemptToken,
+      ).toBeNull();
+
+      act(() =>
+        view.result.current.clearReviewRetry(pull.url, "stale-attempt-token"),
+      );
+      expect(view.result.current.states.get(pull.url)?.reviewRetry).toBe(retry);
+      act(() =>
+        view.result.current.clearReviewRetry(pull.url, retry!.attemptToken),
+      );
+      expect(view.result.current.states.get(pull.url)?.reviewRetry).toBeNull();
+    },
+  );
+
+  it("clears an old review retry when a newer attempt is accepted and keeps it cleared after success", async () => {
+    const gate = createDeferred<void>();
+    const pull = createPullsResponse().ready[0]!;
+    const feedback = {
+      body: "Retry the exact selected line.",
+      line: 17,
+      path: "src/Retry.php",
+      side: "RIGHT",
+    } satisfies ReviewFeedback;
+    let invocation = 0;
+    fixes.stream.mockImplementation(async function* (
+      request: ClaudeRunRequest,
+    ) {
+      invocation += 1;
+      yield {
+        number: request.number,
+        repository: request.repository,
+        runId: `review-attempt-${invocation}`,
+        type: "start",
+      } satisfies ClaudeRunEvent;
+      if (invocation === 1) {
+        yield {
+          message: "First attempt failed.",
+          type: "error",
+        } satisfies ClaudeRunEvent;
+        return;
+      }
+      await gate.promise;
+      yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
+    });
+    const view = renderPullRuns([pull]);
+
+    await act(async () => {
+      await finishRun(
+        view.result.current.start(pull, {
+          draft: "First exact draft.",
+          expectedBaseRefOid: pull.baseRefOid,
+          feedback,
+          source: "review",
+        }),
+      );
+    });
+    const oldRetry = view.result.current.states.get(pull.url)?.reviewRetry;
+    expect(oldRetry?.status).toBe("failed");
+
+    let newer!: RunStartOutcome;
+    await act(async () => {
+      newer = await view.result.current.start(pull, {
+        draft: "Second exact draft.",
+        expectedBaseRefOid: pull.baseRefOid,
+        feedback,
+        source: "review",
+      });
+    });
+    expect(newer.kind).toBe("accepted");
+    expect(view.result.current.states.get(pull.url)?.reviewRetry).toBeNull();
+    expect(
+      view.result.current.states.get(pull.url)?.reviewAttemptToken,
+    ).not.toBe(oldRetry?.attemptToken);
+
+    await act(async () => {
+      gate.resolve();
+      if (newer.kind !== "accepted") {
+        throw new Error("New review fix was not accepted.");
+      }
+      await expect(newer.completion).resolves.toBe("completed");
+    });
+    expect(view.result.current.states.get(pull.url)?.reviewRetry).toBeNull();
+    expect(
+      view.result.current.states.get(pull.url)?.reviewAttemptToken,
+    ).toBeNull();
+  });
+
+  it("retains retry state during non-authoritative omission, clears it on a new head, and purges transcript bytes on removal", async () => {
+    const pull = createPullsResponse().ready[0]!;
+    const feedback = {
+      body: "Preserve this retry.",
+      line: 17,
+      path: "src/Retry.php",
+      side: "RIGHT",
+    } satisfies ReviewFeedback;
+    fixes.stream.mockImplementation(async function* (
+      request: ClaudeRunRequest,
+    ) {
+      yield {
+        number: request.number,
+        repository: request.repository,
+        runId: "review-authority",
+        type: "start",
+      } satisfies ClaudeRunEvent;
+      yield {
+        message: "Review failed.",
+        type: "error",
+      } satisfies ClaudeRunEvent;
+    });
+    const transcriptStore = createMemoryRunTranscriptStore();
+    const view = renderHook(
+      ({
+        authoritative,
+        items,
+      }: {
+        authoritative: boolean;
+        items: PullReadiness[];
+      }) =>
+        usePullRuns(items, undefined, {
+          authoritative,
+          transcriptStore,
+        }),
+      {
+        initialProps: {
+          authoritative: true,
+          items: [pull],
+        },
+      },
+    );
+
+    await act(async () => {
+      await finishRun(
+        view.result.current.start(pull, {
+          draft: "  Preserve this exact draft.  ",
+          expectedBaseRefOid: pull.baseRefOid,
+          feedback,
+          source: "review",
+        }),
+      );
+    });
+    const stateBefore = view.result.current.states.get(pull.url);
+    const [history] = stateBefore?.history ?? [];
+    expect(stateBefore?.reviewRetry).not.toBeNull();
+    expect(history).toBeDefined();
+
+    view.rerender({ authoritative: false, items: [] });
+    expect(view.result.current.states.get(pull.url)).toBe(stateBefore);
+
+    const changed = {
+      ...pull,
+      headRefOid: "cccccccccccccccccccccccccccccccccccccccc",
+    };
+    view.rerender({ authoritative: true, items: [changed] });
+    await waitFor(() =>
+      expect(view.result.current.states.get(pull.url)?.reviewRetry).toBeNull(),
+    );
+    expect(view.result.current.states.get(pull.url)?.history).toHaveLength(1);
+
+    view.rerender({ authoritative: true, items: [] });
+    await waitFor(() =>
+      expect(view.result.current.states.has(pull.url)).toBe(false),
+    );
+    if (!history) throw new Error("Run history was not archived.");
+    await waitFor(async () =>
+      expect(await view.result.current.loadTranscript(history)).toBeNull(),
+    );
+  });
+
+  it("archives transcript metadata and resets the composer even when browser storage fails", async () => {
+    const [pull] = pulls();
+    const transcriptStore: RunTranscriptStore = {
+      retriesFailedDeletes: false,
+      delete: vi.fn(async () => undefined),
+      get: vi.fn(async () => null),
+      initialize: vi.fn(async () => undefined),
+      put: vi.fn(async () => {
+        throw new RunTranscriptStoreError(
+          "indexeddb_write_failed",
+          "Browser storage rejected the transcript.",
+        );
+      }),
+    };
+    fixes.stream.mockImplementation(async function* (
+      request: ClaudeRunRequest,
+    ) {
+      yield {
+        number: request.number,
+        repository: request.repository,
+        runId: "storage-failure",
+        type: "start",
+      } satisfies ClaudeRunEvent;
+      yield { text: "Exact output.", type: "text" } satisfies ClaudeRunEvent;
+      yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
+    });
+    const view = renderHook(() =>
+      usePullRuns([pull], undefined, { transcriptStore }),
+    );
+
+    await act(async () => {
+      await finishRun(view.result.current.start(pull));
+    });
+
+    const current = view.result.current.states.get(pull.url);
+    const [history] = current?.history ?? [];
+    expect(current).toMatchObject({
+      output: "",
+      status: "idle",
+    });
+    expect(history).toMatchObject({
+      id: "storage-failure",
+      transcript: {
+        availability: "unavailable",
+        bytes: new TextEncoder().encode("Exact output.").byteLength,
+        code: "indexeddb_write_failed",
+        message: "Browser storage rejected the transcript.",
+      },
+    });
+    expect(history).not.toHaveProperty("output");
+    if (!history) throw new Error("Run history was not archived.");
+    await expect(
+      view.result.current.loadTranscript(history),
+    ).rejects.toMatchObject({
+      code: "indexeddb_write_failed",
+      message: "Browser storage rejected the transcript.",
+    });
+  });
+
+  it("resets the composer and performs no durable write when transcript storage initialization fails", async () => {
+    const [pull] = pulls();
+    const initialize = vi.fn(async () => {
+      throw new RunTranscriptStoreError(
+        "indexeddb_initialize_failed",
+        "Browser transcript cleanup could not be completed.",
+      );
+    });
+    const put = vi.fn(async () => undefined);
+    const transcriptStore: RunTranscriptStore = {
+      retriesFailedDeletes: true,
+      delete: vi.fn(async () => undefined),
+      get: vi.fn(async () => null),
+      initialize,
+      put,
+    };
+    fixes.stream.mockImplementation(async function* (
+      request: ClaudeRunRequest,
+    ) {
+      yield {
+        number: request.number,
+        repository: request.repository,
+        runId: "storage-initialization-failure",
+        type: "start",
+      } satisfies ClaudeRunEvent;
+      yield {
+        text: "Output must not enter durable storage.",
+        type: "text",
+      } satisfies ClaudeRunEvent;
+      yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
+    });
+    const view = renderHook(() =>
+      usePullRuns([pull], undefined, { transcriptStore }),
+    );
+    act(() => view.result.current.setMessage(pull.url, "Fix this pull."));
+
+    await act(async () => {
+      await finishRun(view.result.current.start(pull));
+    });
+
+    const current = view.result.current.states.get(pull.url);
+    const [history] = current?.history ?? [];
+    expect(current).toMatchObject({
+      message: "",
+      output: "",
+      status: "idle",
+    });
+    expect(history).toMatchObject({
+      id: "storage-initialization-failure",
+      transcript: {
+        availability: "unavailable",
+        code: "indexeddb_initialize_failed",
+        message: "Browser transcript cleanup could not be completed.",
+      },
+    });
+    expect(initialize).toHaveBeenCalledOnce();
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it("compensates for a transcript write that finishes after authoritative removal", async () => {
+    const [pull] = pulls();
+    const putGate = createDeferred<void>();
+    const stored = new Map<string, string>();
+    const deleted: string[][] = [];
+    const transcriptStore: RunTranscriptStore = {
+      retriesFailedDeletes: false,
+      async delete(keys) {
+        deleted.push([...keys]);
+        for (const key of keys) stored.delete(key);
+      },
+      async get(key) {
+        return stored.get(key) ?? null;
+      },
+      async initialize() {},
+      async put(key, transcript) {
+        await putGate.promise;
+        stored.set(key, transcript);
+      },
+    };
+    fixes.cancel.mockResolvedValue(undefined);
+    fixes.stream.mockImplementation(async function* (
+      request: ClaudeRunRequest,
+    ) {
+      yield {
+        number: request.number,
+        repository: request.repository,
+        runId: "removed-during-write",
+        type: "start",
+      } satisfies ClaudeRunEvent;
+      yield { text: "Must be purged.", type: "text" } satisfies ClaudeRunEvent;
+      yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
+    });
+    const view = renderHook(
+      ({ items }) =>
+        usePullRuns(items, undefined, {
+          authoritative: true,
+          transcriptStore,
+        }),
+      { initialProps: { items: [pull] } },
+    );
+
+    let outcome!: RunStartOutcome;
+    await act(async () => {
+      outcome = await view.result.current.start(pull);
+    });
+    expect(outcome.kind).toBe("accepted");
+
+    view.rerender({ items: [] });
+    await waitFor(() =>
+      expect(view.result.current.states.has(pull.url)).toBe(false),
+    );
+
+    await act(async () => {
+      putGate.resolve();
+      if (outcome.kind !== "accepted") {
+        throw new Error("Run was not accepted.");
+      }
+      await expect(outcome.completion).resolves.toBe("completed");
+    });
+
+    expect(view.result.current.states.has(pull.url)).toBe(false);
+    expect(stored.size).toBe(0);
+    expect(
+      deleted.flat().some((key) => key.includes("removed-during-write")),
+    ).toBe(true);
+  });
+
+  it("does not cap history metadata and keeps transcript bytes out of React state", async () => {
+    const [pull] = pulls();
+    let invocation = 0;
+    fixes.stream.mockImplementation(async function* (
+      request: ClaudeRunRequest,
+    ) {
+      invocation += 1;
+      yield {
+        number: request.number,
+        repository: request.repository,
+        runId: `history-${invocation}`,
+        type: "start",
+      } satisfies ClaudeRunEvent;
+      yield {
+        text: `transcript-${invocation}`,
+        type: "text",
+      } satisfies ClaudeRunEvent;
+      yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
+    });
+    const view = renderPullRuns([pull]);
+
+    for (let index = 0; index < 25; index += 1) {
+      await act(async () => {
+        await finishRun(view.result.current.start(pull));
+      });
+    }
+
+    const history = view.result.current.states.get(pull.url)?.history ?? [];
+    expect(history).toHaveLength(25);
+    expect(history.every((entry) => !("output" in entry))).toBe(true);
+    expect(history[0]?.id).toBe("history-25");
+    expect(history.at(-1)?.id).toBe("history-1");
+    await expect(view.result.current.loadTranscript(history[0]!)).resolves.toBe(
+      "transcript-25",
+    );
+    await expect(
+      view.result.current.loadTranscript(history.at(-1)!),
+    ).resolves.toBe("transcript-1");
+  });
+
+  it("archives successive accepted runs newest first without sharing mutable history", async () => {
+    const [pull] = pulls();
+    let invocation = 0;
+    fixes.stream.mockImplementation(async function* (
+      request: ClaudeRunRequest,
+    ) {
+      invocation += 1;
+      yield {
+        number: request.number,
+        repository: request.repository,
+        runId: `successive-${invocation}`,
+        type: "start",
+      } satisfies ClaudeRunEvent;
+      yield {
+        text: `output-${invocation}`,
+        type: "text",
+      } satisfies ClaudeRunEvent;
+      yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
+    });
+    const view = renderPullRuns([pull]);
+
+    act(() => view.result.current.setMessage(pull.url, "First instructions."));
+    await act(async () => {
+      await finishRun(view.result.current.start(pull));
+    });
+    const firstHistory = view.result.current.states.get(pull.url)?.history;
+    expect(firstHistory).toEqual([
+      expect.objectContaining({
+        id: "successive-1",
+        instructions: {
+          kind: "manual",
+          text: "First instructions.",
+        },
+      }),
+    ]);
+    if (!firstHistory?.[0]) throw new Error("First run was not archived.");
+    await expect(
+      view.result.current.loadTranscript(firstHistory[0]),
+    ).resolves.toBe("output-1");
+
+    act(() => view.result.current.setMessage(pull.url, "Second instructions."));
+    await act(async () => {
+      await finishRun(view.result.current.start(pull));
+    });
+
+    const state = view.result.current.states.get(pull.url);
+    expect(state).toMatchObject({
+      message: "",
+      output: "",
+      status: "idle",
+    });
+    expect(state?.history).toEqual([
+      expect.objectContaining({
+        id: "successive-2",
+        instructions: {
+          kind: "manual",
+          text: "Second instructions.",
+        },
+      }),
+      expect.objectContaining({
+        id: "successive-1",
+        instructions: {
+          kind: "manual",
+          text: "First instructions.",
+        },
+      }),
+    ]);
+    await expect(
+      view.result.current.loadTranscript(state!.history[0]!),
+    ).resolves.toBe("output-2");
+    await expect(
+      view.result.current.loadTranscript(state!.history[1]!),
+    ).resolves.toBe("output-1");
+    expect(state?.history).not.toBe(firstHistory);
+    expect(firstHistory).toHaveLength(1);
   });
 
   it("deduplicates an active review fix through the existing per-pull run guard", async () => {
@@ -487,7 +1236,7 @@ describe("usePullRuns", () => {
       await gate.promise;
       yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
     });
-    const view = renderHook(() => usePullRuns([pull]));
+    const view = renderPullRuns([pull]);
 
     let first!: RunStartOutcome;
     await act(async () => {
@@ -542,11 +1291,12 @@ describe("usePullRuns", () => {
       fixes.stream.mockImplementation(() => {
         throw new ClaudeRunHttpError(409, code, `Service response: ${code}`);
       });
-      const view = renderHook(() => usePullRuns([pull]));
+      const view = renderPullRuns([pull]);
 
       let outcome!: RunStartOutcome;
       await act(async () => {
         outcome = await view.result.current.start(pull, {
+          agent: "claude",
           parallelism: 2,
           source: "auto",
           triggers: [automaticTrigger(pull)],
@@ -559,7 +1309,11 @@ describe("usePullRuns", () => {
         message: `Service response: ${code}`,
         source: "auto",
       });
-      expect(view.result.current.states.get(pull.url)?.status).toBe("failed");
+      expect(view.result.current.states.get(pull.url)).toMatchObject({
+        history: [],
+        output: `[error] Service response: ${code}\n`,
+        status: "failed",
+      });
     },
   );
 
@@ -568,11 +1322,12 @@ describe("usePullRuns", () => {
     fixes.stream.mockImplementation(() => {
       throw new TypeError("Network connection failed.");
     });
-    const view = renderHook(() => usePullRuns([pull]));
+    const view = renderPullRuns([pull]);
 
     let outcome!: RunStartOutcome;
     await act(async () => {
       outcome = await view.result.current.start(pull, {
+        agent: "claude",
         parallelism: 3,
         source: "auto",
         triggers: [automaticTrigger(pull)],
@@ -584,6 +1339,37 @@ describe("usePullRuns", () => {
       kind: "retryable",
       message: "Network connection failed.",
       source: "auto",
+    });
+    expect(view.result.current.states.get(pull.url)).toMatchObject({
+      history: [],
+      output: "[error] Network connection failed.\n",
+      status: "failed",
+    });
+  });
+
+  it("keeps a terminal event before acceptance visible without archiving it", async () => {
+    const [pull] = pulls();
+    fixes.stream.mockImplementation(async function* () {
+      yield {
+        message: "The request was rejected before it started.",
+        type: "error",
+      } satisfies ClaudeRunEvent;
+    });
+    const view = renderPullRuns([pull]);
+
+    let outcome!: RunStartOutcome;
+    await act(async () => {
+      outcome = await view.result.current.start(pull);
+    });
+
+    expect(outcome).toMatchObject({
+      kind: "failed",
+      source: "manual",
+    });
+    expect(view.result.current.states.get(pull.url)).toMatchObject({
+      history: [],
+      output: "[error] The request was rejected before it started.\n",
+      status: "failed",
     });
   });
 
@@ -609,11 +1395,12 @@ describe("usePullRuns", () => {
       await gate.promise;
       yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
     });
-    const view = renderHook(() => usePullRuns([pull]));
+    const view = renderPullRuns([pull]);
 
     let first!: RunStartOutcome;
     await act(async () => {
       first = await view.result.current.start(pull, {
+        agent: "claude",
         parallelism: 1,
         source: "auto",
         triggers: [firstTrigger, secondTrigger],
@@ -622,6 +1409,7 @@ describe("usePullRuns", () => {
     let duplicate!: RunStartOutcome;
     await act(async () => {
       duplicate = await view.result.current.start(pull, {
+        agent: "claude",
         parallelism: 4,
         source: "auto",
         triggers: [secondTrigger, firstTrigger],
@@ -650,6 +1438,7 @@ describe("usePullRuns", () => {
       let changedSet!: RunStartOutcome;
       await act(async () => {
         changedSet = await view.result.current.start(pull, {
+          agent: "claude",
           parallelism: 2,
           source: "auto",
           triggers,
@@ -665,6 +1454,7 @@ describe("usePullRuns", () => {
     let newer!: RunStartOutcome;
     await act(async () => {
       newer = await view.result.current.start(pull, {
+        agent: "claude",
         parallelism: 2,
         source: "auto",
         triggers: [
@@ -719,7 +1509,7 @@ describe("usePullRuns", () => {
         updatedAt: "2026-07-21T00:01:00.000Z",
       };
     });
-    const view = renderHook(() => usePullRuns([pull], refresh));
+    const view = renderPullRuns([pull], refresh);
     act(() =>
       view.result.current.setMessage(pull.url, "Keep this repair draft."),
     );
@@ -727,6 +1517,7 @@ describe("usePullRuns", () => {
     await act(async () => {
       await view.result.current.observeRepair(pull, {
         action: {
+          agent: "claude",
           deduplicated: false,
           id: "repair-1",
           state: "repair_queued",
@@ -751,6 +1542,112 @@ describe("usePullRuns", () => {
     });
   });
 
+  it("resets only stale repair state when the head changes and preserves fix history and the manual draft", async () => {
+    const [pull] = pulls();
+    fixes.stream.mockImplementation(async function* (
+      request: ClaudeRunRequest,
+    ) {
+      yield {
+        number: request.number,
+        repository: request.repository,
+        runId: "history-before-repair",
+        type: "start",
+      } satisfies ClaudeRunEvent;
+      yield { text: "Archived fix.", type: "text" } satisfies ClaudeRunEvent;
+      yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
+    });
+    let repairSignal!: AbortSignal;
+    repairs.stream.mockImplementation(async function* (
+      _action,
+      _pull,
+      signal: AbortSignal,
+    ) {
+      repairSignal = signal;
+      yield {
+        actionId: "repair-head-change",
+        headRefOid: pull.headRefOid,
+        number: pull.number,
+        output: "Repairing old head.",
+        repository: pull.repository,
+        state: "repair_running",
+        terminal: false,
+        type: "snapshot",
+        updatedAt: "2026-07-23T00:00:00.000Z",
+      };
+      await waitForAbort(signal);
+    });
+    const transcriptStore = createMemoryRunTranscriptStore();
+    const view = renderHook(
+      ({ items }) => usePullRuns(items, undefined, { transcriptStore }),
+      {
+        initialProps: { items: [pull] },
+      },
+    );
+    act(() => view.result.current.setMessage(pull.url, "Create history."));
+    await act(async () => {
+      await finishRun(view.result.current.start(pull));
+    });
+    act(() =>
+      view.result.current.setMessage(
+        pull.url,
+        "Keep this draft across repair reconciliation.",
+      ),
+    );
+
+    let observation!: Promise<void>;
+    act(() => {
+      observation = view.result.current.observeRepair(pull, {
+        action: {
+          agent: "claude",
+          deduplicated: false,
+          id: "repair-head-change",
+          state: "repair_running",
+          token: "A".repeat(43),
+          type: "repair_queued",
+        },
+        headRefOid: pull.headRefOid,
+        merged: false,
+        number: pull.number,
+        repository: pull.repository,
+        url: pull.url,
+      });
+    });
+    await waitFor(() =>
+      expect(view.result.current.states.get(pull.url)).toMatchObject({
+        kind: "repair",
+        status: "running",
+      }),
+    );
+
+    const changed = {
+      ...pull,
+      headRefOid: "cccccccccccccccccccccccccccccccccccccccc",
+    };
+    view.rerender({ items: [changed] });
+
+    await waitFor(() =>
+      expect(view.result.current.states.get(pull.url)).toMatchObject({
+        history: [
+          expect.objectContaining({
+            id: "history-before-repair",
+          }),
+        ],
+        kind: "fix",
+        message: "Keep this draft across repair reconciliation.",
+        output: "",
+        repairState: null,
+        status: "idle",
+      }),
+    );
+    const [history] = view.result.current.states.get(pull.url)?.history ?? [];
+    if (!history) throw new Error("Run history was not archived.");
+    await expect(view.result.current.loadTranscript(history)).resolves.toBe(
+      "Archived fix.",
+    );
+    expect(repairSignal.aborted).toBe(true);
+    await act(async () => observation);
+  });
+
   it("starting publishes before the stream yields and per-PR state stays independent", async () => {
     const gate = createDeferred<void>();
     const [first, second] = pulls();
@@ -766,9 +1663,13 @@ describe("usePullRuns", () => {
       } satisfies ClaudeRunEvent;
       yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
     });
-    const view = renderHook(({ items }) => usePullRuns(items), {
-      initialProps: { items: [first, second] },
-    });
+    const transcriptStore = createMemoryRunTranscriptStore();
+    const view = renderHook(
+      ({ items }) => usePullRuns(items, undefined, { transcriptStore }),
+      {
+        initialProps: { items: [first, second] },
+      },
+    );
 
     act(() => {
       view.result.current.setMessage(first.url, "Fix the first pull.");
@@ -792,7 +1693,112 @@ describe("usePullRuns", () => {
       gate.resolve();
       await task;
     });
-    expect(view.result.current.states.get(first.url)?.status).toBe("completed");
+    expect(view.result.current.states.get(first.url)).toMatchObject({
+      history: [expect.objectContaining({ status: "completed" })],
+      message: "",
+      status: "idle",
+    });
+  });
+
+  it("archives an accepted disconnect once and resets before resolving completion", async () => {
+    const [pull] = pulls();
+    fixes.stream.mockImplementation(async function* (
+      request: ClaudeRunRequest,
+    ) {
+      yield {
+        number: request.number,
+        repository: request.repository,
+        runId: "run-disconnect",
+        type: "start",
+      } satisfies ClaudeRunEvent;
+      yield { text: "Partial output.", type: "text" } satisfies ClaudeRunEvent;
+    });
+    const view = renderPullRuns([pull]);
+    act(() => view.result.current.setMessage(pull.url, "Disconnect safely."));
+
+    let outcome!: RunStartOutcome;
+    await act(async () => {
+      outcome = await view.result.current.start(pull);
+      if (outcome.kind !== "accepted") throw new Error("Run was not accepted.");
+      await expect(outcome.completion).resolves.toBe("failed");
+    });
+
+    expect(view.result.current.states.get(pull.url)).toMatchObject({
+      history: [
+        expect.objectContaining({
+          id: "run-disconnect",
+          status: "failed",
+        }),
+      ],
+      message: "Disconnect safely.",
+      output: "",
+      status: "idle",
+    });
+    const [history] = view.result.current.states.get(pull.url)?.history ?? [];
+    if (!history) throw new Error("Run history was not archived.");
+    await expect(view.result.current.loadTranscript(history)).resolves.toBe(
+      "Partial output.\n[error] Claude disconnected before reporting completion.\n",
+    );
+  });
+
+  it("archives an accepted stream exception and suppresses every later event", async () => {
+    const [pull] = pulls();
+    let lateEventPulled = false;
+    fixes.stream.mockImplementation(async function* (
+      request: ClaudeRunRequest,
+    ) {
+      yield {
+        number: request.number,
+        repository: request.repository,
+        runId: "run-exception",
+        type: "start",
+      } satisfies ClaudeRunEvent;
+      yield { text: "Before failure.", type: "text" } satisfies ClaudeRunEvent;
+      throw new Error("Stream parser failed.");
+    });
+    const view = renderPullRuns([pull]);
+
+    let outcome!: RunStartOutcome;
+    await act(async () => {
+      outcome = await view.result.current.start(pull);
+      if (outcome.kind !== "accepted") throw new Error("Run was not accepted.");
+      await expect(outcome.completion).resolves.toBe("failed");
+    });
+    const [history] = view.result.current.states.get(pull.url)?.history ?? [];
+    expect(history).toMatchObject({
+      id: "run-exception",
+      status: "failed",
+    });
+    if (!history) throw new Error("Run history was not archived.");
+    await expect(view.result.current.loadTranscript(history)).resolves.toBe(
+      "Before failure.\n[error] Stream parser failed.\n",
+    );
+
+    fixes.stream.mockImplementation(async function* (
+      request: ClaudeRunRequest,
+    ) {
+      yield {
+        number: request.number,
+        repository: request.repository,
+        runId: "run-terminal-late",
+        type: "start",
+      } satisfies ClaudeRunEvent;
+      yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
+      lateEventPulled = true;
+      yield {
+        text: "must never appear",
+        type: "text",
+      } satisfies ClaudeRunEvent;
+    });
+    await act(async () => {
+      await finishRun(view.result.current.start(pull));
+    });
+
+    expect(lateEventPulled).toBe(false);
+    expect(view.result.current.states.get(pull.url)?.history).toHaveLength(2);
+    expect(
+      view.result.current.states.get(pull.url)?.history[0]?.transcript.bytes,
+    ).toBe(0);
   });
 
   it("removal while starting invalidates purges and aborts without DELETE", async () => {
@@ -805,9 +1811,13 @@ describe("usePullRuns", () => {
       signal = runSignal;
       await waitForAbort(runSignal);
     });
-    const view = renderHook(({ items }) => usePullRuns(items), {
-      initialProps: { items: [pull] },
-    });
+    const transcriptStore = createMemoryRunTranscriptStore();
+    const view = renderHook(
+      ({ items }) => usePullRuns(items, undefined, { transcriptStore }),
+      {
+        initialProps: { items: [pull] },
+      },
+    );
     act(() => view.result.current.setMessage(pull.url, "Start this fix."));
     let task!: Promise<RunStartOutcome>;
     act(() => {
@@ -845,9 +1855,13 @@ describe("usePullRuns", () => {
         expect(cancellationSignal).not.toBe(streamSignal);
       },
     );
-    const view = renderHook(({ items }) => usePullRuns(items), {
-      initialProps: { items: [pull] },
-    });
+    const transcriptStore = createMemoryRunTranscriptStore();
+    const view = renderHook(
+      ({ items }) => usePullRuns(items, undefined, { transcriptStore }),
+      {
+        initialProps: { items: [pull] },
+      },
+    );
     act(() => view.result.current.setMessage(pull.url, "Run then remove."));
     let task!: Promise<RunStartOutcome>;
     act(() => {
@@ -887,7 +1901,7 @@ describe("usePullRuns", () => {
     fixes.cancel.mockImplementation(async () => {
       expect(streamSignal.aborted).toBe(true);
     });
-    const view = renderHook(() => usePullRuns([pull]));
+    const view = renderPullRuns([pull]);
     act(() => view.result.current.setMessage(pull.url, "Unmount this run."));
     act(() => {
       void view.result.current.start(pull);
@@ -922,9 +1936,13 @@ describe("usePullRuns", () => {
       yield { text: "late output", type: "text" } satisfies ClaudeRunEvent;
       yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
     });
-    const view = renderHook(({ items }) => usePullRuns(items), {
-      initialProps: { items: [pull] },
-    });
+    const transcriptStore = createMemoryRunTranscriptStore();
+    const view = renderHook(
+      ({ items }) => usePullRuns(items, undefined, { transcriptStore }),
+      {
+        initialProps: { items: [pull] },
+      },
+    );
     act(() => view.result.current.setMessage(pull.url, "Purge this run."));
     let task!: Promise<RunStartOutcome>;
     act(() => {
@@ -944,6 +1962,14 @@ describe("usePullRuns", () => {
     });
 
     expect(view.result.current.states.has(pull.url)).toBe(false);
+    view.rerender({ items: [pull] });
+    act(() => view.result.current.setMessage(pull.url, "Fresh state."));
+    expect(view.result.current.states.get(pull.url)).toMatchObject({
+      history: [],
+      message: "Fresh state.",
+      output: "",
+      status: "idle",
+    });
   });
 
   it("old generation cannot overwrite a newly started run", async () => {
@@ -972,9 +1998,13 @@ describe("usePullRuns", () => {
       }
       yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
     });
-    const view = renderHook(({ items }) => usePullRuns(items), {
-      initialProps: { items: [pull] },
-    });
+    const transcriptStore = createMemoryRunTranscriptStore();
+    const view = renderHook(
+      ({ items }) => usePullRuns(items, undefined, { transcriptStore }),
+      {
+        initialProps: { items: [pull] },
+      },
+    );
     act(() => view.result.current.setMessage(pull.url, "Old generation."));
     let oldTask!: Promise<RunStartOutcome>;
     act(() => {
@@ -1012,9 +2042,20 @@ describe("usePullRuns", () => {
       await newTask;
     });
     expect(view.result.current.states.get(pull.url)).toMatchObject({
-      output: "new output",
-      status: "completed",
+      history: [
+        expect.objectContaining({
+          id: "run-2",
+          status: "completed",
+        }),
+      ],
+      output: "",
+      status: "idle",
     });
+    const [history] = view.result.current.states.get(pull.url)?.history ?? [];
+    if (!history) throw new Error("Run history was not archived.");
+    await expect(view.result.current.loadTranscript(history)).resolves.toBe(
+      "new output",
+    );
   });
 
   it("manual cancel losing to completion preserves Completed", async () => {
@@ -1034,7 +2075,7 @@ describe("usePullRuns", () => {
       yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
     });
     fixes.cancel.mockReturnValue(cancelGate.promise);
-    const view = renderHook(() => usePullRuns([pull]));
+    const view = renderPullRuns([pull]);
     act(() => view.result.current.setMessage(pull.url, "Race completion."));
     let runTask!: Promise<RunStartOutcome>;
     act(() => {
@@ -1053,13 +2094,87 @@ describe("usePullRuns", () => {
       completeGate.resolve();
       await runTask;
     });
-    expect(view.result.current.states.get(pull.url)?.status).toBe("completed");
+    expect(view.result.current.states.get(pull.url)).toMatchObject({
+      history: [
+        expect.objectContaining({
+          id: "run-race",
+          status: "completed",
+        }),
+      ],
+      status: "idle",
+    });
     await act(async () => {
       cancelGate.resolve();
       await cancelTask;
     });
 
-    expect(view.result.current.states.get(pull.url)?.status).toBe("completed");
+    expect(view.result.current.states.get(pull.url)).toMatchObject({
+      history: [expect.objectContaining({ status: "completed" })],
+      status: "idle",
+    });
+  });
+
+  it("successful cancellation wins once when it precedes stream completion", async () => {
+    const completionGate = createDeferred<void>();
+    const [pull] = pulls();
+    let signal!: AbortSignal;
+    fixes.stream.mockImplementation(async function* (
+      request: ClaudeRunRequest,
+      runSignal: AbortSignal,
+    ) {
+      signal = runSignal;
+      yield {
+        number: request.number,
+        repository: request.repository,
+        runId: "cancel-wins",
+        type: "start",
+      } satisfies ClaudeRunEvent;
+      yield {
+        text: "Before cancellation.",
+        type: "text",
+      } satisfies ClaudeRunEvent;
+      await completionGate.promise;
+      yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
+    });
+    fixes.cancel.mockResolvedValue(undefined);
+    const view = renderPullRuns([pull]);
+    act(() => view.result.current.setMessage(pull.url, "Cancel this run."));
+
+    let outcome!: RunStartOutcome;
+    await act(async () => {
+      outcome = await view.result.current.start(pull);
+    });
+    await act(async () => {
+      await view.result.current.cancel(pull.url);
+      if (outcome.kind !== "accepted") throw new Error("Run was not accepted.");
+      await expect(outcome.completion).resolves.toBe("cancelled");
+    });
+
+    expect(signal.aborted).toBe(true);
+    expect(view.result.current.states.get(pull.url)).toMatchObject({
+      history: [
+        expect.objectContaining({
+          id: "cancel-wins",
+          status: "cancelled",
+        }),
+      ],
+      message: "Cancel this run.",
+      status: "idle",
+    });
+    const [history] = view.result.current.states.get(pull.url)?.history ?? [];
+    if (!history) throw new Error("Run history was not archived.");
+    await expect(view.result.current.loadTranscript(history)).resolves.toBe(
+      "Before cancellation.",
+    );
+
+    await act(async () => {
+      completionGate.resolve();
+      await Promise.resolve();
+    });
+    expect(view.result.current.states.get(pull.url)?.history).toHaveLength(1);
+    expect(view.result.current.states.get(pull.url)?.history[0]?.status).toBe(
+      "cancelled",
+    );
   });
 
   it("manual cancel response cannot overwrite a newer run", async () => {
@@ -1083,7 +2198,7 @@ describe("usePullRuns", () => {
       yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
     });
     fixes.cancel.mockReturnValue(cancelGate.promise);
-    const view = renderHook(() => usePullRuns([pull]));
+    const view = renderPullRuns([pull]);
     act(() => view.result.current.setMessage(pull.url, "First run."));
     let firstTask!: Promise<RunStartOutcome>;
     act(() => {
@@ -1141,7 +2256,7 @@ describe("usePullRuns", () => {
       await waitForAbort(runSignal);
     });
     fixes.cancel.mockRejectedValue(new Error("Cancellation service failed."));
-    const view = renderHook(() => usePullRuns([pull]));
+    const view = renderPullRuns([pull]);
     act(() => view.result.current.setMessage(pull.url, "Keep running."));
     act(() => {
       void view.result.current.start(pull);
@@ -1184,7 +2299,7 @@ describe("usePullRuns", () => {
       throw new DOMException("Review fix cancelled.", "AbortError");
     });
     fixes.cancel.mockResolvedValue(undefined);
-    const view = renderHook(() => usePullRuns([pull]));
+    const view = renderPullRuns([pull]);
 
     let outcome!: RunStartOutcome;
     await act(async () => {
@@ -1218,10 +2333,31 @@ describe("usePullRuns", () => {
     expect(streamSignal.aborted).toBe(true);
     expect(view.result.current.states.get(pull.url)).toMatchObject({
       cancelling: false,
-      output: "Review fix started.",
-      source: "review",
-      status: "cancelled",
+      history: [
+        expect.objectContaining({
+          id: "review-to-cancel",
+          instructions: {
+            feedback: {
+              body: "Keep the original error attached.",
+              line: 17,
+              path: "src/Error.php",
+              side: "RIGHT",
+            },
+            kind: "review",
+            message: "",
+          },
+          status: "cancelled",
+        }),
+      ],
+      output: "",
+      source: "manual",
+      status: "idle",
     });
+    const [history] = view.result.current.states.get(pull.url)?.history ?? [];
+    if (!history) throw new Error("Run history was not archived.");
+    await expect(view.result.current.loadTranscript(history)).resolves.toBe(
+      "Review fix started.",
+    );
   });
 
   it("manual cancellation while starting aborts without DELETE", async () => {
@@ -1234,7 +2370,7 @@ describe("usePullRuns", () => {
       signal = runSignal;
       await waitForAbort(runSignal);
     });
-    const view = renderHook(() => usePullRuns([pull]));
+    const view = renderPullRuns([pull]);
     act(() => view.result.current.setMessage(pull.url, "Cancel startup."));
     let runTask!: Promise<RunStartOutcome>;
     act(() => {
@@ -1251,43 +2387,60 @@ describe("usePullRuns", () => {
     expect(view.result.current.states.get(pull.url)?.status).toBe("cancelled");
   });
 
-  it.each<[ClaudeRunEvent, RunStatus, string]>([
-    [{ exitCode: 0, type: "complete" }, "completed", ""],
-    [{ exitCode: 1, type: "complete" }, "failed", ""],
+  it.each<[ClaudeRunEvent, RunStatus, string, string]>([
+    [{ exitCode: 0, type: "complete" }, "completed", "", ""],
+    [{ exitCode: 1, type: "complete" }, "failed", "", "Finish this run."],
     [
       { message: "The worker failed.", type: "error" },
       "failed",
       "[error] The worker failed.\n",
+      "Finish this run.",
     ],
     [
       { message: "Run capacity reached.", type: "limit" },
       "limited",
       "[limit] Run capacity reached.\n",
+      "Finish this run.",
     ],
-    [{ type: "cancelled" }, "cancelled", ""],
-  ])("terminal event $type maps to $1", async (terminal, expected, output) => {
-    const [pull] = pulls();
-    fixes.stream.mockImplementation(async function* (
-      request: ClaudeRunRequest,
-    ) {
-      yield {
-        number: request.number,
-        repository: request.repository,
-        runId: "run-terminal",
-        type: "start",
-      } satisfies ClaudeRunEvent;
-      yield terminal;
-    });
-    const view = renderHook(() => usePullRuns([pull]));
-    act(() => view.result.current.setMessage(pull.url, "Finish this run."));
+    [{ type: "cancelled" }, "cancelled", "", "Finish this run."],
+  ])(
+    "terminal event $type maps to $1 and leaves the expected retry draft",
+    async (terminal, expected, output, message) => {
+      const [pull] = pulls();
+      fixes.stream.mockImplementation(async function* (
+        request: ClaudeRunRequest,
+      ) {
+        yield {
+          number: request.number,
+          repository: request.repository,
+          runId: "run-terminal",
+          type: "start",
+        } satisfies ClaudeRunEvent;
+        yield terminal;
+      });
+      const view = renderPullRuns([pull]);
+      act(() => view.result.current.setMessage(pull.url, "Finish this run."));
 
-    await act(async () => {
-      await finishRun(view.result.current.start(pull));
-    });
+      await act(async () => {
+        await finishRun(view.result.current.start(pull));
+      });
 
-    expect(view.result.current.states.get(pull.url)).toMatchObject({
-      output,
-      status: expected,
-    });
-  });
+      expect(view.result.current.states.get(pull.url)).toMatchObject({
+        history: [
+          expect.objectContaining({
+            id: "run-terminal",
+            status: expected,
+          }),
+        ],
+        message,
+        output: "",
+        status: "idle",
+      });
+      const [history] = view.result.current.states.get(pull.url)?.history ?? [];
+      if (!history) throw new Error("Run history was not archived.");
+      await expect(view.result.current.loadTranscript(history)).resolves.toBe(
+        output,
+      );
+    },
+  );
 });

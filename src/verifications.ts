@@ -1,12 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { agentLabel } from "./agent";
 import {
   cancelReleaseVerification,
   cancelVerification,
   streamReleaseVerification,
   streamVerification,
 } from "./api";
+import {
+  reconcileRecentReleasePipeline,
+  releasePipelineIdentity,
+} from "./release-pipelines";
 import type {
+  Agent,
   RecentRelease,
   RecentReleasesResponse,
   ReleaseVerificationEvent,
@@ -35,6 +41,7 @@ export type ReleaseVerificationBatchStatus =
   | "cancelled";
 
 export type ReleaseVerificationBatchState = {
+  agent: Agent;
   batchId: string | null;
   cancelling: boolean;
   error: string | null;
@@ -53,6 +60,7 @@ export type ReleaseVerificationBatches = {
 };
 
 export type VerificationRunState = {
+  agent: Agent;
   cancelling: boolean;
   output: string;
   runId: string | null;
@@ -66,6 +74,7 @@ export type VerificationRuns = {
 };
 
 type Runtime = {
+  agent: Agent;
   cancellationController: AbortController | null;
   generation: number;
   runId: string | null;
@@ -73,6 +82,7 @@ type Runtime = {
 };
 
 type BatchRuntime = {
+  agent: Agent;
   batchId: string | null;
   cancellationController: AbortController | null;
   generation: number;
@@ -81,6 +91,7 @@ type BatchRuntime = {
 };
 
 export const IDLE_VERIFICATION_STATE: VerificationRunState = Object.freeze({
+  agent: "claude",
   cancelling: false,
   output: "",
   runId: null,
@@ -89,6 +100,7 @@ export const IDLE_VERIFICATION_STATE: VerificationRunState = Object.freeze({
 
 export const IDLE_RELEASE_VERIFICATION_STATE: ReleaseVerificationBatchState =
   Object.freeze({
+    agent: "claude",
     batchId: null,
     cancelling: false,
     error: null,
@@ -199,31 +211,44 @@ export const reconcileRecentReleases = (
   previous: RecentReleasesResponse | null,
   incoming: RecentReleasesResponse,
 ): RecentReleasesResponse => {
-  const incomingReleases = releasesWithinWindow(
+  const scopedReleases = releasesWithinWindow(
     incoming.releases,
     incoming.generatedAt,
   );
+  const previousReleases = previous
+    ? releasesWithinWindow(previous.releases, incoming.generatedAt)
+    : [];
+  const previousByIdentity = new Map(
+    previousReleases.map((release) => [
+      releasePipelineIdentity(release),
+      release,
+    ]),
+  );
+  const incomingReleases = scopedReleases.map((release) =>
+    reconcileRecentReleasePipeline(
+      previousByIdentity.get(releasePipelineIdentity(release)),
+      release,
+    ),
+  );
   const scopedIncoming =
-    incomingReleases === incoming.releases
+    incomingReleases.every(
+      (release, index) => release === incoming.releases[index],
+    ) && incomingReleases.length === incoming.releases.length
       ? incoming
       : { ...incoming, releases: incomingReleases };
   if (!previous || !incoming.partial) return scopedIncoming;
 
   const known = new Map(
-    releasesWithinWindow(previous.releases, incoming.generatedAt).map(
-      (release) => [release.id, release],
-    ),
+    previousReleases.map((release) => [
+      releasePipelineIdentity(release),
+      release,
+    ]),
   );
   const releases = incomingReleases.map((release) => {
-    const prior = known.get(release.id);
-    known.delete(release.id);
-    if (
-      !prior ||
-      prior.repository.toLowerCase() !== release.repository.toLowerCase() ||
-      prior.tag !== release.tag
-    ) {
-      return release;
-    }
+    const identity = releasePipelineIdentity(release);
+    const prior = known.get(identity);
+    known.delete(identity);
+    if (!prior) return release;
 
     const merged = mergeReleasedPulls(prior.pulls, release.pulls);
     if (!merged.retained) return release;
@@ -285,9 +310,11 @@ const formatEvent = (event: VerificationRunEvent): string | null => {
 };
 
 const requestFor = (
+  agent: Agent,
   release: RecentRelease,
   pull: ReleasedPull,
 ): VerificationRunRequest => ({
+  agent,
   headSha: pull.headSha,
   pullNumber: pull.number,
   pullUrl: pull.url,
@@ -299,6 +326,7 @@ const requestFor = (
 export function useVerificationRuns(
   releases: readonly RecentRelease[],
   authoritative = true,
+  agent: Agent = "claude",
 ): VerificationRuns {
   const [states, setStates] = useState<Map<string, VerificationRunState>>(
     () => new Map(),
@@ -408,6 +436,7 @@ export function useVerificationRuns(
       if (isVerificationActive(state)) return;
 
       const runtime: Runtime = {
+        agent,
         cancellationController: null,
         generation: ++generationRef.current,
         runId: null,
@@ -415,6 +444,7 @@ export function useVerificationRuns(
       };
       runtimesRef.current.set(key, runtime);
       update(key, runtime, () => ({
+        agent: runtime.agent,
         cancelling: false,
         output: "",
         runId: null,
@@ -424,7 +454,7 @@ export function useVerificationRuns(
       let ended = false;
       try {
         for await (const event of streamVerification(
-          requestFor(release, pull),
+          requestFor(runtime.agent, release, pull),
           runtime.streamController.signal,
         )) {
           if (!current(key, runtime)) return;
@@ -483,7 +513,7 @@ export function useVerificationRuns(
             ...existing,
             output: append(
               existing.output,
-              "[error] Claude disconnected before reporting completion.",
+              `[error] ${agentLabel(runtime.agent)} disconnected before reporting completion.`,
             ),
             status: "failed",
           }));
@@ -495,7 +525,7 @@ export function useVerificationRuns(
             cancelling: false,
             output: append(
               existing.output,
-              `[error] ${error instanceof Error ? error.message : "Claude verification could not be reached."}`,
+              `[error] ${error instanceof Error ? error.message : `${agentLabel(runtime.agent)} verification could not be reached.`}`,
             ),
             status: "failed",
           }));
@@ -507,7 +537,7 @@ export function useVerificationRuns(
         }
       }
     },
-    [current, update],
+    [agent, current, update],
   );
 
   const cancel = useCallback(
@@ -551,7 +581,7 @@ export function useVerificationRuns(
             cancelling: false,
             output: append(
               existing.output,
-              `[diagnostic] ${error instanceof Error ? error.message : "Claude verification could not be cancelled."}`,
+              `[diagnostic] ${error instanceof Error ? error.message : `${agentLabel(runtime.agent)} verification could not be cancelled.`}`,
             ),
           }));
         }
@@ -696,6 +726,8 @@ const preserveVerificationResult = (status: VerificationStatus): boolean =>
 export function useReleaseVerificationBatches(
   releases: readonly RecentRelease[],
   authoritative = true,
+  agent: Agent = "claude",
+  directStates: ReadonlyMap<string, VerificationRunState> = new Map(),
 ): ReleaseVerificationBatches {
   const [states, setStates] = useState<
     Map<string, ReleaseVerificationBatchState>
@@ -705,6 +737,7 @@ export function useReleaseVerificationBatches(
   >(() => new Map());
   const statesRef = useRef(states);
   const pullStatesRef = useRef(pullStates);
+  const directStatesRef = useRef(directStates);
   const runtimesRef = useRef(new Map<string, BatchRuntime>());
   const batchMembersRef = useRef(new Map<string, Set<string>>());
   const generationRef = useRef(0);
@@ -722,6 +755,7 @@ export function useReleaseVerificationBatches(
       ),
     [releases],
   );
+  directStatesRef.current = directStates;
 
   const publishStates = useCallback(
     (
@@ -782,9 +816,19 @@ export function useReleaseVerificationBatches(
     async (release: RecentRelease) => {
       if (!canVerifyEntireRelease(release)) return;
       const key = releaseVerificationKey(release);
-      if (isReleaseBatchActive(statesRef.current.get(key))) return;
+      if (
+        isReleaseBatchActive(statesRef.current.get(key)) ||
+        release.pulls.some((pull) =>
+          isVerificationActive(
+            directStatesRef.current.get(verificationKey(release, pull)),
+          ),
+        )
+      ) {
+        return;
+      }
 
       const runtime: BatchRuntime = {
+        agent,
         batchId: null,
         cancellationController: null,
         generation: ++generationRef.current,
@@ -796,6 +840,7 @@ export function useReleaseVerificationBatches(
       runtimesRef.current.set(key, runtime);
       updateState(key, runtime, () => ({
         ...IDLE_RELEASE_VERIFICATION_STATE,
+        agent: runtime.agent,
         status: "starting",
         total: release.pulls.length,
       }));
@@ -810,6 +855,7 @@ export function useReleaseVerificationBatches(
           }
           next.set(pullKey, {
             ...IDLE_VERIFICATION_STATE,
+            agent: runtime.agent,
             status: "starting",
           });
         }
@@ -819,6 +865,7 @@ export function useReleaseVerificationBatches(
       try {
         for await (const event of streamReleaseVerification(
           {
+            agent: runtime.agent,
             releaseId: release.id,
             repository: release.repository,
             tag: release.tag,
@@ -873,6 +920,7 @@ export function useReleaseVerificationBatches(
                 }
                 next.set(pullKey, {
                   ...IDLE_VERIFICATION_STATE,
+                  agent: runtime.agent,
                   status: "starting",
                 });
                 changed = true;
@@ -981,7 +1029,7 @@ export function useReleaseVerificationBatches(
         }
       }
     },
-    [current, publishPulls, updateState],
+    [agent, current, publishPulls, updateState],
   );
 
   const cancel = useCallback(

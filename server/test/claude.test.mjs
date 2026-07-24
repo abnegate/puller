@@ -19,6 +19,8 @@ import {
 
 const SHA = "abcdef0123456789abcdef0123456789abcdef01";
 const OTHER_SHA = "1234567890abcdef1234567890abcdef12345678";
+const BASE_SHA = "0123456789abcdef0123456789abcdef01234567";
+const PUBLISHED_SHA = "fedcba9876543210fedcba9876543210fedcba98";
 const UPDATED_AT = "2026-07-17T00:00:00Z";
 const GREPTILE_BODY = `Confidence Score: 5/5\nLast reviewed commit: ${SHA}`;
 const UNRESOLVED = {
@@ -50,6 +52,7 @@ const ENVIRONMENT = {
 function pull(overrides = {}) {
   return {
     blockers: ["1 unresolved review thread"],
+    baseRefOid: BASE_SHA,
     checks: { commentsComplete: true, threadsComplete: true },
     ci: {
       checks: [
@@ -103,6 +106,7 @@ function snapshot(item = pull(), overrides = {}) {
 
 function rawPull(overrides = {}) {
   return {
+    baseRefOid: BASE_SHA,
     ci: {
       checks: [
         {
@@ -199,14 +203,95 @@ function channel({ blockFirst = false } = {}) {
   };
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
+
+function autoAuthorization(
+  { number = 7, repository = "owner/repo" } = {},
+  headRefOid = SHA,
+  overrides = {},
+) {
+  return {
+    authored: true,
+    authorLogin: "viewer",
+    available: true,
+    baseRefOid: BASE_SHA,
+    complete: true,
+    headRefName: "fix/auto",
+    headRefOid,
+    headRepository: repository,
+    isCrossRepository: false,
+    number,
+    open: true,
+    repository,
+    state: "OPEN",
+    url: `https://github.com/${repository}/pull/${number}`,
+    viewerLogin: "viewer",
+    viewerPermission: "WRITE",
+    ...overrides,
+  };
+}
+
 function manager(overrides = {}) {
   const child = overrides.child ?? fakeChild();
   const spawn = overrides.spawn ?? vi.fn(() => child);
   const cache = overrides.cache ?? { get: vi.fn(async () => snapshot()) };
   const loadPull = overrides.loadPull ?? vi.fn(async () => exact());
-  const resolver = overrides.resolver ?? {
+  const workspaceFor = ({ number, repository }) => ({
+    branch: "fix/auto",
+    cleanup: vi.fn(async () => undefined),
+    cwd: `/trusted/auto/${repository.replace("/", "-")}-${number}`,
+    headRefOid: SHA,
+    remote: "origin",
+    repository,
+  });
+  const resolver = {
     resolve: vi.fn(async () => "/trusted/workspace"),
+    resolveReview: vi.fn(async (identity) => workspaceFor(identity)),
+    verifyReview: vi.fn(async (workspace) => ({
+      ...workspace,
+      headRefOid: PUBLISHED_SHA,
+    })),
+    ...overrides.resolver,
   };
+  const authorizationCalls = new Map();
+  const loadReviewAuthorization =
+    overrides.loadReviewAuthorization ??
+    vi.fn(async ({ number, repository }) => {
+      const key = `${repository.toLowerCase()}#${number}`;
+      const calls = (authorizationCalls.get(key) ?? 0) + 1;
+      authorizationCalls.set(key, calls);
+      const phase = ((calls - 1) % 6) + 1;
+      return autoAuthorization(
+        { number, repository },
+        phase === 6 ? PUBLISHED_SHA : SHA,
+      );
+    });
+  const changed = new Map();
+  const git =
+    overrides.git ??
+    vi.fn(async (_command, arguments_) => {
+      const cwd = arguments_[arguments_.indexOf("-C") + 1];
+      if (arguments_.includes("rev-parse")) {
+        return { stderr: "", stdout: `${SHA}\n` };
+      }
+      if (arguments_.includes("status")) {
+        const count = (changed.get(cwd) ?? 0) + 1;
+        changed.set(cwd, count);
+        return {
+          stderr: "",
+          stdout: count === 1 ? " M src/index.ts\n" : "",
+        };
+      }
+      return { stderr: "", stdout: "" };
+    });
   const kill = overrides.kill ?? vi.fn();
   const createTemporary =
     overrides.createTemporary ??
@@ -215,6 +300,7 @@ function manager(overrides = {}) {
     overrides.removeTemporary ?? vi.fn(async () => undefined);
   const value = createClaudeRunManager({
     cache,
+    loadReviewAuthorization,
     loadPull,
     resolver,
     spawn,
@@ -227,13 +313,18 @@ function manager(overrides = {}) {
     removeTemporary,
     environment: ENVIRONMENT,
     ...overrides,
+    git,
+    loadReviewAuthorization,
+    resolver,
   });
   return {
     value,
     child,
     spawn,
     cache,
+    git,
     loadPull,
+    loadReviewAuthorization,
     resolver,
     kill,
     createTemporary,
@@ -242,6 +333,7 @@ function manager(overrides = {}) {
 }
 
 const input = {
+  agent: "claude",
   repository: "owner/repo",
   number: 7,
   expectedHeadRefOid: SHA,
@@ -274,6 +366,7 @@ function greptileComment(confidence = 5, overrides = {}) {
 
 function autoInput(triggers, overrides = {}) {
   return {
+    agent: "claude",
     ...input,
     message: "",
     parallelism: 1,
@@ -647,6 +740,15 @@ describe("Claude Code request and parser", () => {
       CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
       ENABLE_CLAUDEAI_MCP_SERVERS: "false",
       ENABLE_TOOL_SEARCH: "false",
+      GIT_ATTR_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+      GIT_NO_REPLACE_OBJECTS: "1",
+      GIT_OPTIONAL_LOCKS: "0",
+      GIT_SSH_COMMAND:
+        "ssh -oBatchMode=yes -oConnectTimeout=15 -oStrictHostKeyChecking=yes",
+      GIT_TERMINAL_PROMPT: "0",
       HOME: "/Users/test",
       LANG: "en_NZ.UTF-8",
       LC_ALL: "en_NZ.UTF-8",
@@ -863,6 +965,149 @@ describe("Claude Code request and parser", () => {
 });
 
 describe("Claude Code run manager", () => {
+  it("spawns Codex with stdin after listeners and parses a completed turn", async () => {
+    const child = fakeChild();
+    child.stdin = new PassThrough();
+    vi.spyOn(child.stdin, "end");
+    const cleanup = vi.fn(async () => undefined);
+    const prepareCodex = vi.fn(async () => ({
+      args: ["exec", "--json", "-"],
+      cleanup,
+      command: "/opt/homebrew/bin/codex",
+      cwd: "/protected/control",
+      environment: { PATH: "/usr/bin:/bin" },
+      prompt: "trusted prompt",
+    }));
+    const context = manager({ child, prepareCodex });
+    const output = channel();
+    const run = await context.value.start(
+      { ...input, agent: "codex" },
+      output.value,
+    );
+
+    expect(prepareCodex).toHaveBeenCalledWith(
+      expect.objectContaining({
+        purpose: "fix",
+        target: "/trusted/workspace",
+      }),
+    );
+    expect(context.spawn).toHaveBeenCalledWith(
+      "/opt/homebrew/bin/codex",
+      ["exec", "--json", "-"],
+      expect.objectContaining({
+        cwd: "/protected/control",
+        stdio: ["pipe", "pipe", "pipe"],
+      }),
+    );
+    expect(child.stdin.end).toHaveBeenCalledWith("trusted prompt");
+    child.stdout.write(
+      '{"type":"item.started","item":{"type":"command_execution","command":"npm test","status":"in_progress"}}\n',
+    );
+    child.stdout.write(
+      '{"type":"item.completed","item":{"type":"agent_message","text":"Done."}}\n',
+    );
+    child.stdout.write('{"type":"turn.completed"}\n');
+    child.emit("close", 0, null);
+    await run.done;
+
+    expect(output.events[0]).toMatchObject({
+      agent: "codex",
+      type: "start",
+    });
+    expect(output.events).toContainEqual({
+      name: "npm test",
+      status: "started",
+      type: "tool",
+    });
+    expect(output.events.at(-1)).toEqual({ type: "complete", exitCode: 0 });
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(context.createTemporary).not.toHaveBeenCalled();
+  });
+
+  it("handles a synchronous Codex stdin error after installing its listener", async () => {
+    const child = fakeChild();
+    child.stdin = new PassThrough();
+    vi.spyOn(child.stdin, "end").mockImplementationOnce(() => {
+      child.stdin.emit(
+        "error",
+        Object.assign(new Error("pipe"), { code: "EPIPE" }),
+      );
+      return child.stdin;
+    });
+    const context = manager({
+      child,
+      prepareCodex: vi.fn(async () => ({
+        args: ["exec", "--json", "-"],
+        cleanup: vi.fn(async () => undefined),
+        command: "/opt/homebrew/bin/codex",
+        cwd: "/protected/control",
+        environment: {},
+        prompt: "trusted prompt",
+      })),
+    });
+    const output = channel();
+    const run = await context.value.start(
+      { ...input, agent: "codex" },
+      output.value,
+    );
+    expect(output.events.at(-1)).toMatchObject({
+      message: "Codex could not receive the run instructions.",
+      type: "error",
+    });
+    child.emit("close", null, "SIGINT");
+    await run.done;
+  });
+
+  it("escalates Codex cancellation from SIGINT through SIGTERM to SIGKILL", async () => {
+    const timers = [];
+    const child = fakeChild();
+    child.stdin = new PassThrough();
+    const cleanup = vi.fn(async () => undefined);
+    const context = manager({
+      child,
+      clearTimer: vi.fn((timer) => {
+        if (timer) timer.cleared = true;
+      }),
+      prepareCodex: vi.fn(async () => ({
+        args: ["exec", "--json", "-"],
+        cleanup,
+        command: "/opt/homebrew/bin/codex",
+        cwd: "/protected/control",
+        environment: {},
+        prompt: "trusted prompt",
+      })),
+      setTimer(callback, delay) {
+        const timer = { callback, cleared: false, delay, unref: vi.fn() };
+        timers.push(timer);
+        return timer;
+      },
+    });
+    const run = await context.value.start(
+      { ...input, agent: "codex" },
+      channel().value,
+    );
+
+    context.value.cancel("run-1");
+    expect(context.kill.mock.calls.map(([, signal]) => signal)).toEqual([
+      "SIGINT",
+    ]);
+    timers.findLast((timer) => timer.delay === 10).callback();
+    expect(context.kill.mock.calls.map(([, signal]) => signal)).toEqual([
+      "SIGINT",
+      "SIGTERM",
+    ]);
+    timers.findLast((timer) => timer.delay === 10).callback();
+    expect(context.kill.mock.calls.map(([, signal]) => signal)).toEqual([
+      "SIGINT",
+      "SIGTERM",
+      "SIGKILL",
+    ]);
+
+    child.emit("close", null, "SIGKILL");
+    await run.done;
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
   it("refreshes GitHub, resolves locally, spawns shell-free, and normalizes streaming events", async () => {
     const context = manager();
     const output = channel();
@@ -905,6 +1150,7 @@ describe("Claude Code run manager", () => {
     });
     expect(output.events[0]).toEqual({
       type: "start",
+      agent: "claude",
       runId: "run-1",
       repository: "owner/repo",
       number: 7,
@@ -928,7 +1174,13 @@ describe("Claude Code run manager", () => {
     await run.done;
 
     expect(output.events).toEqual([
-      { type: "start", runId: "run-1", repository: "owner/repo", number: 7 },
+      {
+        type: "start",
+        agent: "claude",
+        runId: "run-1",
+        repository: "owner/repo",
+        number: 7,
+      },
       { type: "diagnostic", text: "Claude Code emitted an unreadable event." },
       { type: "diagnostic", text: "Claude Code started." },
       { type: "text", text: "Edited [workspace]/src/a.js [secret]" },
@@ -1788,6 +2040,455 @@ describe("Claude Code run manager", () => {
     );
     context.child.emit("close", 0, null);
     await retry.done;
+  });
+
+  it("cleans an owned Auto workspace and releases reservations when authorization drifts after creation", async () => {
+    const cleanup = vi.fn(async () => undefined);
+    const coordinator = createRunCoordinator({ limit: 1 });
+    const comment = issueComment();
+    const context = manager({
+      coordinator,
+      loadPull: vi.fn(async () =>
+        exact({
+          pull: rawPull({
+            comments: [greptileComment(), comment],
+            reviewThreads: [],
+            unresolvedThreads: [],
+          }),
+        }),
+      ),
+      loadReviewAuthorization: vi
+        .fn()
+        .mockResolvedValueOnce(autoAuthorization())
+        .mockResolvedValueOnce(
+          autoAuthorization({}, SHA, { headRefName: "other/branch" }),
+        ),
+      resolver: {
+        resolveReview: vi.fn(async () => ({
+          branch: "fix/auto",
+          cleanup,
+          cwd: "/trusted/auto/owner-repo-7",
+          headRefOid: SHA,
+          remote: "origin",
+          repository: "owner/repo",
+        })),
+      },
+    });
+
+    await expect(
+      context.value.start(
+        autoInput([
+          {
+            kind: "issue_comment",
+            id: comment.id,
+            updatedAt: comment.updatedAt,
+          },
+        ]),
+        channel().value,
+      ),
+    ).rejects.toMatchObject({ code: "review_identity_changed", status: 409 });
+
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(context.spawn).not.toHaveBeenCalled();
+    expect(context.value.activeCount()).toBe(0);
+    expect(context.value.activeWorkspaceCount()).toBe(0);
+    expect(coordinator.activeCount()).toBe(0);
+    expect(coordinator.activeWorkspaceCount()).toBe(0);
+  });
+
+  it("reauthorizes before Auto staging and cleans without publishing when that proof drifts", async () => {
+    const cleanup = vi.fn(async () => undefined);
+    const comment = issueComment();
+    const loadReviewAuthorization = vi
+      .fn()
+      .mockResolvedValueOnce(autoAuthorization())
+      .mockResolvedValueOnce(autoAuthorization())
+      .mockResolvedValueOnce(
+        autoAuthorization({}, SHA, { viewerLogin: "other-viewer" }),
+      );
+    const context = manager({
+      loadPull: vi.fn(async () =>
+        exact({
+          pull: rawPull({
+            comments: [greptileComment(), comment],
+            reviewThreads: [],
+            unresolvedThreads: [],
+          }),
+        }),
+      ),
+      loadReviewAuthorization,
+      resolver: {
+        resolveReview: vi.fn(async () => ({
+          branch: "fix/auto",
+          cleanup,
+          cwd: "/trusted/auto/owner-repo-7",
+          headRefOid: SHA,
+          remote: "origin",
+          repository: "owner/repo",
+        })),
+      },
+    });
+    const output = channel();
+    const started = await context.value.start(
+      autoInput([
+        {
+          kind: "issue_comment",
+          id: comment.id,
+          updatedAt: comment.updatedAt,
+        },
+      ]),
+      output.value,
+    );
+
+    context.child.emit("close", 0, null);
+    await started.done;
+
+    expect(output.events.at(-1)).toMatchObject({
+      message: expect.stringContaining("could not safely publish"),
+      type: "error",
+    });
+    expect(loadReviewAuthorization).toHaveBeenCalledTimes(3);
+    expect(
+      context.git.mock.calls.some(([, arguments_]) =>
+        arguments_.includes("add"),
+      ),
+    ).toBe(false);
+    expect(context.value.activeCount()).toBe(0);
+    expect(context.value.activeWorkspaceCount()).toBe(0);
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it("cleans an owned Auto workspace once when disconnect and child exit race", async () => {
+    const cleanup = vi.fn(async () => undefined);
+    const comment = issueComment();
+    const context = manager({
+      loadPull: vi.fn(async () =>
+        exact({
+          pull: rawPull({
+            comments: [greptileComment(), comment],
+            reviewThreads: [],
+            unresolvedThreads: [],
+          }),
+        }),
+      ),
+      resolver: {
+        resolveReview: vi.fn(async () => ({
+          branch: "fix/auto",
+          cleanup,
+          cwd: "/trusted/auto/owner-repo-7",
+          headRefOid: SHA,
+          remote: "origin",
+          repository: "owner/repo",
+        })),
+      },
+    });
+    const output = channel();
+    const started = await context.value.start(
+      autoInput([
+        {
+          kind: "issue_comment",
+          id: comment.id,
+          updatedAt: comment.updatedAt,
+        },
+      ]),
+      output.value,
+    );
+
+    output.close();
+    context.child.emit("error", new Error("child closing"));
+    context.child.emit("close", null, "SIGTERM");
+    await started.done;
+
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(context.value.activeCount()).toBe(0);
+    expect(context.value.activeWorkspaceCount()).toBe(0);
+  });
+
+  it("holds every Auto reservation until deferred owned-workspace cleanup settles", async () => {
+    const deletion = deferred();
+    const cleanup = vi.fn(() => deletion.promise);
+    const coordinator = createRunCoordinator({ limit: 1 });
+    const comment = issueComment();
+    const context = manager({
+      coordinator,
+      loadPull: vi.fn(async () =>
+        exact({
+          pull: rawPull({
+            comments: [greptileComment(), comment],
+            reviewThreads: [],
+            unresolvedThreads: [],
+          }),
+        }),
+      ),
+      resolver: {
+        resolveReview: vi.fn(async () => ({
+          branch: "fix/auto",
+          cleanup,
+          cwd: "/trusted/auto/owner-repo-7",
+          headRefOid: SHA,
+          remote: "origin",
+          repository: "owner/repo",
+        })),
+      },
+    });
+    const automatic = autoInput([
+      {
+        kind: "issue_comment",
+        id: comment.id,
+        updatedAt: comment.updatedAt,
+      },
+    ]);
+    const started = await context.value.start(automatic, channel().value);
+
+    context.child.emit("close", 1, null);
+    await vi.waitFor(() => expect(cleanup).toHaveBeenCalledOnce());
+
+    expect(context.value.activeCount()).toBe(1);
+    expect(context.value.activeWorkspaceCount()).toBe(1);
+    expect(coordinator.activeCount()).toBe(1);
+    expect(coordinator.activeWorkspaceCount()).toBe(1);
+    await expect(
+      context.value.start(automatic, channel().value),
+    ).rejects.toMatchObject({ code: "auto_triggers_running" });
+
+    deletion.resolve();
+    await started.done;
+    expect(context.value.activeCount()).toBe(0);
+    expect(context.value.activeWorkspaceCount()).toBe(0);
+    expect(coordinator.activeCount()).toBe(0);
+    expect(coordinator.activeWorkspaceCount()).toBe(0);
+
+    const retry = await context.value.start(automatic, channel().value);
+    context.child.emit("close", 1, null);
+    await retry.done;
+    expect(cleanup).toHaveBeenCalledTimes(2);
+  });
+
+  it("holds pre-spawn Auto reservations until failed-start workspace cleanup settles", async () => {
+    const deletion = deferred();
+    const cleanup = vi.fn(() => deletion.promise);
+    const coordinator = createRunCoordinator({ limit: 1 });
+    const processes = [fakeChild(201), fakeChild(202)];
+    const spawn = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error("spawn failed");
+      })
+      .mockImplementationOnce(() => processes[1]);
+    const comment = issueComment();
+    const context = manager({
+      coordinator,
+      loadPull: vi.fn(async () =>
+        exact({
+          pull: rawPull({
+            comments: [greptileComment(), comment],
+            reviewThreads: [],
+            unresolvedThreads: [],
+          }),
+        }),
+      ),
+      resolver: {
+        resolveReview: vi.fn(async () => ({
+          branch: "fix/auto",
+          cleanup,
+          cwd: "/trusted/auto/owner-repo-7",
+          headRefOid: SHA,
+          remote: "origin",
+          repository: "owner/repo",
+        })),
+      },
+      spawn,
+    });
+    const automatic = autoInput([
+      {
+        kind: "issue_comment",
+        id: comment.id,
+        updatedAt: comment.updatedAt,
+      },
+    ]);
+    const starting = context.value.start(automatic, channel().value);
+    await vi.waitFor(() => expect(cleanup).toHaveBeenCalledOnce());
+
+    expect(context.value.activeWorkspaceCount()).toBe(1);
+    expect(coordinator.activeCount()).toBe(1);
+    expect(coordinator.activeWorkspaceCount()).toBe(1);
+    await expect(
+      context.value.start(automatic, channel().value),
+    ).rejects.toMatchObject({ code: "auto_triggers_running" });
+
+    deletion.resolve();
+    await expect(starting).rejects.toThrow("spawn failed");
+    expect(context.value.activeWorkspaceCount()).toBe(0);
+    expect(coordinator.activeCount()).toBe(0);
+    expect(coordinator.activeWorkspaceCount()).toBe(0);
+
+    const retry = await context.value.start(automatic, channel().value);
+    processes[1].emit("close", 1, null);
+    await retry.done;
+    expect(cleanup).toHaveBeenCalledTimes(2);
+  });
+
+  it("passes abort signals to Git and reconciles cancellation racing an accepted Auto push", async () => {
+    const pushed = deferred();
+    const cleanup = vi.fn(async () => undefined);
+    const reportDiagnostic = vi.fn();
+    let committed = false;
+    let statusCalls = 0;
+    const git = vi.fn(async (_command, arguments_, options) => {
+      if (arguments_.includes("rev-parse")) {
+        return {
+          stderr: "",
+          stdout: `${committed ? PUBLISHED_SHA : SHA}\n`,
+        };
+      }
+      if (arguments_.includes("status")) {
+        statusCalls += 1;
+        return {
+          stderr: "",
+          stdout: statusCalls === 1 ? " M src/index.ts\n" : "",
+        };
+      }
+      if (arguments_.includes("commit")) {
+        committed = true;
+      }
+      if (arguments_.includes("push")) {
+        await pushed.promise;
+      }
+      expect(options.signal).toBeInstanceOf(AbortSignal);
+      return { stderr: "", stdout: "" };
+    });
+    let authorizationCalls = 0;
+    const loadReviewAuthorization = vi.fn(async () => {
+      authorizationCalls += 1;
+      return autoAuthorization(
+        {},
+        authorizationCalls >= 6 ? PUBLISHED_SHA : SHA,
+      );
+    });
+    const resolver = {
+      resolveReview: vi.fn(async () => ({
+        branch: "fix/auto",
+        cleanup,
+        cwd: "/trusted/auto/owner-repo-7",
+        headRefOid: SHA,
+        remote: "origin",
+        repository: "owner/repo",
+      })),
+      verifyReview: vi.fn(async (workspace) => ({
+        ...workspace,
+        headRefOid: PUBLISHED_SHA,
+      })),
+    };
+    const comment = issueComment();
+    const context = manager({
+      git,
+      loadPull: vi.fn(async () =>
+        exact({
+          pull: rawPull({
+            comments: [greptileComment(), comment],
+            reviewThreads: [],
+            unresolvedThreads: [],
+          }),
+        }),
+      ),
+      loadReviewAuthorization,
+      reportDiagnostic,
+      resolver,
+    });
+    const output = channel();
+    const started = await context.value.start(
+      autoInput([
+        {
+          kind: "issue_comment",
+          id: comment.id,
+          updatedAt: comment.updatedAt,
+        },
+      ]),
+      output.value,
+    );
+
+    context.child.emit("close", 0, null);
+    await vi.waitFor(() =>
+      expect(
+        git.mock.calls.some(([, arguments_]) => arguments_.includes("push")),
+      ).toBe(true),
+    );
+    output.close();
+    pushed.resolve();
+    await started.done;
+
+    expect(
+      git.mock.calls.every(
+        ([, , options]) => options.signal instanceof AbortSignal,
+      ),
+    ).toBe(true);
+    expect(resolver.verifyReview).toHaveBeenCalledOnce();
+    expect(reportDiagnostic).toHaveBeenCalledWith(
+      expect.stringContaining("Cancellation raced an accepted push"),
+    );
+    expect(output.events).toContainEqual({
+      message: "The client disconnected.",
+      type: "cancelled",
+    });
+    expect(output.events).not.toContainEqual({
+      exitCode: 0,
+      type: "complete",
+    });
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(context.value.activeCount()).toBe(0);
+    expect(context.value.activeWorkspaceCount()).toBe(0);
+  });
+
+  it("awaits owned Auto workspace cleanup when shutdown aborts final preflight", async () => {
+    const cleanup = vi.fn(async () => undefined);
+    const comment = issueComment();
+    const context = manager({
+      loadPull: vi.fn(async () =>
+        exact({
+          pull: rawPull({
+            comments: [greptileComment(), comment],
+            reviewThreads: [],
+            unresolvedThreads: [],
+          }),
+        }),
+      ),
+      loadReviewAuthorization: vi
+        .fn()
+        .mockResolvedValueOnce(autoAuthorization())
+        .mockImplementationOnce(() => new Promise(() => undefined)),
+      resolver: {
+        resolveReview: vi.fn(async () => ({
+          branch: "fix/auto",
+          cleanup,
+          cwd: "/trusted/auto/owner-repo-7",
+          headRefOid: SHA,
+          remote: "origin",
+          repository: "owner/repo",
+        })),
+      },
+    });
+    const starting = context.value.start(
+      autoInput([
+        {
+          kind: "issue_comment",
+          id: comment.id,
+          updatedAt: comment.updatedAt,
+        },
+      ]),
+      channel().value,
+    );
+    await vi.waitFor(() =>
+      expect(context.resolver.resolveReview).toHaveBeenCalledOnce(),
+    );
+
+    const stopping = context.value.shutdown();
+    await expect(starting).rejects.toMatchObject({ code: "shutting_down" });
+    await stopping;
+
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(context.spawn).not.toHaveBeenCalled();
+    expect(context.value.activeCount()).toBe(0);
+    expect(context.value.activeWorkspaceCount()).toBe(0);
   });
 
   it("releases the Auto and shared reservations when process startup throws", async () => {

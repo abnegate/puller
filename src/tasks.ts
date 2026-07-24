@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { normalizeAgent } from "./agent";
 import {
   cancelTask,
   getTaskOptions,
@@ -9,6 +10,7 @@ import {
   TaskStartError,
 } from "./api";
 import type {
+  Agent,
   StartTaskRequest,
   Task,
   TaskEvent,
@@ -25,7 +27,7 @@ export type TaskState = {
   task: Task;
 };
 
-export type NewTaskRequest = Omit<StartTaskRequest, "id">;
+export type NewTaskRequest = Omit<StartTaskRequest, "agent" | "id">;
 
 export type Tasks = {
   cancel: (id: string) => Promise<void>;
@@ -88,6 +90,7 @@ const appendError = (output: string, message: string): string => {
 };
 
 const sameTask = (left: Task, right: Task): boolean =>
+  normalizeAgent(left.agent) === normalizeAgent(right.agent) &&
   left.base === right.base &&
   left.branch === right.branch &&
   left.createdAt === right.createdAt &&
@@ -155,7 +158,7 @@ export const applyTaskEvent = (
   };
 };
 
-export function useTasks(): Tasks {
+export function useTasks(agent: Agent = "claude"): Tasks {
   const [states, setStates] = useState<Map<string, TaskState>>(() => new Map());
   const [options, setOptions] = useState<TaskOptions | null>(null);
   const [loading, setLoading] = useState(true);
@@ -334,6 +337,7 @@ export function useTasks(): Tasks {
       const prompt = request.prompt.trim();
       const now = new Date().toISOString();
       const retryKey = JSON.stringify([
+        agent,
         request.repository.toLowerCase(),
         request.base,
         prompt,
@@ -341,6 +345,7 @@ export function useTasks(): Tasks {
       const id = retryIds.current.get(retryKey) ?? crypto.randomUUID();
       retryIds.current.set(retryKey, id);
       const optimistic: Task = {
+        agent,
         base: request.base,
         createdAt: now,
         id,
@@ -362,7 +367,7 @@ export function useTasks(): Tasks {
       });
 
       try {
-        const task = await startTask({ ...request, id, prompt });
+        const task = await startTask({ ...request, agent, id, prompt });
         retryIds.current.delete(retryKey);
         update(id, (state) => ({ ...state, replaying: true, task }));
         observe(id);
@@ -375,6 +380,7 @@ export function useTasks(): Tasks {
             const recovered = (await getTasks()).find(
               (task) =>
                 task.id === id &&
+                normalizeAgent(task.agent) === agent &&
                 task.repository.toLowerCase() ===
                   request.repository.toLowerCase() &&
                 task.base === request.base,
@@ -408,7 +414,7 @@ export function useTasks(): Tasks {
         throw startError;
       }
     },
-    [observe, publish, update],
+    [agent, observe, publish, update],
   );
 
   const cancel = useCallback(

@@ -1,18 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { agentLabel, isAgent } from "./agent";
 import { cancelRepair, streamRepair } from "./api";
 import {
-  cancelClaudeRun,
+  cancelAgentRun,
   ClaudeRunHttpError,
-  streamClaudeRun,
+  streamAgentRun,
+  type AgentRunEvent,
+  type AgentRunRequest,
   type AutoParallelism,
   type AutoTrigger,
-  type ClaudeRunEvent,
-  type ClaudeRunRequest,
   type ReviewFeedback,
   type RunSource,
 } from "./fixes";
+import {
+  browserRunTranscriptStore,
+  RunTranscriptStoreError,
+  type RunTranscriptFailureCode,
+  type RunTranscriptStore,
+} from "./run-transcripts";
 import type {
+  Agent,
   MergePullRepairResponse,
   PullReadiness,
   RepairEvent,
@@ -21,6 +29,7 @@ import type {
 
 export type RunStatus =
   | "idle"
+  | "preparing"
   | "starting"
   | "running"
   | "completed"
@@ -33,6 +42,56 @@ export type RunTerminalStatus = Extract<
   "completed" | "failed" | "cancelled" | "limited"
 >;
 
+export type RunInstructions =
+  | {
+      kind: "manual";
+      text: string;
+    }
+  | {
+      feedback: Readonly<ReviewFeedback>;
+      kind: "review";
+      message: string;
+    }
+  | {
+      kind: "auto";
+      message: string;
+      triggers: readonly Readonly<AutoTrigger>[];
+    };
+
+export type RunHistoryEntry = {
+  agent: Agent;
+  finishedAt: string;
+  headRefOid: string;
+  id: string;
+  instructions: RunInstructions;
+  source: RunSource;
+  status: RunTerminalStatus;
+  transcript:
+    | Readonly<{
+        availability: "available";
+        bytes: number;
+        key: string;
+      }>
+    | Readonly<{
+        availability: "unavailable";
+        bytes: number;
+        code: RunTranscriptFailureCode;
+        message: string;
+      }>;
+};
+
+export type ReviewAttemptToken = string;
+
+export type ReviewRetryContext = Readonly<{
+  attemptToken: ReviewAttemptToken;
+  baseRefOid: string;
+  draft: string;
+  feedback: Readonly<ReviewFeedback>;
+  headRefOid: string;
+  runId: string;
+  status: Exclude<RunTerminalStatus, "completed">;
+}>;
+
 export type StartRunOptions =
   | {
       message?: string;
@@ -41,12 +100,14 @@ export type StartRunOptions =
       triggers?: never;
     }
   | {
+      agent: Agent;
       message?: string;
       parallelism: AutoParallelism;
       source: "auto";
       triggers: readonly AutoTrigger[];
     }
   | {
+      draft?: string;
       expectedBaseRefOid: string;
       feedback: ReviewFeedback;
       message?: string;
@@ -103,12 +164,16 @@ export type RunStartOutcome =
 
 export type RunState = {
   actionId: string | null;
+  agent: Agent;
   cancelling: boolean;
   headRefOid: string | null;
+  history: readonly RunHistoryEntry[];
   kind: "fix" | "repair";
   message: string;
   output: string;
   repairState: RepairState | null;
+  reviewAttemptToken: ReviewAttemptToken | null;
+  reviewRetry: ReviewRetryContext | null;
   source: RunSource;
   status: RunStatus;
 };
@@ -121,6 +186,11 @@ export type PullGroups = {
 
 export type PullRuns = {
   cancel: (key: string) => Promise<void>;
+  clearReviewRetry: (key: string, attemptToken: ReviewAttemptToken) => void;
+  loadTranscript: (
+    entry: Pick<RunHistoryEntry, "transcript">,
+    signal?: AbortSignal,
+  ) => Promise<string | null>;
   observeRepair: (
     pull: PullReadiness,
     response: MergePullRepairResponse,
@@ -133,33 +203,68 @@ export type PullRuns = {
   states: ReadonlyMap<string, RunState>;
 };
 
+export type PullRunOptions = {
+  agent?: Agent;
+  authoritative?: boolean;
+  transcriptStore?: RunTranscriptStore;
+};
+
 type Runtime = {
+  accepted: boolean;
   action: MergePullRepairResponse["action"] | null;
+  agent: Agent;
+  archive: Promise<void> | null;
+  attemptToken: ReviewAttemptToken | null;
+  baseRefOid: string | null;
   cancellationController: AbortController | null;
+  finalize: (
+    status: RunTerminalStatus,
+    output?: { line: boolean; text: string },
+  ) => boolean;
+  finalized: boolean;
   generation: number;
   headRefOid: string | null;
+  instructions: RunInstructions | null;
   kind: "fix" | "repair";
   pull: PullReadiness | null;
+  pendingTranscriptKey: string | null;
+  reviewDraft: string | null;
+  reviewFeedback: Readonly<ReviewFeedback> | null;
   runId: string | null;
   source: RunSource;
   streamController: AbortController;
   triggers: ReadonlySet<string> | null;
 };
 
+const EMPTY_RUN_HISTORY: readonly RunHistoryEntry[] = Object.freeze([]);
+const textEncoder = new TextEncoder();
+
 export const IDLE_RUN_STATE: RunState = Object.freeze({
   actionId: null,
+  agent: "claude",
   cancelling: false,
   headRefOid: null,
+  history: EMPTY_RUN_HISTORY,
   kind: "fix",
   message: "",
   output: "",
   repairState: null,
+  reviewAttemptToken: null,
+  reviewRetry: null,
   source: "manual",
   status: "idle",
 });
 
 export const isRunActive = (state?: Pick<RunState, "status">): boolean =>
-  state?.status === "starting" || state?.status === "running";
+  state?.status === "preparing" ||
+  state?.status === "starting" ||
+  state?.status === "running";
+
+export const isRunPreparing = (state?: Pick<RunState, "status">): boolean =>
+  state?.status === "preparing";
+
+export const isRunExecuting = (state?: Pick<RunState, "status">): boolean =>
+  state?.status === "running";
 
 const comparePulls = (first: PullReadiness, second: PullReadiness): number =>
   first.rank - second.rank ||
@@ -204,12 +309,17 @@ export const groupPulls = (
     const repairPending =
       run?.kind === "repair" &&
       (isRunActive(run) || run.status === "completed");
+    const fixInProgress =
+      run !== undefined &&
+      run.kind !== "repair" &&
+      isRunActive(run) &&
+      !isRunPreparing(run);
 
     if (
       pull.ci.state === "pending" ||
       (pull.ci.running ?? 0) > 0 ||
       repairPending ||
-      (run?.kind !== "repair" && isRunActive(run))
+      fixInProgress
     ) {
       groups.progress.push(pull);
     } else if (pull.ready && !repairTerminal) {
@@ -271,13 +381,15 @@ const matchesTriggers = (
 const startFailure = (
   error: unknown,
   source: RunSource,
+  agent: Agent,
 ): Exclude<RunStartOutcome, { kind: "accepted" }> => {
+  const label = agentLabel(agent);
   if (!(error instanceof ClaudeRunHttpError)) {
     if (isAbortError(error)) {
       return {
         code: null,
         kind: "failed",
-        message: "The Claude Code run was cancelled before it started.",
+        message: `The ${label} run was cancelled before it started.`,
         source,
       };
     }
@@ -288,7 +400,7 @@ const startFailure = (
       message:
         error instanceof Error
           ? error.message
-          : "Claude could not be reached before the run started.",
+          : `${label} could not be reached before the run started.`,
       source,
     };
   }
@@ -324,7 +436,10 @@ const startFailure = (
   return { code, kind: "failed", message, source };
 };
 
-const formatEvent = (event: ClaudeRunEvent): string | null => {
+const codeAgentLabel = (agent: Agent): string =>
+  agent === "claude" ? "Claude Code" : "Codex";
+
+const formatEvent = (event: AgentRunEvent): string | null => {
   switch (event.type) {
     case "text":
       return event.text;
@@ -354,6 +469,68 @@ const append = (current: string, text: string, line: boolean): string => {
 
   const prefix = current && !current.endsWith("\n") ? "\n" : "";
   return `${current}${prefix}${text}\n`;
+};
+
+const transcriptKey = (
+  pull: Pick<PullReadiness, "number" | "repository" | "url">,
+  generation: number,
+  runId: string,
+): string =>
+  JSON.stringify([
+    pull.repository.toLowerCase(),
+    pull.number,
+    pull.url,
+    generation,
+    runId,
+  ]);
+
+const transcriptFailure = (
+  error: unknown,
+  bytes: number,
+): Extract<RunHistoryEntry["transcript"], { availability: "unavailable" }> => {
+  if (error instanceof RunTranscriptStoreError) {
+    return Object.freeze({
+      availability: "unavailable",
+      bytes,
+      code: error.code,
+      message: error.message,
+    });
+  }
+
+  return Object.freeze({
+    availability: "unavailable",
+    bytes,
+    code: "indexeddb_write_failed",
+    message: "The run transcript could not be saved in browser storage.",
+  });
+};
+
+const effectiveInstructions = (
+  options: StartRunOptions,
+  message: string,
+): RunInstructions => {
+  if (options.source === "review") {
+    return Object.freeze({
+      feedback: Object.freeze({ ...options.feedback }),
+      kind: "review",
+      message,
+    });
+  }
+
+  if (options.source === "auto") {
+    return Object.freeze({
+      kind: "auto",
+      message,
+      triggers: Object.freeze(
+        options.triggers.map((trigger) => Object.freeze({ ...trigger })),
+      ),
+    });
+  }
+
+  return Object.freeze({
+    kind: "manual",
+    text: message || "Fix every current readiness blocker.",
+  });
 };
 
 const repairStatus = (state: RepairState): RunStatus => {
@@ -387,6 +564,11 @@ const applyRepairEvent = (state: RunState, event: RepairEvent): RunState => {
 export function usePullRuns(
   pulls: readonly PullReadiness[],
   onRepairReady: (pull: PullReadiness) => void = () => undefined,
+  {
+    agent = "claude",
+    authoritative = true,
+    transcriptStore = browserRunTranscriptStore,
+  }: PullRunOptions = {},
 ): PullRuns {
   const [states, setStates] = useState<Map<string, RunState>>(() => new Map());
   const statesRef = useRef(states);
@@ -395,19 +577,33 @@ export function usePullRuns(
   const generationRef = useRef(0);
   const mountedRef = useRef(true);
   const identities = pulls
-    .map((pull) => `${pull.url}\n${pull.headRefOid.toLowerCase()}`)
+    .map(
+      (pull) =>
+        `${pull.url}\n${pull.baseRefOid.toLowerCase()}\n${pull.headRefOid.toLowerCase()}`,
+    )
     .sort()
     .join("\u0000");
   const present = useMemo(
     () =>
       new Map(
         (identities ? identities.split("\u0000") : []).map((identity) => {
-          const newline = identity.lastIndexOf("\n");
-          return [identity.slice(0, newline), identity.slice(newline + 1)];
+          const headSeparator = identity.lastIndexOf("\n");
+          const baseSeparator = identity.lastIndexOf("\n", headSeparator - 1);
+          return [
+            identity.slice(0, baseSeparator),
+            {
+              baseRefOid: identity.slice(baseSeparator + 1, headSeparator),
+              headRefOid: identity.slice(headSeparator + 1),
+            },
+          ];
         }),
       ),
     [identities],
   );
+  const presentRef = useRef(present);
+  const authoritativeRef = useRef(authoritative);
+  presentRef.current = present;
+  authoritativeRef.current = authoritative;
 
   const publish = useCallback(
     (
@@ -456,8 +652,31 @@ export function usePullRuns(
     [current, publish],
   );
 
+  const deleteTranscripts = useCallback(
+    async (keys: readonly string[]): Promise<void> => {
+      if (keys.length === 0) return;
+      await transcriptStore.initialize();
+      try {
+        await transcriptStore.delete(keys);
+      } catch (error) {
+        if (!transcriptStore.retriesFailedDeletes) throw error;
+        // IndexedDB records are session-tagged, so the next browser-store
+        // initialization deterministically retries this cleanup.
+      }
+    },
+    [transcriptStore],
+  );
+
   const purge = useCallback(
     (key: string) => {
+      const state = statesRef.current.get(key);
+      const transcriptKeys = [
+        ...(state?.history ?? []).flatMap((entry) =>
+          entry.transcript.availability === "available"
+            ? [entry.transcript.key]
+            : [],
+        ),
+      ];
       publish((existing) => {
         if (!existing.has(key)) {
           return existing as Map<string, RunState>;
@@ -467,31 +686,82 @@ export function usePullRuns(
         next.delete(key);
         return next;
       });
+      if (transcriptKeys.length > 0) {
+        void deleteTranscripts(transcriptKeys);
+      }
+    },
+    [deleteTranscripts, publish],
+  );
+
+  const clearReviewRetry = useCallback(
+    (key: string, attemptToken: ReviewAttemptToken) => {
+      publish((existing) => {
+        const state = existing.get(key);
+        if (state?.reviewRetry?.attemptToken !== attemptToken) {
+          return existing as Map<string, RunState>;
+        }
+
+        const next = new Map(existing);
+        next.set(key, { ...state, reviewRetry: null });
+        return next;
+      });
     },
     [publish],
+  );
+
+  const loadTranscript = useCallback(
+    async (
+      entry: Pick<RunHistoryEntry, "transcript">,
+      signal?: AbortSignal,
+    ): Promise<string | null> => {
+      if (entry.transcript.availability === "unavailable") {
+        throw new RunTranscriptStoreError(
+          entry.transcript.code,
+          entry.transcript.message,
+        );
+      }
+      await transcriptStore.initialize();
+      return await transcriptStore.get(entry.transcript.key, signal);
+    },
+    [transcriptStore],
   );
 
   const cancelDetached = useCallback((runId: string) => {
     const controller = new AbortController();
     cancellationsRef.current.add(controller);
-    void cancelClaudeRun(runId, controller.signal)
+    void Promise.resolve(cancelAgentRun(runId, controller.signal))
       .catch(() => undefined)
       .finally(() => cancellationsRef.current.delete(controller));
   }, []);
 
   const discard = useCallback(
-    (key: string, purgeState: boolean) => {
+    async (key: string, purgeState: boolean): Promise<void> => {
       const runtime = runtimesRef.current.get(key);
-      if (runtime) {
-        runtimesRef.current.delete(key);
-      }
       if (purgeState) {
         purge(key);
+        if (runtime) {
+          runtimesRef.current.delete(key);
+        }
       }
       if (!runtime) {
         return;
       }
 
+      if (
+        !purgeState &&
+        runtime.kind === "fix" &&
+        runtime.accepted &&
+        runtime.runId
+      ) {
+        const runId = runtime.runId;
+        if (runtime.finalize("cancelled")) {
+          await runtime.archive;
+          cancelDetached(runId);
+          return;
+        }
+      }
+
+      runtimesRef.current.delete(key);
       runtime.cancellationController?.abort();
       runtime.streamController.abort();
       if (runtime.kind === "fix" && runtime.runId) {
@@ -499,6 +769,33 @@ export function usePullRuns(
       }
     },
     [cancelDetached, purge],
+  );
+
+  const resetRepair = useCallback(
+    (key: string) => {
+      const runtime = runtimesRef.current.get(key);
+      if (runtime?.kind === "repair") {
+        runtimesRef.current.delete(key);
+        runtime.cancellationController?.abort();
+        runtime.streamController.abort();
+      }
+
+      publish((existing) => {
+        const state = existing.get(key);
+        if (!state || state.kind !== "repair") {
+          return existing as Map<string, RunState>;
+        }
+
+        const next = new Map(existing);
+        next.set(key, {
+          ...IDLE_RUN_STATE,
+          history: state.history,
+          message: state.message,
+        });
+        return next;
+      });
+    },
+    [publish],
   );
 
   const setMessage = useCallback(
@@ -525,6 +822,17 @@ export function usePullRuns(
       const key = pull.url;
       const state = statesRef.current.get(key) ?? IDLE_RUN_STATE;
       const source = options.source ?? "manual";
+      const selectedAgent =
+        options.source === "auto" ? options.agent : agent;
+      if (!isAgent(selectedAgent)) {
+        return {
+          code: "agent_invalid",
+          kind: "failed",
+          message: "Select Claude or Codex for this automatic run.",
+          source,
+        };
+      }
+      const label = agentLabel(selectedAgent);
       const message = (
         options.message ?? (source === "manual" ? state.message : "")
       ).trim();
@@ -536,6 +844,7 @@ export function usePullRuns(
           source === "auto" &&
           runtime?.kind === "fix" &&
           runtime.source === "auto" &&
+          runtime.agent === selectedAgent &&
           runtime.headRefOid?.toLowerCase() === pull.headRefOid.toLowerCase() &&
           requested !== null &&
           matchesTriggers(runtime.triggers, requested)
@@ -551,18 +860,38 @@ export function usePullRuns(
         return {
           code: "pull_running",
           kind: "retryable",
-          message: "A Claude Code run is already active for this pull request.",
+          message: `A ${codeAgentLabel(runtime?.agent ?? state.agent)} run is already active for this pull request.`,
           source,
         };
       }
 
+      const generation = ++generationRef.current;
+      const attemptToken = source === "review" ? `${key}\n${generation}` : null;
       const runtime: Runtime = {
+        accepted: false,
         action: null,
+        agent: selectedAgent,
+        archive: null,
+        attemptToken,
+        baseRefOid:
+          options.source === "review" ? options.expectedBaseRefOid : null,
         cancellationController: null,
-        generation: ++generationRef.current,
+        finalize: () => false,
+        finalized: false,
+        generation,
         headRefOid: pull.headRefOid,
+        instructions: effectiveInstructions(options, message),
         kind: "fix",
+        pendingTranscriptKey: null,
         pull: null,
+        reviewDraft:
+          options.source === "review"
+            ? (options.draft ?? options.feedback.body)
+            : null,
+        reviewFeedback:
+          options.source === "review"
+            ? Object.freeze({ ...options.feedback })
+            : null,
         runId: null,
         source,
         streamController: new AbortController(),
@@ -573,13 +902,14 @@ export function usePullRuns(
       update(key, runtime, (existing) => ({
         ...existing,
         actionId: null,
+        agent: selectedAgent,
         cancelling: false,
         headRefOid: null,
         kind: "fix",
         output: "",
         repairState: null,
         source,
-        status: "starting",
+        status: source === "review" ? "preparing" : "starting",
       }));
 
       let resolveAcceptance!: (outcome: RunStartOutcome) => void;
@@ -590,10 +920,8 @@ export function usePullRuns(
       const completion = new Promise<RunTerminalStatus>((resolve) => {
         resolveCompletion = resolve;
       });
-      let accepted = false;
       let acceptanceSettled = false;
       let completionSettled = false;
-      let ended = false;
 
       const settleAcceptance = (outcome: RunStartOutcome): void => {
         if (acceptanceSettled) return;
@@ -606,6 +934,126 @@ export function usePullRuns(
         resolveCompletion(status);
       };
 
+      runtime.finalize = (status, output): boolean => {
+        if (
+          runtime.finalized ||
+          !runtime.accepted ||
+          runtime.runId === null ||
+          runtime.instructions === null ||
+          !current(key, runtime)
+        ) {
+          return false;
+        }
+
+        runtime.finalized = true;
+        const finishedAt = new Date().toISOString();
+        const runId = runtime.runId;
+        const instructions = runtime.instructions;
+        const archivedOutput = output
+          ? append(
+              statesRef.current.get(key)?.output ?? "",
+              output.text,
+              output.line,
+            )
+          : (statesRef.current.get(key)?.output ?? "");
+        const bytes = textEncoder.encode(archivedOutput).byteLength;
+        const pendingKey =
+          runtime.pendingTranscriptKey ??
+          transcriptKey(pull, runtime.generation, runtime.runId);
+        runtime.pendingTranscriptKey = pendingKey;
+        runtime.cancellationController?.abort();
+        runtime.cancellationController = null;
+        runtime.streamController.abort();
+        runtime.archive = (async () => {
+          let transcript: RunHistoryEntry["transcript"];
+          let stored = false;
+          try {
+            await transcriptStore.initialize();
+            await transcriptStore.put(pendingKey, archivedOutput);
+            stored = true;
+            transcript = Object.freeze({
+              availability: "available",
+              bytes,
+              key: pendingKey,
+            });
+          } catch (error) {
+            transcript = transcriptFailure(error, bytes);
+          }
+
+          const identity = presentRef.current.get(key);
+          const presentEnough =
+            identity !== undefined || !authoritativeRef.current;
+          const identityMatches =
+            !authoritativeRef.current ||
+            (identity !== undefined &&
+              identity.baseRefOid === runtime.baseRefOid?.toLowerCase() &&
+              identity.headRefOid === runtime.headRefOid?.toLowerCase());
+          if (!current(key, runtime) || !presentEnough) {
+            if (stored) {
+              await deleteTranscripts([pendingKey]);
+            }
+            return;
+          }
+
+          update(key, runtime, (existing) => {
+            const entry: RunHistoryEntry = Object.freeze({
+              agent: runtime.agent,
+              finishedAt,
+              headRefOid: runtime.headRefOid ?? pull.headRefOid,
+              id: runId,
+              instructions,
+              source: runtime.source,
+              status,
+              transcript,
+            });
+            const retryableReview =
+              runtime.source === "review" &&
+              status !== "completed" &&
+              identityMatches &&
+              runtime.attemptToken !== null &&
+              runtime.baseRefOid !== null &&
+              runtime.headRefOid !== null &&
+              runtime.reviewDraft !== null &&
+              runtime.reviewFeedback !== null;
+            const reviewRetry: ReviewRetryContext | null =
+              runtime.source !== "review"
+                ? existing.reviewRetry
+                : retryableReview
+                  ? Object.freeze({
+                      attemptToken: runtime.attemptToken!,
+                      baseRefOid: runtime.baseRefOid!,
+                      draft: runtime.reviewDraft!,
+                      feedback: runtime.reviewFeedback!,
+                      headRefOid: runtime.headRefOid!,
+                      runId,
+                      status: status as Exclude<RunTerminalStatus, "completed">,
+                    })
+                  : null;
+            return {
+              ...IDLE_RUN_STATE,
+              agent: runtime.agent,
+              history: Object.freeze([entry, ...existing.history]),
+              message:
+                runtime.source === "manual" && status === "completed"
+                  ? ""
+                  : existing.message,
+              reviewAttemptToken:
+                runtime.source === "review"
+                  ? null
+                  : existing.reviewAttemptToken,
+              reviewRetry,
+            };
+          });
+        })().finally(() => {
+          runtime.pendingTranscriptKey = null;
+          if (current(key, runtime)) {
+            runtimesRef.current.delete(key);
+          }
+          settleCompletion(status);
+        });
+        return true;
+      };
+
       const execute = async (): Promise<void> => {
         try {
           const base = {
@@ -614,10 +1062,11 @@ export function usePullRuns(
             number: pull.number,
             repository: pull.repository,
           };
-          const request: ClaudeRunRequest =
+          const request: AgentRunRequest =
             options.source === "auto"
               ? {
                   ...base,
+                  agent: runtime.agent,
                   parallelism: options.parallelism,
                   source: "auto",
                   triggers: options.triggers,
@@ -625,12 +1074,13 @@ export function usePullRuns(
               : options.source === "review"
                 ? {
                     ...base,
+                    agent: runtime.agent,
                     expectedBaseRefOid: options.expectedBaseRefOid,
                     feedback: options.feedback,
                     source: "review",
                   }
-                : { ...base, source: "manual" };
-          for await (const event of streamClaudeRun(
+                : { ...base, agent: runtime.agent, source: "manual" };
+          for await (const event of streamAgentRun(
             request,
             runtime.streamController.signal,
           )) {
@@ -638,12 +1088,25 @@ export function usePullRuns(
               settleCompletion("cancelled");
               return;
             }
+            if (runtime.finalized) return;
 
             if (event.type === "start") {
-              accepted = true;
+              if (runtime.accepted) continue;
+              runtime.accepted = true;
               runtime.runId = event.runId;
+              runtime.pendingTranscriptKey = transcriptKey(
+                pull,
+                runtime.generation,
+                event.runId,
+              );
               update(key, runtime, (existing) => ({
                 ...existing,
+                headRefOid: pull.headRefOid,
+                reviewAttemptToken:
+                  source === "review"
+                    ? runtime.attemptToken
+                    : existing.reviewAttemptToken,
+                reviewRetry: source === "review" ? null : existing.reviewRetry,
                 status: "running",
               }));
               settleAcceptance({
@@ -654,18 +1117,6 @@ export function usePullRuns(
                 status: "running",
               });
               continue;
-            }
-
-            const formatted = formatEvent(event);
-            if (formatted !== null) {
-              update(key, runtime, (existing) => ({
-                ...existing,
-                output: append(
-                  existing.output,
-                  formatted,
-                  event.type !== "text",
-                ),
-              }));
             }
 
             let terminal: RunTerminalStatus | null = null;
@@ -680,23 +1131,60 @@ export function usePullRuns(
             }
 
             if (terminal !== null) {
-              ended = true;
+              const formatted = formatEvent(event);
+              if (runtime.accepted) {
+                runtime.finalize(
+                  terminal,
+                  formatted === null
+                    ? undefined
+                    : { line: event.type !== "text", text: formatted },
+                );
+                return;
+              }
+
               update(key, runtime, (existing) => ({
                 ...existing,
                 cancelling: false,
+                output:
+                  formatted === null
+                    ? existing.output
+                    : append(existing.output, formatted, event.type !== "text"),
                 status: terminal,
               }));
-              settleCompletion(terminal);
+              settleAcceptance({
+                code: null,
+                kind: "failed",
+                message: `The ${label} run ended before it was accepted.`,
+                source,
+              });
+              return;
+            }
+
+            const formatted = formatEvent(event);
+            if (formatted !== null) {
+              update(key, runtime, (existing) => ({
+                ...existing,
+                output: append(
+                  existing.output,
+                  formatted,
+                  event.type !== "text",
+                ),
+              }));
             }
           }
 
-          if (!ended) {
+          if (!runtime.finalized) {
             const error = new Error(
-              accepted
-                ? "Claude disconnected before reporting completion."
-                : "Claude disconnected before accepting the run.",
+              runtime.accepted
+                ? `${label} disconnected before reporting completion.`
+                : `${label} disconnected before accepting the run.`,
             );
-            if (current(key, runtime)) {
+            if (runtime.accepted) {
+              runtime.finalize("failed", {
+                line: true,
+                text: `[error] ${error.message}`,
+              });
+            } else if (current(key, runtime)) {
               update(key, runtime, (existing) => ({
                 ...existing,
                 cancelling: false,
@@ -707,44 +1195,60 @@ export function usePullRuns(
                 ),
                 status: "failed",
               }));
-            }
-            if (accepted) {
-              settleCompletion("failed");
-            } else {
-              settleAcceptance(startFailure(error, source));
+              settleAcceptance(startFailure(error, source, runtime.agent));
             }
           }
         } catch (error) {
-          if (current(key, runtime) && !isAbortError(error)) {
+          if (runtime.finalized) return;
+
+          if (runtime.accepted) {
+            const finalized = runtime.finalize(
+              isAbortError(error) ? "cancelled" : "failed",
+              isAbortError(error)
+                ? undefined
+                : {
+                    line: true,
+                    text: `[error] ${error instanceof Error ? error.message : `${label} could not be reached.`}`,
+                  },
+            );
+            if (!finalized && !current(key, runtime)) {
+              settleCompletion("cancelled");
+            }
+          } else if (current(key, runtime) && !isAbortError(error)) {
             update(key, runtime, (existing) => ({
               ...existing,
               cancelling: false,
               output: append(
                 existing.output,
-                `[error] ${error instanceof Error ? error.message : "Claude could not be reached."}`,
+                `[error] ${error instanceof Error ? error.message : `${label} could not be reached.`}`,
                 true,
               ),
               status: "failed",
             }));
-          }
-          if (accepted) {
-            settleCompletion(isAbortError(error) ? "cancelled" : "failed");
+            settleAcceptance(startFailure(error, source, runtime.agent));
           } else {
-            settleAcceptance(startFailure(error, source));
+            settleAcceptance(startFailure(error, source, runtime.agent));
           }
         } finally {
           if (!acceptanceSettled) {
             settleAcceptance({
               code: null,
               kind: "failed",
-              message: "The Claude Code run ended before it was accepted.",
+              message: `The ${label} run ended before it was accepted.`,
               source,
             });
           }
-          if (!completionSettled && accepted) {
-            settleCompletion(ended ? "failed" : "cancelled");
+          if (!completionSettled && runtime.accepted) {
+            if (!current(key, runtime)) {
+              settleCompletion("cancelled");
+            } else if (!runtime.finalized) {
+              runtime.finalize("failed", {
+                line: true,
+                text: `[error] ${label} disconnected before reporting completion.`,
+              });
+            }
           }
-          if (current(key, runtime)) {
+          if (current(key, runtime) && !runtime.finalized) {
             runtimesRef.current.delete(key);
             runtime.cancellationController?.abort();
           }
@@ -754,7 +1258,7 @@ export function usePullRuns(
       void execute();
       return acceptance;
     },
-    [current, update],
+    [agent, current, deleteTranscripts, transcriptStore, update],
   );
 
   const observeRepair = useCallback(
@@ -770,15 +1274,26 @@ export function usePullRuns(
 
       const existing = runtimesRef.current.get(key);
       if (existing?.kind === "repair") return;
-      if (existing) discard(key, false);
+      if (existing) await discard(key, false);
 
       const runtime: Runtime = {
+        accepted: false,
         action: response.action,
+        agent: response.action.agent,
+        archive: null,
+        attemptToken: null,
+        baseRefOid: null,
         cancellationController: null,
+        finalize: () => false,
+        finalized: false,
         generation: ++generationRef.current,
         headRefOid: pull.headRefOid,
+        instructions: null,
         kind: "repair",
+        pendingTranscriptKey: null,
         pull,
+        reviewDraft: null,
+        reviewFeedback: null,
         runId: null,
         source: "auto",
         streamController: new AbortController(),
@@ -788,6 +1303,7 @@ export function usePullRuns(
       update(key, runtime, (state) => ({
         ...state,
         actionId: response.action.id,
+        agent: response.action.agent,
         cancelling: false,
         headRefOid: pull.headRefOid,
         kind: "repair",
@@ -907,7 +1423,7 @@ export function usePullRuns(
       }));
 
       try {
-        await cancelClaudeRun(runtime.runId, controller.signal);
+        await cancelAgentRun(runtime.runId, controller.signal);
       } catch (error) {
         if (current(key, runtime) && !isAbortError(error)) {
           update(key, runtime, (existing) => ({
@@ -915,7 +1431,7 @@ export function usePullRuns(
             cancelling: false,
             output: append(
               existing.output,
-              `[diagnostic] ${error instanceof Error ? error.message : "Claude could not be cancelled."}`,
+              `[diagnostic] ${error instanceof Error ? error.message : `${agentLabel(runtime.agent)} could not be cancelled.`}`,
               true,
             ),
           }));
@@ -923,18 +1439,7 @@ export function usePullRuns(
         return;
       }
 
-      if (!current(key, runtime) || !isRunActive(statesRef.current.get(key))) {
-        return;
-      }
-
-      update(key, runtime, (existing) => ({
-        ...existing,
-        cancelling: false,
-        status: "cancelled",
-      }));
-      runtimesRef.current.delete(key);
-      runtime.cancellationController = null;
-      runtime.streamController.abort();
+      runtime.finalize("cancelled");
     },
     [current, update],
   );
@@ -963,19 +1468,66 @@ export function usePullRuns(
     ]);
 
     for (const key of stored) {
-      const head = present.get(key);
+      const identity = present.get(key);
       const state = statesRef.current.get(key);
-      if (
-        head === undefined ||
-        (state?.kind === "repair" && state.headRefOid !== head)
+      const runtime = runtimesRef.current.get(key);
+      if (identity === undefined) {
+        if (authoritative) void discard(key, true);
+      } else if (
+        authoritative &&
+        ((state?.reviewRetry &&
+          (state.reviewRetry.baseRefOid.toLowerCase() !== identity.baseRefOid ||
+            state.reviewRetry.headRefOid.toLowerCase() !==
+              identity.headRefOid)) ||
+          (state?.reviewAttemptToken &&
+            runtime?.source === "review" &&
+            (runtime.baseRefOid?.toLowerCase() !== identity.baseRefOid ||
+              runtime.headRefOid?.toLowerCase() !== identity.headRefOid)))
       ) {
-        discard(key, true);
+        publish((existing) => {
+          const currentState = existing.get(key);
+          if (
+            !currentState ||
+            (!currentState.reviewRetry && !currentState.reviewAttemptToken)
+          ) {
+            return existing as Map<string, RunState>;
+          }
+          const next = new Map(existing);
+          next.set(key, {
+            ...currentState,
+            reviewAttemptToken: null,
+            reviewRetry: null,
+          });
+          return next;
+        });
+      } else if (
+        authoritative &&
+        state?.kind === "repair" &&
+        state.headRefOid?.toLowerCase() !== identity.headRefOid
+      ) {
+        resetRepair(key);
       }
     }
-  }, [discard, present]);
+  }, [authoritative, discard, present, publish, resetRepair]);
 
   return useMemo(
-    () => ({ cancel, observeRepair, setMessage, start, states }),
-    [cancel, observeRepair, setMessage, start, states],
+    () => ({
+      cancel,
+      clearReviewRetry,
+      loadTranscript,
+      observeRepair,
+      setMessage,
+      start,
+      states,
+    }),
+    [
+      cancel,
+      clearReviewRetry,
+      loadTranscript,
+      observeRepair,
+      setMessage,
+      start,
+      states,
+    ],
   );
 }

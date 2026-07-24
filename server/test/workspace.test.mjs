@@ -1,9 +1,12 @@
 import { execFile as executeFile } from "node:child_process";
 import {
+  access,
   chmod,
   mkdtemp,
   mkdir,
+  readdir,
   realpath,
+  rename,
   rm,
   stat,
   symlink,
@@ -13,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   createTaskRepositoryCatalog,
@@ -25,6 +28,7 @@ import {
   validateGitBranch,
   validateReleaseTag,
 } from "../workspace.mjs";
+import { removeTrackedFixtures } from "./fixtures.mjs";
 
 const SHA = "abcdef0123456789abcdef0123456789abcdef01";
 const OTHER_SHA = "1234567890abcdef1234567890abcdef12345678";
@@ -34,20 +38,20 @@ const SAFE_GIT_CONFIGURATION = [
   "-c",
   "core.fsmonitor=false",
 ];
-const temporary = [];
+const temporary = new Set();
 const execFile = promisify(executeFile);
 
 afterEach(async () => {
-  await Promise.all(
-    temporary
-      .splice(0)
-      .map((path) => rm(path, { recursive: true, force: true })),
-  );
+  await removeTrackedFixtures(temporary);
+});
+
+afterAll(async () => {
+  await removeTrackedFixtures(temporary);
 });
 
 async function directory(name = "root") {
   const base = await mkdtemp(join(tmpdir(), "pull-workspace-"));
-  temporary.push(base);
+  temporary.add(base);
   const path = join(base, name);
   await mkdir(path, { recursive: true });
   return { base: await realpath(base), path: await realpath(path) };
@@ -131,9 +135,11 @@ describe("workspace resolution", () => {
         "/home/test",
       ),
     ).toEqual({
+      reviewRoot: "/home/test/.puller/reviews",
       roots: ["/one", "/two", "/home/test/.puller/worktrees"],
     });
     expect(resolveWorkspaceOptions({}, "/home/test")).toEqual({
+      reviewRoot: "/home/test/.puller/reviews",
       roots: [
         "/home/test/Local",
         "/home/test/.codex/worktrees",
@@ -149,6 +155,7 @@ describe("workspace resolution", () => {
         "/home/test",
       ),
     ).toEqual({
+      reviewRoot: "/state/reviews",
       roots: ["/one", "/state/worktrees"],
     });
     expect(
@@ -157,12 +164,19 @@ describe("workspace resolution", () => {
         "/home/test",
       ),
     ).toEqual({
+      reviewRoot: "/home/test/.puller/reviews",
       roots: [
         "/home/test/Local",
         "/home/test/.codex/worktrees",
         "/custom/tasks",
       ],
     });
+    expect(
+      resolveWorkspaceOptions(
+        { PULLER_REVIEW_WORKSPACE_ROOT: "/custom/reviews" },
+        "/home/test",
+      ).reviewRoot,
+    ).toBe("/custom/reviews");
   });
 
   it("deduplicates canonically equivalent trusted roots before discovery", async () => {
@@ -1113,37 +1127,27 @@ describe("workspace resolution", () => {
   });
 });
 
-describe("review workspaces", () => {
-  async function reviewFixture(overrides = {}) {
-    const { path: root } = await directory();
-    const repository = join(root, "repo");
-    await mkdir(repository);
-    const state = {
-      branch: "fix/review",
-      descendant: "",
-      head: SHA,
-      origin: "https://github.com/owner/repo.git",
-      pushable: "ok",
-      pushOrigin: "git@github.com:owner/repo.git",
-      remoteHead: SHA,
-      status: "",
-      top: repository,
-      ...overrides,
-    };
-    const run = gitRunner(new Map([[repository, state]]));
-    const resolver = createWorkspaceResolver({
-      discoverRepositories: vi.fn(async () => [repository]),
-      reviewCommandTimeout: overrides.reviewCommandTimeout ?? 30_000,
-      roots: [root],
-      run,
-    });
-    return { repository, resolver, run, state };
-  }
+describe("owned review workspaces", () => {
+  const branch = "fix/review";
+  const repositoryName = "owner/repo";
+  const canonicalOrigin = "git@github.com:owner/repo.git";
 
-  async function rewrittenHistory(kind) {
-    const { path: root } = await directory();
-    const repository = join(root, "repo");
-    await execFile("git", ["init", "--initial-branch=main", repository]);
+  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects invalid review cleanup timeout %s",
+    (reviewCleanupTimeout) => {
+      expect(() => createWorkspaceResolver({ reviewCleanupTimeout })).toThrow(
+        "reviewCleanupTimeout must be a positive integer.",
+      );
+    },
+  );
+
+  it("rejects an invalid review cleanup remover", () => {
+    expect(() =>
+      createWorkspaceResolver({ removeReviewDirectory: null }),
+    ).toThrow("removeReviewDirectory must be a function.");
+  });
+
+  async function configureIdentity(repository) {
     await execFile("git", [
       "-C",
       repository,
@@ -1165,355 +1169,487 @@ describe("review workspaces", () => {
       "commit.gpgsign",
       "false",
     ]);
-    await execFile("git", [
-      "-C",
-      repository,
-      "config",
-      "remote.origin.url",
-      "https://github.com/owner/repo.git",
-    ]);
-    await writeFile(join(repository, "source.txt"), "content\n");
-    await execFile("git", ["-C", repository, "add", "source.txt"]);
-    await execFile("git", ["-C", repository, "commit", "-m", "base"]);
-    const base = (
-      await execFile("git", ["-C", repository, "rev-parse", "HEAD"])
-    ).stdout.trim();
-    const tree = (
-      await execFile("git", ["-C", repository, "rev-parse", "HEAD^{tree}"])
-    ).stdout.trim();
-    const unrelated = (
-      await execFile("git", [
-        "-C",
-        repository,
-        "commit-tree",
-        tree,
-        "-m",
-        "unrelated",
-      ])
-    ).stdout.trim();
-    const replacement = (
-      await execFile("git", [
-        "-C",
-        repository,
-        "commit-tree",
-        tree,
-        "-p",
-        base,
-        "-m",
-        "replacement",
-      ])
-    ).stdout.trim();
-    await execFile("git", [
-      "-C",
-      repository,
-      "checkout",
-      "-B",
-      "fix/review",
-      unrelated,
-    ]);
-    await execFile("git", [
-      "-C",
-      repository,
-      "update-ref",
-      "refs/remotes/origin/fix/review",
-      unrelated,
-    ]);
-    if (kind === "replace") {
-      await execFile("git", [
-        "-C",
-        repository,
-        "replace",
-        unrelated,
-        replacement,
-      ]);
-    } else {
-      await mkdir(join(repository, ".git", "info"), { recursive: true });
-      await writeFile(
-        join(repository, ".git", "info", "grafts"),
-        `${unrelated} ${base}\n`,
-      );
-    }
-    await expect(
-      execFile("git", [
-        "-C",
-        repository,
-        "merge-base",
-        "--is-ancestor",
-        base,
-        unrelated,
-      ]),
-    ).resolves.toBeDefined();
-    return {
-      base,
-      repository,
-      resolver: createWorkspaceResolver({ roots: [root] }),
-      unrelated,
-    };
   }
 
-  it("proves a clean exact-head branch and push remote before review", async () => {
-    const { repository, resolver, run } = await reviewFixture({
-      reviewCommandTimeout: 17,
-    });
-    await expect(
-      resolver.resolveReview({
-        expectedHeadRefOid: SHA,
-        headRefName: "fix/review",
-        number: 7,
-        repository: "owner/repo",
-      }),
-    ).resolves.toEqual({
-      branch: "fix/review",
-      cwd: repository,
-      headRefOid: SHA,
-      remote: "origin",
-      repository: "owner/repo",
-    });
-    const calls = run.mock.calls.filter(([executable]) => executable === "git");
-    expect(calls.length).toBeGreaterThan(0);
-    for (const [, args] of calls) {
-      expect(args.slice(2, 2 + SAFE_GIT_CONFIGURATION.length)).toEqual(
-        SAFE_GIT_CONFIGURATION,
-      );
-    }
-    const push = calls.find(
-      ([, args]) =>
-        args
-          .slice(
-            2 + SAFE_GIT_CONFIGURATION.length,
-            5 + SAFE_GIT_CONFIGURATION.length,
-          )
-          .join(" ") === "push --dry-run --porcelain",
-    );
-    expect(push?.[2]).toMatchObject({
-      env: expect.objectContaining({
-        GIT_NO_REPLACE_OBJECTS: "1",
-        GIT_SSH_COMMAND: expect.stringContaining("BatchMode=yes"),
-        GIT_TERMINAL_PROMPT: "0",
-      }),
-      killSignal: "SIGKILL",
-      timeout: 17,
-    });
-  });
-
-  it("does not execute repository hooks or fsmonitor during review proof commands", async () => {
+  async function fixture({
+    afterCommand,
+    beforeCommand,
+    resolverOptions = {},
+  } = {}) {
     const { path: root } = await directory();
-    const repository = join(root, "repo");
+    const repositories = join(root, "repositories");
+    const reviewRoot = join(root, "reviews");
+    const source = join(repositories, "repo");
     const remote = join(root, "remote.git");
-    const hookMarker = join(root, "hook-ran");
-    const monitorMarker = join(root, "monitor-ran");
-    const hook = join(repository, ".git", "hooks", "pre-push");
-    const monitor = join(root, "monitor");
-
+    const producer = join(root, "producer");
+    await mkdir(repositories);
     await execFile("git", ["init", "--bare", remote]);
-    await execFile("git", ["init", "--initial-branch=fix/review", repository]);
+    await execFile("git", ["init", `--initial-branch=${branch}`, source]);
+    await configureIdentity(source);
+    await writeFile(join(source, "source.txt"), "stale\n");
+    await execFile("git", ["-C", source, "add", "source.txt"]);
+    await execFile("git", ["-C", source, "commit", "-m", "stale"]);
+    const stale = (
+      await execFile("git", ["-C", source, "rev-parse", "HEAD"])
+    ).stdout.trim();
     await execFile("git", [
       "-C",
-      repository,
-      "config",
-      "user.email",
-      "puller@example.test",
+      source,
+      "push",
+      remote,
+      `${stale}:refs/heads/${branch}`,
     ]);
     await execFile("git", [
-      "-C",
-      repository,
-      "config",
-      "user.name",
-      "Puller Test",
+      "--git-dir",
+      remote,
+      "symbolic-ref",
+      "HEAD",
+      `refs/heads/${branch}`,
     ]);
+    await execFile("git", ["clone", remote, producer]);
+    await configureIdentity(producer);
+    await writeFile(join(producer, "remote.txt"), "current\n");
+    await execFile("git", ["-C", producer, "add", "remote.txt"]);
+    await execFile("git", ["-C", producer, "commit", "-m", "current"]);
+    await execFile("git", ["-C", producer, "push", "origin", branch]);
+    const expected = (
+      await execFile("git", ["-C", producer, "rev-parse", "HEAD"])
+    ).stdout.trim();
     await execFile("git", [
       "-C",
-      repository,
+      source,
       "remote",
       "add",
       "origin",
-      "https://github.com/owner/repo.git",
+      "https://user:secret@github.com/Owner/Repo.git",
     ]);
-    await writeFile(join(repository, "source.txt"), "content\n");
-    await execFile("git", ["-C", repository, "add", "source.txt"]);
-    await execFile("git", ["-C", repository, "commit", "-m", "base"]);
-    const head = (
-      await execFile("git", ["-C", repository, "rev-parse", "HEAD"])
-    ).stdout.trim();
+    await writeFile(join(source, "source.txt"), "dirty\n");
 
-    await writeFile(hook, `#!/bin/sh\n: > "${hookMarker}"\nexit 1\n`);
-    await chmod(hook, 0o755);
-    await writeFile(monitor, `#!/bin/sh\n: > "${monitorMarker}"\nexit 1\n`);
-    await chmod(monitor, 0o755);
-    await execFile("git", [
-      "-C",
-      repository,
-      "config",
-      "core.fsmonitor",
-      monitor,
-    ]);
+    const run = vi.fn(async (executable, args, options) => {
+      const offset = 2 + SAFE_GIT_CONFIGURATION.length;
+      const tokens = args.slice(offset);
+      await beforeCommand?.({ args, options, tokens });
+      const rewritten = [...args];
+      if (tokens[0] === "fetch" || tokens[0] === "push") {
+        const origin = rewritten.indexOf("origin", offset + 1);
+        if (origin !== -1) rewritten[origin] = remote;
+      }
+      const result = await execFile(executable, rewritten, options);
+      await afterCommand?.({ args, options, result, tokens });
+      return result;
+    });
+    const environment = {
+      AWS_SECRET_ACCESS_KEY: "not-forwarded",
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "url.file:///tmp/.insteadOf",
+      GIT_CONFIG_VALUE_0: "git@github.com:",
+      GH_TOKEN: "not-forwarded",
+      HOME: process.env.HOME,
+      LANG: process.env.LANG ?? "C",
+      PATH: process.env.PATH,
+      SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK,
+    };
+    const resolver = createWorkspaceResolver({
+      environment,
+      reviewRoot,
+      roots: [repositories],
+      run,
+      ...resolverOptions,
+    });
+    return {
+      environment,
+      expected,
+      remote,
+      repositories,
+      resolver,
+      reviewRoot,
+      root,
+      run,
+      source,
+      stale,
+    };
+  }
 
+  const resolveReview = (fixture, signal) =>
+    fixture.resolver.resolveReview({
+      expectedHeadRefOid: fixture.expected,
+      headRefName: branch,
+      number: 7,
+      repository: repositoryName,
+      signal,
+    });
+
+  it("clones a stale dirty same-branch primary into a hardened owned workspace", async () => {
+    const current = await fixture();
+    const workspace = await resolveReview(current);
+    expect(workspace).toMatchObject({
+      branch,
+      cwd: expect.stringContaining(`${current.reviewRoot}/review-`),
+      headRefOid: current.expected,
+      remote: "origin",
+      repository: repositoryName,
+    });
+    expect(workspace.cleanup).toEqual(expect.any(Function));
+    await expect(
+      execFile("git", ["-C", current.source, "rev-parse", "HEAD"]),
+    ).resolves.toMatchObject({ stdout: `${current.stale}\n` });
     await expect(
       execFile("git", [
         "-C",
-        repository,
-        "push",
-        "--dry-run",
-        remote,
-        `${head}:refs/heads/fix/review`,
+        current.source,
+        "symbolic-ref",
+        "--short",
+        "HEAD",
       ]),
-    ).rejects.toBeDefined();
-    await expect(stat(hookMarker)).resolves.toBeDefined();
-    await execFile("git", ["-C", repository, "status", "--porcelain=v1"]).catch(
-      () => undefined,
+    ).resolves.toMatchObject({ stdout: `${branch}\n` });
+    expect(
+      (await execFile("git", ["-C", current.source, "status", "--porcelain"]))
+        .stdout,
+    ).toContain(" M source.txt");
+
+    const clone = current.run.mock.calls.find(([, args]) =>
+      args.includes("clone"),
     );
-    await expect(stat(monitorMarker)).resolves.toBeDefined();
-    await rm(hookMarker, { force: true });
-    await rm(monitorMarker, { force: true });
-
-    await execFile("git", [
-      "-C",
-      repository,
-      ...SAFE_GIT_CONFIGURATION,
-      "push",
-      remote,
-      `${head}:refs/heads/fix/review`,
+    const cloneArguments = clone[1].slice(2 + SAFE_GIT_CONFIGURATION.length);
+    expect(cloneArguments.slice(0, 3)).toEqual([
+      "clone",
+      "--no-hardlinks",
+      "--no-checkout",
     ]);
-    await execFile("git", [
-      "-C",
-      repository,
-      "update-ref",
-      "refs/remotes/origin/fix/review",
-      head,
-    ]);
+    expect(cloneArguments).not.toContain("--shared");
+    expect(
+      cloneArguments.some((argument) => argument.startsWith("--reference")),
+    ).toBe(false);
+    expect(
+      current.run.mock.calls.some(([, args]) => args.includes("fetch")),
+    ).toBe(true);
+    for (const [, , options] of current.run.mock.calls) {
+      expect(options.env).toMatchObject({
+        GIT_ATTR_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_SYSTEM: "/dev/null",
+        GIT_NO_REPLACE_OBJECTS: "1",
+        GIT_OPTIONAL_LOCKS: "0",
+        GIT_TERMINAL_PROMPT: "0",
+      });
+      expect(options.env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+      expect(options.env.GH_TOKEN).toBeUndefined();
+      expect(options.env.GIT_CONFIG_COUNT).toBeUndefined();
+      expect(options.env.GIT_CONFIG_KEY_0).toBeUndefined();
+      expect(options.env.GIT_CONFIG_VALUE_0).toBeUndefined();
+    }
 
-    const run = vi.fn(async (executable, args, options) => {
-      const configured = args.slice(2 + SAFE_GIT_CONFIGURATION.length);
-      if (configured[0] === "push") {
-        const rewritten = [...args];
-        rewritten[rewritten.indexOf("origin")] = remote;
-        return execFile(executable, rewritten, options);
+    const config = async (key) =>
+      (
+        await execFile("git", [
+          "-C",
+          workspace.cwd,
+          "config",
+          "--local",
+          "--get",
+          key,
+        ])
+      ).stdout.trim();
+    await expect(config("remote.origin.url")).resolves.toBe(canonicalOrigin);
+    await expect(config("remote.origin.pushurl")).resolves.toBe(
+      canonicalOrigin,
+    );
+    await expect(config("remote.origin.fetch")).resolves.toBe(
+      `+refs/heads/${branch}:refs/remotes/origin/${branch}`,
+    );
+    await expect(config("core.hooksPath")).resolves.toBe("/dev/null");
+    await expect(config("core.fsmonitor")).resolves.toBe("false");
+    await expect(config("commit.gpgsign")).resolves.toBe("false");
+    await expect(config("tag.gpgsign")).resolves.toBe("false");
+    await expect(config("user.name")).resolves.toBe("Puller Review");
+    await expect(config("user.email")).resolves.toBe("puller@localhost");
+    expect((await stat(current.reviewRoot)).mode & 0o777).toBe(0o700);
+    expect((await stat(workspace.cwd)).mode & 0o777).toBe(0o700);
+    await expect(
+      access(join(workspace.cwd, ".git", "objects", "info", "alternates")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+
+    await workspace.cleanup();
+    await workspace.cleanup();
+    await expect(access(workspace.cwd)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(access(current.source)).resolves.toBeUndefined();
+    await expect(readdir(current.reviewRoot)).resolves.toEqual([]);
+  });
+
+  it("cleans a partial clone when exact branch fetch fails", async () => {
+    const current = await fixture({
+      beforeCommand: ({ tokens }) => {
+        if (tokens[0] === "fetch") throw new Error("fetch failed");
+      },
+    });
+    await expect(resolveReview(current)).rejects.toMatchObject({
+      code: "review_workspace_fetch_failed",
+    });
+    await expect(readdir(current.reviewRoot)).resolves.toEqual([]);
+    await expect(access(current.source)).resolves.toBeUndefined();
+  });
+
+  it("bounds cleanup of a partial clone when removal never settles", async () => {
+    const removeReviewDirectory = vi.fn(() => new Promise(() => undefined));
+    const current = await fixture({
+      beforeCommand: ({ tokens }) => {
+        if (tokens[0] === "fetch") throw new Error("fetch failed");
+      },
+      resolverOptions: {
+        removeReviewDirectory,
+        reviewCleanupTimeout: 10,
+      },
+    });
+
+    await expect(resolveReview(current)).rejects.toMatchObject({
+      code: "review_workspace_cleanup_failed",
+      message: expect.not.stringContaining(current.root),
+    });
+    expect(removeReviewDirectory).toHaveBeenCalledOnce();
+  });
+
+  it("cleans a partial clone when the caller aborts during fetch", async () => {
+    const controller = new AbortController();
+    const current = await fixture({
+      beforeCommand: ({ tokens }) => {
+        if (tokens[0] === "fetch") {
+          controller.abort(new Error("review cancelled"));
+          throw new Error("fetch interrupted");
+        }
+      },
+    });
+    await expect(resolveReview(current, controller.signal)).rejects.toThrow(
+      "review cancelled",
+    );
+    await expect(readdir(current.reviewRoot)).resolves.toEqual([]);
+  });
+
+  it("rejects alternates introduced during clone and removes the clone", async () => {
+    const current = await fixture({
+      afterCommand: async ({ args, tokens }) => {
+        if (tokens[0] !== "clone") return;
+        const cwd = args.at(-1);
+        await mkdir(join(cwd, ".git", "objects", "info"), {
+          recursive: true,
+        });
+        await writeFile(
+          join(cwd, ".git", "objects", "info", "alternates"),
+          "/tmp/untrusted\n",
+        );
+      },
+    });
+    await expect(resolveReview(current)).rejects.toMatchObject({
+      code: "review_git_alternates_present",
+    });
+    await expect(readdir(current.reviewRoot)).resolves.toEqual([]);
+  });
+
+  it("post-verifies a clean pushed descendant at the exact canonical remote", async () => {
+    const current = await fixture();
+    const workspace = await resolveReview(current);
+    try {
+      await writeFile(join(workspace.cwd, "review.txt"), "fixed\n");
+      await execFile("git", ["-C", workspace.cwd, "add", "review.txt"]);
+      await execFile("git", [
+        "-C",
+        workspace.cwd,
+        "commit",
+        "-m",
+        "fix review",
+      ]);
+      const head = (
+        await execFile("git", ["-C", workspace.cwd, "rev-parse", "HEAD"])
+      ).stdout.trim();
+      await execFile("git", [
+        "-C",
+        workspace.cwd,
+        "push",
+        current.remote,
+        `${head}:refs/heads/${branch}`,
+      ]);
+      await execFile("git", [
+        "-C",
+        workspace.cwd,
+        "update-ref",
+        `refs/remotes/origin/${branch}`,
+        head,
+      ]);
+      await expect(
+        current.resolver.verifyReview(workspace, {
+          expectedHeadRefOid: current.expected,
+        }),
+      ).resolves.toMatchObject({ headRefOid: head });
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it("rejects local security configuration changed before completion", async () => {
+    const current = await fixture();
+    const workspace = await resolveReview(current);
+    try {
+      await writeFile(join(workspace.cwd, "review.txt"), "fixed\n");
+      await execFile("git", ["-C", workspace.cwd, "add", "review.txt"]);
+      await execFile("git", [
+        "-C",
+        workspace.cwd,
+        "commit",
+        "-m",
+        "fix review",
+      ]);
+      const head = (
+        await execFile("git", ["-C", workspace.cwd, "rev-parse", "HEAD"])
+      ).stdout.trim();
+      await execFile("git", [
+        "-C",
+        workspace.cwd,
+        "push",
+        current.remote,
+        `${head}:refs/heads/${branch}`,
+      ]);
+      await execFile("git", [
+        "-C",
+        workspace.cwd,
+        "update-ref",
+        `refs/remotes/origin/${branch}`,
+        head,
+      ]);
+      await execFile("git", [
+        "-C",
+        workspace.cwd,
+        "config",
+        "--local",
+        "core.hooksPath",
+        ".git/hooks",
+      ]);
+      await expect(
+        current.resolver.verifyReview(workspace, {
+          expectedHeadRefOid: current.expected,
+        }),
+      ).rejects.toMatchObject({ code: "review_workspace_hardening_changed" });
+    } finally {
+      await workspace.cleanup();
+    }
+  });
+
+  it.each([
+    ["replace refs", "review_commit_not_descendant"],
+    ["legacy grafts", "review_git_grafts_present"],
+  ])("does not let %s spoof descendant verification", async (kind, code) => {
+    const current = await fixture();
+    const workspace = await resolveReview(current);
+    try {
+      const tree = (
+        await execFile("git", ["-C", workspace.cwd, "rev-parse", "HEAD^{tree}"])
+      ).stdout.trim();
+      const unrelated = (
+        await execFile("git", [
+          "-C",
+          workspace.cwd,
+          "commit-tree",
+          tree,
+          "-m",
+          "unrelated",
+        ])
+      ).stdout.trim();
+      const replacement = (
+        await execFile("git", [
+          "-C",
+          workspace.cwd,
+          "commit-tree",
+          tree,
+          "-p",
+          current.expected,
+          "-m",
+          "replacement",
+        ])
+      ).stdout.trim();
+      await execFile("git", [
+        "-C",
+        workspace.cwd,
+        "reset",
+        "--hard",
+        unrelated,
+      ]);
+      await execFile("git", [
+        "-C",
+        workspace.cwd,
+        "update-ref",
+        `refs/remotes/origin/${branch}`,
+        unrelated,
+      ]);
+      if (kind === "replace refs") {
+        await execFile("git", [
+          "-C",
+          workspace.cwd,
+          "replace",
+          unrelated,
+          replacement,
+        ]);
+      } else {
+        await mkdir(join(workspace.cwd, ".git", "info"), { recursive: true });
+        await writeFile(
+          join(workspace.cwd, ".git", "info", "grafts"),
+          `${unrelated} ${current.expected}\n`,
+        );
       }
-      return execFile(executable, args, options);
-    });
-    const resolver = createWorkspaceResolver({
-      discoverRepositories: async () => [repository],
-      roots: [root],
-      run,
-    });
-
-    await expect(
-      resolver.resolveReview({
-        expectedHeadRefOid: head,
-        headRefName: "fix/review",
-        number: 7,
-        repository: "owner/repo",
-      }),
-    ).resolves.toMatchObject({ cwd: repository, headRefOid: head });
-    await expect(stat(hookMarker)).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(stat(monitorMarker)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(
+        current.resolver.verifyReview(workspace, {
+          expectedHeadRefOid: current.expected,
+        }),
+      ).rejects.toMatchObject({ code });
+    } finally {
+      await workspace.cleanup();
+    }
   });
 
-  it("rejects dirty and mismatched push-remote workspaces", async () => {
-    const dirty = await reviewFixture({ status: " M source.js" });
-    await expect(
-      dirty.resolver.resolveReview({
-        expectedHeadRefOid: SHA,
-        headRefName: "fix/review",
-        number: 7,
-        repository: "owner/repo",
-      }),
-    ).rejects.toMatchObject({ code: "workspace_dirty" });
-
-    const remote = await reviewFixture({
-      pushOrigin: "https://github.com/different/repo.git",
+  it("rejects a symlinked review root without touching its target", async () => {
+    const current = await fixture();
+    const external = join(current.root, "external");
+    await mkdir(external);
+    await writeFile(join(external, "sentinel"), "keep\n");
+    await symlink(external, current.reviewRoot);
+    await expect(resolveReview(current)).rejects.toMatchObject({
+      code: "review_workspace_root_untrusted",
     });
-    await expect(
-      remote.resolver.resolveReview({
-        expectedHeadRefOid: SHA,
-        headRefName: "fix/review",
-        number: 7,
-        repository: "owner/repo",
-      }),
-    ).rejects.toMatchObject({ code: "review_workspace_remote_mismatch" });
+    await expect(access(join(external, "sentinel"))).resolves.toBeUndefined();
   });
 
-  it("post-verifies a clean pushed descendant at the exact origin ref", async () => {
-    const { repository, resolver, state } = await reviewFixture();
-    const workspace = await resolver.resolveReview({
-      expectedHeadRefOid: SHA,
-      headRefName: "fix/review",
-      number: 7,
-      repository: "owner/repo",
-    });
-    state.head = OTHER_SHA;
-    state.remoteHead = OTHER_SHA;
+  it("rejects cleanup when the canonical review root was replaced", async () => {
+    const current = await fixture();
+    const workspace = await resolveReview(current);
+    const displaced = `${current.reviewRoot}-displaced`;
+    await rename(current.reviewRoot, displaced);
+    await mkdir(current.reviewRoot, { mode: 0o700 });
+    const sentinel = join(current.reviewRoot, "sentinel");
+    await writeFile(sentinel, "keep\n");
 
-    await expect(
-      resolver.verifyReview(workspace, { expectedHeadRefOid: SHA }),
-    ).resolves.toMatchObject({
-      cwd: repository,
-      headRefOid: OTHER_SHA,
+    await expect(workspace.cleanup()).rejects.toMatchObject({
+      code: "review_workspace_cleanup_failed",
+      message: expect.not.stringContaining(current.root),
     });
+    await expect(access(sentinel)).resolves.toBeUndefined();
+    await expect(access(displaced)).resolves.toBeUndefined();
   });
 
-  it("rejects a rewritten or unpushed completion", async () => {
-    const rewritten = await reviewFixture();
-    const rewrittenWorkspace = await rewritten.resolver.resolveReview({
-      expectedHeadRefOid: SHA,
-      headRefName: "fix/review",
-      number: 7,
-      repository: "owner/repo",
+  it("rejects cleanup when the review directory inode was replaced", async () => {
+    const current = await fixture();
+    const workspace = await resolveReview(current);
+    const displaced = `${workspace.cwd}-displaced`;
+    await rename(workspace.cwd, displaced);
+    await mkdir(workspace.cwd, { mode: 0o700 });
+    const sentinel = join(workspace.cwd, "sentinel");
+    await writeFile(sentinel, "keep\n");
+
+    await expect(workspace.cleanup()).rejects.toMatchObject({
+      code: "review_workspace_cleanup_failed",
+      message: expect.not.stringContaining(current.root),
     });
-    rewritten.state.head = OTHER_SHA;
-    rewritten.state.remoteHead = OTHER_SHA;
-    rewritten.state.descendant = undefined;
-    await expect(
-      rewritten.resolver.verifyReview(rewrittenWorkspace, {
-        expectedHeadRefOid: SHA,
-      }),
-    ).rejects.toMatchObject({ code: "review_commit_not_descendant" });
-
-    const unpushed = await reviewFixture();
-    const unpushedWorkspace = await unpushed.resolver.resolveReview({
-      expectedHeadRefOid: SHA,
-      headRefName: "fix/review",
-      number: 7,
-      repository: "owner/repo",
-    });
-    unpushed.state.head = OTHER_SHA;
-    await expect(
-      unpushed.resolver.verifyReview(unpushedWorkspace, {
-        expectedHeadRefOid: SHA,
-      }),
-    ).rejects.toMatchObject({ code: "review_workspace_remote_head_mismatch" });
-  });
-
-  it("does not let replace refs spoof descendant verification", async () => {
-    const fixture = await rewrittenHistory("replace");
-    await expect(
-      fixture.resolver.verifyReview(
-        {
-          branch: "fix/review",
-          cwd: fixture.repository,
-          headRefOid: fixture.base,
-          remote: "origin",
-          repository: "owner/repo",
-        },
-        { expectedHeadRefOid: fixture.base },
-      ),
-    ).rejects.toMatchObject({ code: "review_commit_not_descendant" });
-  });
-
-  it("fails closed when legacy Git grafts could spoof ancestry", async () => {
-    const fixture = await rewrittenHistory("graft");
-    await expect(
-      fixture.resolver.verifyReview(
-        {
-          branch: "fix/review",
-          cwd: fixture.repository,
-          headRefOid: fixture.base,
-          remote: "origin",
-          repository: "owner/repo",
-        },
-        { expectedHeadRefOid: fixture.base },
-      ),
-    ).rejects.toMatchObject({ code: "review_git_grafts_present" });
+    await expect(access(sentinel)).resolves.toBeUndefined();
+    await expect(access(displaced)).resolves.toBeUndefined();
   });
 });
 

@@ -1,4 +1,4 @@
-import type { ReviewCommentSide } from "./types";
+import type { Agent, ReviewCommentSide } from "./types";
 
 export type RunSource = "manual" | "auto" | "review";
 
@@ -71,6 +71,10 @@ export type ClaudeRunRequest = ClaudeRunRequestBase &
       }
   );
 
+export type AgentRunRequest = ClaudeRunRequest & {
+  agent: Agent;
+};
+
 export class ClaudeRunHttpError extends Error {
   readonly code: string | null;
   readonly status: number;
@@ -82,6 +86,8 @@ export class ClaudeRunHttpError extends Error {
     this.code = code;
   }
 }
+
+export { ClaudeRunHttpError as AgentRunHttpError };
 
 export type ClaudeRunEvent =
   | {
@@ -97,6 +103,16 @@ export type ClaudeRunEvent =
   | { type: "error"; message: string }
   | { type: "cancelled"; message?: string }
   | { type: "limit"; message: string };
+
+export type AgentRunEvent =
+  | {
+      agent: Agent;
+      type: "start";
+      runId: string;
+      repository: string;
+      number: number;
+    }
+  | Exclude<ClaudeRunEvent, { type: "start" }>;
 
 const AUTH_STATUSES = new Set([401, 403]);
 const MAX_ERROR_LENGTH = 500;
@@ -167,9 +183,12 @@ const validateReviewRequest = (
   }
 };
 
-const parseEvent = (value: unknown): ClaudeRunEvent => {
+const parseEvent = (
+  value: unknown,
+  label = "Claude",
+): ClaudeRunEvent => {
   if (!isRecord(value) || !isNonEmptyString(value.type)) {
-    throw new Error("Claude returned an invalid stream event.");
+    throw new Error(`${label} returned an invalid stream event.`);
   }
 
   switch (value.type) {
@@ -238,7 +257,30 @@ const parseEvent = (value: unknown): ClaudeRunEvent => {
       break;
   }
 
-  throw new Error("Claude returned an invalid stream event.");
+  throw new Error(`${label} returned an invalid stream event.`);
+};
+
+const parseAgentEvent = (value: unknown, label: string): AgentRunEvent => {
+  if (
+    isRecord(value) &&
+    value.type === "start" &&
+    hasOnlyKeys(value, ["agent", "type", "runId", "repository", "number"]) &&
+    (value.agent === "claude" || value.agent === "codex") &&
+    isNonEmptyString(value.runId) &&
+    isNonEmptyString(value.repository) &&
+    isInteger(value.number) &&
+    value.number > 0
+  ) {
+    return {
+      agent: value.agent,
+      number: value.number,
+      repository: value.repository,
+      runId: value.runId,
+      type: "start",
+    };
+  }
+
+  return parseEvent(value, label) as AgentRunEvent;
 };
 
 const getResponseError = async (
@@ -375,16 +417,13 @@ const readLines = async function* (
   }
 };
 
-export async function* streamClaudeRun(
-  request: ClaudeRunRequest,
-  signal?: AbortSignal,
-): AsyncGenerator<ClaudeRunEvent, void, undefined> {
+const requestBody = (request: ClaudeRunRequest): Record<string, unknown> => {
   const source = request.source ?? "manual";
   if (request.source === "review") {
     validateReviewRequest(request);
   }
 
-  const body = {
+  return {
     expectedHeadRefOid:
       request.source === "review"
         ? request.expectedHeadRefOid.toLowerCase()
@@ -414,6 +453,13 @@ export async function* streamClaudeRun(
         }
       : {}),
   };
+};
+
+export async function* streamClaudeRun(
+  request: ClaudeRunRequest,
+  signal?: AbortSignal,
+): AsyncGenerator<ClaudeRunEvent, void, undefined> {
+  const body = requestBody(request);
   const response = await authorizedFetch(
     "/api/claude/runs",
     {
@@ -480,6 +526,78 @@ export async function* streamClaudeRun(
   }
 }
 
+export async function* streamAgentRun(
+  request: AgentRunRequest,
+  signal?: AbortSignal,
+): AsyncGenerator<AgentRunEvent, void, undefined> {
+  const { agent, ...legacyRequest } = request;
+  const body = { agent, ...requestBody(legacyRequest as ClaudeRunRequest) };
+  const response = await authorizedFetch(
+    "/api/agents/runs",
+    {
+      body: JSON.stringify(body),
+      headers: {
+        Accept: "application/x-ndjson",
+        "Content-Type": "application/json",
+      },
+      method: "POST",
+    },
+    signal,
+  );
+
+  const label = agent === "codex" ? "Codex" : "Claude";
+  if (!response.ok) {
+    throw await getResponseError(response, `${label} could not be started`);
+  }
+  if (!response.body) {
+    throw new Error(`${label} returned an empty response stream.`);
+  }
+
+  let eventIndex = 0;
+  let terminal = false;
+  for await (const line of readLines(response.body)) {
+    let payload: unknown;
+    try {
+      payload = JSON.parse(line);
+    } catch {
+      throw new Error(`${label} returned malformed stream data.`);
+    }
+
+    const event = parseAgentEvent(payload, label);
+    if (eventIndex === 0 && event.type !== "start") {
+      throw new Error(`${label} returned a stream without a start event.`);
+    }
+    if (
+      eventIndex === 0 &&
+      event.type === "start" &&
+      (event.agent !== agent ||
+        event.repository !== request.repository ||
+        event.number !== request.number)
+    ) {
+      throw new Error(
+        `${label} returned a start event for a different agent or pull request.`,
+      );
+    }
+    if (eventIndex > 0 && event.type === "start") {
+      throw new Error(`${label} returned more than one start event.`);
+    }
+    if (terminal) {
+      throw new Error(`${label} returned data after a terminal event.`);
+    }
+
+    eventIndex += 1;
+    terminal = ["complete", "error", "cancelled", "limit"].includes(event.type);
+    yield event;
+  }
+
+  if (eventIndex === 0) {
+    throw new Error(`${label} returned an empty response stream.`);
+  }
+  if (!terminal) {
+    throw new Error(`${label} disconnected before reporting completion.`);
+  }
+}
+
 export const cancelClaudeRun = async (
   runId: string,
   signal?: AbortSignal,
@@ -495,6 +613,24 @@ export const cancelClaudeRun = async (
 
   if (!response.ok) {
     throw await getResponseError(response, "Claude could not be cancelled");
+  }
+};
+
+export const cancelAgentRun = async (
+  runId: string,
+  signal?: AbortSignal,
+): Promise<void> => {
+  const response = await authorizedFetch(
+    `/api/agents/runs/${encodeURIComponent(runId)}`,
+    {
+      headers: { Accept: "application/json" },
+      method: "DELETE",
+    },
+    signal,
+  );
+
+  if (!response.ok) {
+    throw await getResponseError(response, "The agent run could not be cancelled");
   }
 };
 

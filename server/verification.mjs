@@ -14,6 +14,12 @@ import {
   eventsForClaudeLine,
   streamingClaudeArguments,
 } from "./claude.mjs";
+import { agentLabel, validateAgent } from "./agent.mjs";
+import {
+  CodexError,
+  createCodexInvocation,
+  eventsForCodexLine,
+} from "./codex.mjs";
 import {
   createVerificationMemoryCapture,
   escapeVerificationMemory,
@@ -64,6 +70,10 @@ export const VERIFICATION_SYSTEM_PROMPT = [
 
 function canonicalUrl(repository, number) {
   return `https://github.com/${repository}/pull/${number}`;
+}
+
+function verificationLabel(agent) {
+  return agent === "claude" ? "Claude" : agentLabel(agent);
 }
 
 export function validateVerificationInput(value) {
@@ -120,6 +130,7 @@ export function validateVerificationInput(value) {
     throw new ActionError(400, "invalid_tag", "The release tag is invalid.");
   }
   return {
+    agent: validateAgent(value.agent),
     headSha: value.headSha.toLowerCase(),
     pullNumber: value.pullNumber,
     pullUrl: value.pullUrl,
@@ -162,6 +173,7 @@ export function validateReleaseVerificationInput(value) {
     throw new ActionError(400, "invalid_tag", "The release tag is invalid.");
   }
   return {
+    agent: validateAgent(value.agent),
     releaseId: value.releaseId,
     repository: value.repository,
     tag: value.tag,
@@ -300,12 +312,16 @@ function validEvidence(evidence, input) {
 }
 
 function safeError(error) {
-  if (error instanceof ActionError || error instanceof WorkspaceError)
+  if (
+    error instanceof ActionError ||
+    error instanceof CodexError ||
+    error instanceof WorkspaceError
+  )
     return error;
   return new ActionError(
     500,
     "verification_failed",
-    "Claude verification could not be started.",
+    "Agent verification could not be started.",
   );
 }
 
@@ -350,6 +366,7 @@ export function createVerificationRunManager({
   environment = process.env,
   setTimer = setTimeout,
   clearTimer = clearTimeout,
+  prepareCodex = createCodexInvocation,
 } = {}) {
   if (typeof resolveRelease !== "function")
     throw new TypeError("A release resolver is required.");
@@ -382,7 +399,10 @@ export function createVerificationRunManager({
   const runs = new Map();
   let stopping = false;
 
-  function terminate(run, signal = "SIGTERM") {
+  function terminate(
+    run,
+    signal = run.input.agent === "codex" ? "SIGINT" : "SIGTERM",
+  ) {
     if (!run.child || run.closed) return;
     try {
       kill(-run.child.pid, signal);
@@ -430,7 +450,14 @@ export function createVerificationRunManager({
     write(run, event);
     terminate(run);
     if (!run.killTimer) {
-      run.killTimer = setTimer(() => terminate(run, "SIGKILL"), killGrace);
+      run.killTimer = setTimer(() => {
+        run.killTimer = null;
+        terminate(run, run.input.agent === "codex" ? "SIGTERM" : "SIGKILL");
+        if (run.input.agent === "codex" && !run.termTimer) {
+          run.termTimer = setTimer(() => terminate(run, "SIGKILL"), killGrace);
+          run.termTimer.unref?.();
+        }
+      }, killGrace);
       run.killTimer.unref?.();
     }
   }
@@ -442,6 +469,7 @@ export function createVerificationRunManager({
       run.closed = true;
       clearTimer(run.runtimeTimer);
       clearTimer(run.killTimer);
+      clearTimer(run.termTimer);
       runs.delete(run.id);
       run.removeClose?.();
       run.removeDrain?.();
@@ -449,7 +477,10 @@ export function createVerificationRunManager({
       run.child?.stderr?.removeAllListeners();
       run.child?.removeAllListeners();
       run.reservation.release();
-      await removeTemporary(run.temporary).catch(() => undefined);
+      if (run.temporary) {
+        await removeTemporary(run.temporary).catch(() => undefined);
+      }
+      await run.codex?.cleanup?.().catch(() => undefined);
       await run.prepared.cleanup();
       run.resolveDone();
     })();
@@ -477,6 +508,7 @@ export function createVerificationRunManager({
     let evidence;
     let prepared;
     let child;
+    let codex;
     let prompt;
     let temporary;
     try {
@@ -541,7 +573,7 @@ export function createVerificationRunManager({
         throw new ActionError(
           413,
           "prompt_too_large",
-          `Claude verification input exceeds the ${promptLimit}-byte technical limit.`,
+          `Agent verification input exceeds the ${promptLimit}-byte technical limit.`,
         );
       }
       prompt = basePrompt;
@@ -583,15 +615,38 @@ export function createVerificationRunManager({
           "The request was closed before verification started.",
         );
       }
-      temporary = await createTemporary(join(tmpdir(), "puller-verification-"));
-      child = spawn("claude", verificationArguments(prepared.cwd, temporary), {
-        cwd: prepared.cwd,
-        detached: true,
-        env: claudeEnvironment(environment, temporary),
-        shell: false,
-        stdio: ["pipe", "pipe", "pipe"],
-        windowsHide: true,
-      });
+      if (input.agent === "codex") {
+        codex = await prepareCodex({
+          environment,
+          prompt,
+          purpose: "verification",
+          target: prepared.cwd,
+        });
+        child = spawn(codex.command, codex.args, {
+          cwd: codex.cwd,
+          detached: true,
+          env: codex.environment,
+          shell: false,
+          stdio: ["pipe", "pipe", "pipe"],
+          windowsHide: true,
+        });
+      } else {
+        temporary = await createTemporary(
+          join(tmpdir(), "puller-verification-"),
+        );
+        child = spawn(
+          "claude",
+          verificationArguments(prepared.cwd, temporary),
+          {
+            cwd: prepared.cwd,
+            detached: true,
+            env: claudeEnvironment(environment, temporary),
+            shell: false,
+            stdio: ["pipe", "pipe", "pipe"],
+            windowsHide: true,
+          },
+        );
+      }
       if (
         !child.stdin ||
         typeof child.stdin.end !== "function" ||
@@ -607,23 +662,26 @@ export function createVerificationRunManager({
         throw new ActionError(
           500,
           "verification_spawn",
-          "Claude verification could not be started safely.",
+          `${verificationLabel(input.agent)} verification could not be started safely.`,
         );
       }
     } catch (error) {
       if (child?.pid) {
         try {
-          kill(-child.pid, "SIGTERM");
+          kill(-child.pid, input.agent === "codex" ? "SIGINT" : "SIGTERM");
         } catch {
           try {
-            child.kill?.("SIGTERM");
+            child.kill?.(input.agent === "codex" ? "SIGINT" : "SIGTERM");
           } catch {
             // The process may have failed before it became signalable.
           }
         }
       }
       reservation.release();
-      await removeTemporary(temporary).catch(() => undefined);
+      if (temporary) {
+        await removeTemporary(temporary).catch(() => undefined);
+      }
+      await codex?.cleanup?.().catch(() => undefined);
       await prepared?.cleanup?.();
       throw safeError(error);
     }
@@ -635,6 +693,8 @@ export function createVerificationRunManager({
     });
     const run = {
       child,
+      codex,
+      codexCompleted: false,
       channel,
       capture: createVerificationMemoryCapture(),
       cleaning: null,
@@ -655,25 +715,41 @@ export function createVerificationRunManager({
       reservation,
       resolveDone,
       runtimeTimer: null,
+      termTimer: null,
       temporary,
       terminal: false,
     };
     runs.set(id, run);
 
     write(run, { type: "start", runId: id, ...input });
+    if (input.agent === "codex") {
+      write(run, {
+        type: "diagnostic",
+        text: "Codex 0.144.6 grants its sandbox access to standard macOS temporary roots; Puller keeps the protected release snapshot outside those roots.",
+      });
+    }
+    const label = verificationLabel(input.agent);
     const limit = (message) => stop(run, { type: "limit", message });
     const output = createLineDecoder({
       maximum: lineLimit,
-      onLimit: () => limit("Claude Code exceeded the per-line output limit."),
+      onLimit: () => limit(`${label} exceeded the per-line output limit.`),
       onLine: (line) => {
-        run.capture.observe(line);
-        for (const event of eventsForClaudeLine(line, prepared.cwd)) {
+        if (input.agent === "claude") run.capture.observe(line);
+        const events =
+          input.agent === "codex"
+            ? eventsForCodexLine(line, prepared.cwd)
+            : eventsForClaudeLine(line, prepared.cwd);
+        for (const event of events) {
           if (event.type === "error") {
             stop(run, event);
+          } else if (event.type === "protocol") {
+            run.codexCompleted = event.status === "completed";
           } else if (event.type === "text") {
+            if (input.agent === "codex") run.capture.observeText(event.text);
             const text = run.redactor.push(event.text);
             if (text) write(run, { ...event, text });
           } else if (
+            input.agent === "claude" &&
             event.type === "tool" &&
             !READ_ONLY_TOOLS.has(event.name)
           ) {
@@ -691,7 +767,7 @@ export function createVerificationRunManager({
     });
     const diagnostics = createLineDecoder({
       maximum: lineLimit,
-      onLimit: () => limit("Claude Code exceeded the per-line output limit."),
+      onLimit: () => limit(`${label} exceeded the per-line output limit.`),
       onLine: (line) => {
         if (line)
           write(run, {
@@ -704,7 +780,7 @@ export function createVerificationRunManager({
       if (run.terminal) return;
       run.output += chunk.byteLength;
       if (run.output > outputLimit) {
-        limit("Claude Code exceeded the total output limit.");
+        limit(`${label} exceeded the total output limit.`);
       } else {
         decoder.push(chunk);
       }
@@ -717,30 +793,49 @@ export function createVerificationRunManager({
       if (!run.closed) {
         stop(run, {
           type: "error",
-          message: "Claude verification input could not be delivered.",
+          message: `${label} verification input could not be delivered.`,
         });
       }
     });
     child.once("error", () => {
       stop(run, {
         type: "error",
-        message: "Claude verification could not be started.",
+        message: `${label} verification could not be started.`,
       });
       void cleanup(run);
     });
     child.once("close", (code, signal) => {
       void (async () => {
-        const completedNormally = !run.terminal && code === 0 && !signal;
+        let completedNormally =
+          !run.terminal &&
+          code === 0 &&
+          !signal &&
+          (input.agent !== "codex" || run.codexCompleted);
+        let codexCleanupFailed = false;
+        if (completedNormally && input.agent === "codex") {
+          try {
+            await run.codex.cleanup();
+          } catch {
+            completedNormally = false;
+            codexCleanupFailed = true;
+          } finally {
+            run.codex = null;
+          }
+        }
         if (!run.terminal) {
           write(
             run,
-            code === 0
+            completedNormally
               ? { type: "complete", exitCode: 0 }
               : {
                   type: "error",
-                  message: signal
-                    ? "Claude verification was terminated unexpectedly."
-                    : "Claude verification exited with an error.",
+                  message: codexCleanupFailed
+                    ? "Codex verification completed, but its isolated runtime could not be removed safely."
+                    : signal
+                      ? `${label} verification was terminated unexpectedly.`
+                      : input.agent === "codex" && code === 0
+                        ? "Codex verification exited without completing its turn."
+                        : `${label} verification exited with an error.`,
                 },
           );
         }
@@ -771,17 +866,17 @@ export function createVerificationRunManager({
       () =>
         stop(run, {
           type: "limit",
-          message: "Claude verification exceeded the run time limit.",
+          message: `${label} verification exceeded the run time limit.`,
         }),
       runtime,
     );
     run.runtimeTimer.unref?.();
     try {
-      child.stdin.end(prompt);
+      child.stdin.end(input.agent === "codex" ? codex.prompt : prompt);
     } catch {
       stop(run, {
         type: "error",
-        message: "Claude verification input could not be delivered.",
+        message: `${label} verification input could not be delivered.`,
       });
     }
     return { id, done };
@@ -866,6 +961,7 @@ function batchInputs(evidence, input) {
       return null;
     numbers.add(pull.number);
     values.push({
+      agent: input.agent,
       headSha: pull.headSha.toLowerCase(),
       pullNumber: pull.number,
       pullUrl: pull.url,
@@ -944,7 +1040,7 @@ export function createReleaseVerificationManager({
             ? {
                 type: "error",
                 code: "verification_limit",
-                message: "Claude verification exceeded a technical limit.",
+                message: `${verificationLabel(verification.agent)} verification exceeded a technical limit.`,
               }
             : event;
         if (normalized.type === "start") batch.runIds.add(normalized.runId);
@@ -982,7 +1078,7 @@ export function createReleaseVerificationManager({
         message:
           error instanceof ActionError
             ? error.message
-            : "Claude verification could not be started.",
+            : `${verificationLabel(verification.agent)} verification could not be started.`,
         state,
         ...identity,
       });

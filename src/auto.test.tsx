@@ -60,7 +60,11 @@ class LockHarness {
           "abort",
           () => {
             const current = this.waiters.get(name);
-            if (!current || !current.includes(waiter) || this.active.has(name)) {
+            if (
+              !current ||
+              !current.includes(waiter) ||
+              this.active.has(name)
+            ) {
               return;
             }
             this.waiters.set(
@@ -87,12 +91,12 @@ class LockHarness {
       return;
     }
     this.active.add(name);
-    void Promise.resolve(
-      waiter.callback({ mode: "exclusive", name } as Lock),
-    ).then(waiter.resolve, waiter.reject).finally(() => {
-      this.active.delete(name);
-      this.drain(name);
-    });
+    void Promise.resolve(waiter.callback({ mode: "exclusive", name } as Lock))
+      .then(waiter.resolve, waiter.reject)
+      .finally(() => {
+        this.active.delete(name);
+        this.drain(name);
+      });
   }
 }
 
@@ -127,6 +131,7 @@ const input = (
   pulls: readonly PullReadiness[],
   overrides: Partial<AutoInput> = {},
 ): AutoInput => ({
+  agent: "claude",
   authoritative: true,
   pulls,
   runs: runInput(),
@@ -141,6 +146,7 @@ const addIssue = (
   updatedAt = "2026-07-22T01:00:00.000Z",
 ): PullReadiness => ({
   ...pull,
+  blockers: ["1 unresolved comment"],
   issueComments: [
     ...pull.issueComments,
     {
@@ -152,16 +158,19 @@ const addIssue = (
       url: `${pull.url}#issuecomment-${id}`,
     },
   ],
+  ready: false,
 });
 
 const failed = (pull: PullReadiness): PullReadiness => ({
   ...pull,
   ci: {
     ...pull.ci,
-    checks: (pull.ci.checks ?? []).map((check, index) =>
-      index === 0 ? { ...check, state: "failure" as const } : check,
-    ),
+    checks: (pull.ci.checks ?? []).map((check, index) => ({
+      ...check,
+      state: index === 0 ? ("failure" as const) : ("success" as const),
+    })),
     failed: 1,
+    passed: Math.max(0, (pull.ci.checks?.length ?? 1) - 1),
     running: 0,
     state: "failure",
   },
@@ -244,7 +253,9 @@ describe("useAuto", () => {
       ): Promise<RunStartOutcome> => acceptedEquivalent(),
     );
     const view = renderHook(() =>
-      useAuto(input([createPullsResponse().ready[0]!], { runs: runInput(start) })),
+      useAuto(
+        input([createPullsResponse().ready[0]!], { runs: runInput(start) }),
+      ),
     );
 
     expect(view.result.current.available).toBe(false);
@@ -339,7 +350,7 @@ describe("useAuto", () => {
     ).toBe(false);
   });
 
-  it("dispatches edited comments and newly appearing pulls after the baseline", async () => {
+  it("dispatches newly appearing blocked pulls and later edits to known pulls", async () => {
     settings();
     const baseline = createPullsResponse().ready[0]!;
     const start = vi.fn(
@@ -355,21 +366,61 @@ describe("useAuto", () => {
     await waitFor(() => expect(view.result.current.leader).toBe(true));
 
     const appeared = addIssue(
-      { ...baseline, number: 999, rank: 2, url: `${baseline.repositoryUrl}/pull/999` },
+      {
+        ...baseline,
+        number: 999,
+        rank: 2,
+        url: `${baseline.repositoryUrl}/pull/999`,
+      },
       "appeared",
     );
     view.rerender({ ...first, pulls: [baseline, appeared] });
     await waitFor(() => expect(start).toHaveBeenCalledOnce());
     expect(start.mock.calls[0]![0].number).toBe(999);
 
-    const edited = addIssue(
-      baseline,
-      "edited",
-      "2026-07-22T03:00:00.000Z",
-    );
+    const edited = addIssue(baseline, "edited", "2026-07-22T03:00:00.000Z");
     view.rerender({ ...first, pulls: [edited, appeared] });
     await waitFor(() => expect(start).toHaveBeenCalledTimes(2));
     expect(start.mock.calls[1]![0].number).toBe(baseline.number);
+  });
+
+  it("persists a newly appearing blocked pull across remount without duplicate dispatch", async () => {
+    settings("appeared-remount");
+    const baseline = createPullsResponse().ready[0]!;
+    const appeared = addIssue(
+      {
+        ...baseline,
+        number: 998,
+        rank: 2,
+        url: `${baseline.repositoryUrl}/pull/998`,
+      },
+      "appeared-remount",
+    );
+    const start = vi.fn<AutoInput["runs"]["start"]>(async () =>
+      acceptedEquivalent(),
+    );
+    const first = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: input([baseline], { runs: runInput(start) }),
+    });
+    await waitFor(() => expect(first.result.current.leader).toBe(true));
+    first.rerender(
+      input([baseline, appeared], {
+        runs: runInput(start),
+      }),
+    );
+    await waitFor(() => expect(start).toHaveBeenCalledOnce());
+    first.unmount();
+
+    const resumed = renderHook(() =>
+      useAuto(
+        input([baseline, appeared], {
+          runs: runInput(start),
+        }),
+      ),
+    );
+    await waitFor(() => expect(resumed.result.current.leader).toBe(true));
+    await act(async () => Promise.resolve());
+    expect(start).toHaveBeenCalledOnce();
   });
 
   it("never treats any Greptile-authored issue comment as an ordinary comment", async () => {
@@ -387,7 +438,12 @@ describe("useAuto", () => {
       async (): Promise<RunStartOutcome> => acceptedEquivalent(),
     );
     const initial = input(
-      [{ ...baseline, issueComments: [...baseline.issueComments, olderGreptile] }],
+      [
+        {
+          ...baseline,
+          issueComments: [...baseline.issueComments, olderGreptile],
+        },
+      ],
       { runs: runInput(start) },
     );
     const view = renderHook((props: AutoInput) => useAuto(props), {
@@ -489,10 +545,516 @@ describe("useAuto", () => {
     await act(async () => Promise.resolve());
     expect(start).toHaveBeenCalledOnce();
 
-    view.rerender({ ...first, pulls: [pending] });
+    const cleared: PullReadiness = {
+      ...failure,
+      blockers: [],
+      ci: {
+        ...failure.ci,
+        checks: (failure.ci.checks ?? []).map((check) => ({
+          ...check,
+          state: "success" as const,
+        })),
+        failed: 0,
+        passed: failure.ci.total,
+        state: "success",
+      },
+      ready: true,
+    };
+    view.rerender({ ...first, pulls: [cleared] });
     await act(async () => Promise.resolve());
     view.rerender({ ...first, pulls: [failure] });
     await waitFor(() => expect(start).toHaveBeenCalledTimes(2));
+  });
+
+  it("waits for every CI check to settle before dispatching a failed check", async () => {
+    settings("pending-failure");
+    const baseline = createPullsResponse().ready[0]!;
+    const firstCheck = baseline.ci.checks![0]!;
+    const progress: PullReadiness = {
+      ...baseline,
+      blockers: ["CI checks pending"],
+      ci: {
+        checks: [
+          { ...firstCheck, state: "failure" },
+          {
+            ...firstCheck,
+            id: "check-still-running",
+            name: "Integration tests",
+            state: "pending",
+          },
+        ],
+        complete: true,
+        failed: 1,
+        passed: 0,
+        running: 1,
+        state: "pending",
+        total: 2,
+        unknown: 0,
+      },
+      ready: false,
+    };
+    const blocked: PullReadiness = {
+      ...progress,
+      blockers: ["CI checks failed"],
+      ci: {
+        ...progress.ci,
+        checks: progress.ci.checks!.map((check) =>
+          check.id === "check-still-running"
+            ? { ...check, state: "success" as const }
+            : check,
+        ),
+        passed: 1,
+        running: 0,
+        state: "failure",
+      },
+    };
+    const start = vi.fn<AutoInput["runs"]["start"]>(async () =>
+      acceptedEquivalent(),
+    );
+    const initial = input([baseline], { runs: runInput(start) });
+    const view = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+    });
+    await waitFor(() => expect(view.result.current.status).toBe("watching"));
+
+    view.rerender({ ...initial, pulls: [progress] });
+    await act(async () => Promise.resolve());
+    expect(start).not.toHaveBeenCalled();
+
+    view.rerender({ ...initial, pulls: [blocked] });
+    await waitFor(() => expect(start).toHaveBeenCalledOnce());
+    expect(start.mock.calls[0]![1]?.triggers).toEqual([
+      expect.objectContaining({
+        id: firstCheck.id,
+        kind: "failed_check",
+      }),
+    ]);
+  });
+
+  it("admits blockers when an initially in-progress pull settles not ready", async () => {
+    settings("initial-progress");
+    const baseline = createPullsResponse().ready[0]!;
+    const firstCheck = baseline.ci.checks![0]!;
+    const progress: PullReadiness = {
+      ...baseline,
+      blockers: ["CI checks pending"],
+      ci: {
+        checks: [
+          { ...firstCheck, state: "failure" },
+          {
+            ...firstCheck,
+            id: "initial-running-check",
+            name: "Integration tests",
+            state: "pending",
+          },
+        ],
+        complete: true,
+        failed: 1,
+        passed: 0,
+        running: 1,
+        state: "pending",
+        total: 2,
+        unknown: 0,
+      },
+      ready: false,
+    };
+    const blocked: PullReadiness = {
+      ...progress,
+      blockers: ["CI checks failed"],
+      ci: {
+        ...progress.ci,
+        checks: progress.ci.checks!.map((check) =>
+          check.id === "initial-running-check"
+            ? { ...check, state: "success" as const }
+            : check,
+        ),
+        passed: 1,
+        running: 0,
+        state: "failure",
+      },
+    };
+    const start = vi.fn<AutoInput["runs"]["start"]>(async () =>
+      acceptedEquivalent(),
+    );
+    const initial = input([progress], { runs: runInput(start) });
+    const view = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+    });
+    await waitFor(() => expect(view.result.current.status).toBe("watching"));
+    expect(start).not.toHaveBeenCalled();
+
+    view.rerender({ ...initial, pulls: [blocked] });
+
+    await waitFor(() => expect(start).toHaveBeenCalledOnce());
+    expect(start.mock.calls[0]![1]?.triggers).toEqual([
+      expect.objectContaining({
+        id: firstCheck.id,
+        kind: "failed_check",
+      }),
+    ]);
+  });
+
+  it("persists incomplete progress without observing it, then admits the blocker once complete", async () => {
+    settings("incomplete-progress");
+    const baseline = createPullsResponse().ready[0]!;
+    const changed = addIssue(
+      baseline,
+      "incomplete-comment",
+      "2026-07-22T04:00:00.000Z",
+    );
+    const progress: PullReadiness = {
+      ...changed,
+      checks: { commentsComplete: false, threadsComplete: true },
+      ci: {
+        ...changed.ci,
+        checks: changed.ci.checks!.map((check) => ({
+          ...check,
+          state: "pending" as const,
+        })),
+        complete: false,
+        running: 1,
+        state: "pending",
+      },
+    };
+    const start = vi.fn<AutoInput["runs"]["start"]>(async () =>
+      acceptedEquivalent(),
+    );
+    const initial = input([baseline], { runs: runInput(start) });
+    const view = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+    });
+    await waitFor(() => expect(view.result.current.leader).toBe(true));
+
+    view.rerender({ ...initial, pulls: [progress] });
+    await act(async () => Promise.resolve());
+    expect(start).not.toHaveBeenCalled();
+    expect(
+      JSON.parse(
+        window.localStorage.getItem(getAutoEvidenceStorageKey("jake"))!,
+      ).observed[baseline.url],
+    ).toMatchObject({
+      issues: {},
+      phase: "progress",
+    });
+
+    view.rerender({
+      ...initial,
+      pulls: [
+        {
+          ...changed,
+          checks: { commentsComplete: true, threadsComplete: true },
+        },
+      ],
+    });
+    await waitFor(() => expect(start).toHaveBeenCalledOnce());
+    expect(start.mock.calls[0]![1]?.triggers).toEqual([
+      expect.objectContaining({
+        id: "incomplete-comment",
+        kind: "issue_comment",
+      }),
+    ]);
+  });
+
+  it("does not loop an accepted Auto identity after progress, but admits a new identity", async () => {
+    settings("auto-loop");
+    const baseline = createPullsResponse().ready[0]!;
+    const blocked = addIssue(
+      baseline,
+      "first-identity",
+      "2026-07-22T05:00:00.000Z",
+    );
+    const completion = deferred<"completed">();
+    const start = vi
+      .fn<AutoInput["runs"]["start"]>()
+      .mockResolvedValueOnce({
+        completion: completion.promise,
+        kind: "accepted",
+        runId: "accepted-auto",
+        source: "auto",
+        status: "running",
+      })
+      .mockResolvedValue(acceptedEquivalent());
+    const initial = input([baseline], { runs: runInput(start) });
+    const view = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+    });
+    await waitFor(() => expect(view.result.current.leader).toBe(true));
+    view.rerender({ ...initial, pulls: [blocked] });
+    await waitFor(() => expect(start).toHaveBeenCalledOnce());
+
+    const running = new Map([
+      [
+        blocked.url,
+        {
+          ...IDLE_RUN_STATE,
+          source: "auto" as const,
+          status: "running" as const,
+        },
+      ],
+    ]);
+    view.rerender({
+      ...initial,
+      pulls: [blocked],
+      runs: { start, states: running },
+    });
+    await act(async () => completion.resolve("completed"));
+    view.rerender({ ...initial, pulls: [blocked] });
+    await act(async () => Promise.resolve());
+    expect(start).toHaveBeenCalledOnce();
+
+    view.rerender({
+      ...initial,
+      pulls: [addIssue(blocked, "second-identity", "2026-07-22T06:00:00.000Z")],
+    });
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(2));
+    expect(start.mock.calls[1]![1]?.triggers).toEqual([
+      expect.objectContaining({
+        id: "second-identity",
+        kind: "issue_comment",
+      }),
+    ]);
+  });
+
+  it("does not relaunch an active Auto incident after disable and re-enable creates a new epoch", async () => {
+    settings("disable-active-auto");
+    const baseline = createPullsResponse().ready[0]!;
+    const blocked = addIssue(
+      baseline,
+      "owned-auto-identity",
+      "2026-07-22T06:30:00.000Z",
+    );
+    const completion = deferred<"completed">();
+    const start = vi.fn<AutoInput["runs"]["start"]>(async () => ({
+      completion: completion.promise,
+      kind: "accepted",
+      runId: "owned-auto-run",
+      source: "auto",
+      status: "running",
+    }));
+    const initial = input([baseline], { runs: runInput(start) });
+    const view = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+    });
+    await waitFor(() => expect(view.result.current.leader).toBe(true));
+    view.rerender({ ...initial, pulls: [blocked] });
+    await waitFor(() => expect(start).toHaveBeenCalledOnce());
+
+    const activeRuns = new Map([
+      [
+        blocked.url,
+        {
+          ...IDLE_RUN_STATE,
+          source: "auto" as const,
+          status: "running" as const,
+        },
+      ],
+    ]);
+    view.rerender({
+      ...initial,
+      pulls: [blocked],
+      runs: { start, states: activeRuns },
+    });
+    act(() => view.result.current.setEnabled(false));
+    await waitFor(() => expect(view.result.current.enabled).toBe(false));
+    act(() => view.result.current.setEnabled(true));
+    await waitFor(() => expect(view.result.current.leader).toBe(true));
+    expect(start).toHaveBeenCalledOnce();
+
+    await act(async () => completion.resolve("completed"));
+    view.rerender({ ...initial, pulls: [blocked] });
+    await act(async () => Promise.resolve());
+    expect(start).toHaveBeenCalledOnce();
+  });
+
+  it("admits a new identity observed during an active Auto run after an epoch change", async () => {
+    settings("disable-active-auto-new-identity");
+    const baseline = createPullsResponse().ready[0]!;
+    const blocked = addIssue(
+      baseline,
+      "owned-auto-identity",
+      "2026-07-22T06:30:00.000Z",
+    );
+    const changed = addIssue(
+      blocked,
+      "new-during-auto",
+      "2026-07-22T06:45:00.000Z",
+    );
+    const completion = deferred<"completed">();
+    const start = vi
+      .fn<AutoInput["runs"]["start"]>()
+      .mockResolvedValueOnce({
+        completion: completion.promise,
+        kind: "accepted",
+        runId: "owned-auto-run",
+        source: "auto",
+        status: "running",
+      })
+      .mockResolvedValue(acceptedEquivalent());
+    const initial = input([baseline], { runs: runInput(start) });
+    const view = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+    });
+    await waitFor(() => expect(view.result.current.leader).toBe(true));
+    view.rerender({ ...initial, pulls: [blocked] });
+    await waitFor(() => expect(start).toHaveBeenCalledOnce());
+
+    const activeRuns = new Map([
+      [
+        blocked.url,
+        {
+          ...IDLE_RUN_STATE,
+          source: "auto" as const,
+          status: "running" as const,
+        },
+      ],
+    ]);
+    view.rerender({
+      ...initial,
+      pulls: [blocked],
+      runs: { start, states: activeRuns },
+    });
+    act(() => view.result.current.setEnabled(false));
+    await waitFor(() => expect(view.result.current.enabled).toBe(false));
+    act(() => view.result.current.setEnabled(true));
+    await waitFor(() => expect(view.result.current.leader).toBe(true));
+    view.rerender({
+      ...initial,
+      pulls: [changed],
+      runs: { start, states: activeRuns },
+    });
+    await act(async () => Promise.resolve());
+    expect(start).toHaveBeenCalledOnce();
+
+    await act(async () => completion.resolve("completed"));
+    view.rerender({ ...initial, pulls: [changed] });
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(2));
+    expect(start.mock.calls[1]![1]?.triggers).toEqual([
+      expect.objectContaining({
+        id: "new-during-auto",
+        kind: "issue_comment",
+      }),
+    ]);
+  });
+
+  it("preserves incidents queued beyond the active Auto launch across an epoch change", async () => {
+    settings("active-auto-queued-identity");
+    const baseline = createPullsResponse().ready[0]!;
+    const comments = Array.from({ length: 65 }, (_, index) => {
+      const suffix = `${index}`.padStart(2, "0");
+      const updatedAt = new Date(
+        Date.parse("2026-07-22T10:00:00.000Z") + index * 1_000,
+      ).toISOString();
+      return {
+        author: "reviewer",
+        body: `Please fix queued issue ${suffix}.`,
+        createdAt: updatedAt,
+        id: `queued-${suffix}`,
+        updatedAt,
+        url: `${baseline.url}#issuecomment-queued-${suffix}`,
+      };
+    });
+    const blocked: PullReadiness = {
+      ...baseline,
+      blockers: ["65 unresolved comments"],
+      issueComments: [...baseline.issueComments, ...comments],
+      ready: false,
+    };
+    const completion = deferred<"completed">();
+    const start = vi
+      .fn<AutoInput["runs"]["start"]>()
+      .mockResolvedValueOnce({
+        completion: completion.promise,
+        kind: "accepted",
+        runId: "active-auto-batch",
+        source: "auto",
+        status: "running",
+      })
+      .mockResolvedValue(acceptedEquivalent());
+    const initial = input([baseline], { runs: runInput(start) });
+    const view = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+    });
+    await waitFor(() => expect(view.result.current.leader).toBe(true));
+    view.rerender({ ...initial, pulls: [blocked] });
+    await waitFor(() => expect(start).toHaveBeenCalledOnce());
+    const launched = new Set(
+      (start.mock.calls[0]![1]?.triggers ?? []).flatMap((trigger) =>
+        trigger.kind === "issue_comment" ? [trigger.id] : [],
+      ),
+    );
+    expect(launched.size).toBe(64);
+    const queued = comments.find((comment) => !launched.has(comment.id));
+    expect(queued).toBeDefined();
+
+    const activeRuns = new Map([
+      [
+        blocked.url,
+        {
+          ...IDLE_RUN_STATE,
+          source: "auto" as const,
+          status: "running" as const,
+        },
+      ],
+    ]);
+    view.rerender({
+      ...initial,
+      pulls: [blocked],
+      runs: { start, states: activeRuns },
+    });
+    act(() => view.result.current.setEnabled(false));
+    await waitFor(() => expect(view.result.current.enabled).toBe(false));
+    act(() => view.result.current.setEnabled(true));
+    await waitFor(() => expect(view.result.current.leader).toBe(true));
+    expect(start).toHaveBeenCalledOnce();
+    expect(view.result.current.queued).toBe(1);
+
+    await act(async () => completion.resolve("completed"));
+    view.rerender({ ...initial, pulls: [blocked] });
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(2));
+    expect(start.mock.calls[1]![1]?.triggers).toEqual([
+      expect.objectContaining({
+        id: queued!.id,
+        kind: "issue_comment",
+      }),
+    ]);
+    await act(async () => Promise.resolve());
+    expect(start).toHaveBeenCalledTimes(2);
+  });
+
+  it("freezes evidence and dispatch while the global snapshot is untrusted", async () => {
+    settings("trust-freeze");
+    const baseline = createPullsResponse().ready[0]!;
+    const changed = addIssue(
+      baseline,
+      "frozen-comment",
+      "2026-07-22T07:00:00.000Z",
+    );
+    const start = vi.fn<AutoInput["runs"]["start"]>(async () =>
+      acceptedEquivalent(),
+    );
+    const initial = input([baseline], { runs: runInput(start) });
+    const view = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+    });
+    await waitFor(() => expect(view.result.current.leader).toBe(true));
+    const key = getAutoEvidenceStorageKey("jake");
+    const trustedEvidence = window.localStorage.getItem(key);
+
+    view.rerender({
+      ...initial,
+      authoritative: false,
+      pulls: [changed],
+    });
+    await act(async () => Promise.resolve());
+    expect(start).not.toHaveBeenCalled();
+    expect(window.localStorage.getItem(key)).toBe(trustedEvidence);
+
+    view.rerender({ ...initial, authoritative: false, pulls: [] });
+    await act(async () => Promise.resolve());
+    expect(window.localStorage.getItem(key)).toBe(trustedEvidence);
+
+    view.rerender({ ...initial, pulls: [changed] });
+    await waitFor(() => expect(start).toHaveBeenCalledOnce());
   });
 
   it("queues by canonical rank and waits for an accepted run to finish", async () => {
@@ -543,17 +1105,19 @@ describe("useAuto", () => {
     const pulls = distinctPulls(5);
     const completions = pulls.map(() => deferred<"completed">());
     let launchIndex = 0;
-    const start = vi.fn<AutoInput["runs"]["start"]>(async (): Promise<RunStartOutcome> => {
-      const completion = completions[launchIndex]!;
-      launchIndex += 1;
-      return {
-        completion: completion.promise,
-        kind: "accepted",
-        runId: `auto-${launchIndex}`,
-        source: "auto",
-        status: "running",
-      };
-    });
+    const start = vi.fn<AutoInput["runs"]["start"]>(
+      async (): Promise<RunStartOutcome> => {
+        const completion = completions[launchIndex]!;
+        launchIndex += 1;
+        return {
+          completion: completion.promise,
+          kind: "accepted",
+          runId: `auto-${launchIndex}`,
+          source: "auto",
+          status: "running",
+        };
+      },
+    );
     const initial = input(pulls, { runs: runInput(start) });
     const view = renderHook((props: AutoInput) => useAuto(props), {
       initialProps: initial,
@@ -626,17 +1190,19 @@ describe("useAuto", () => {
     const pulls = distinctPulls(5);
     const completions = pulls.map(() => deferred<"completed">());
     let launchIndex = 0;
-    const start = vi.fn<AutoInput["runs"]["start"]>(async (): Promise<RunStartOutcome> => {
-      const index = launchIndex;
-      launchIndex += 1;
-      return {
-        completion: completions[index]!.promise,
-        kind: "accepted",
-        runId: `auto-${index}`,
-        source: "auto",
-        status: "running",
-      };
-    });
+    const start = vi.fn<AutoInput["runs"]["start"]>(
+      async (): Promise<RunStartOutcome> => {
+        const index = launchIndex;
+        launchIndex += 1;
+        return {
+          completion: completions[index]!.promise,
+          kind: "accepted",
+          runId: `auto-${index}`,
+          source: "auto",
+          status: "running",
+        };
+      },
+    );
     const initial = input(pulls, { runs: runInput(start) });
     const view = renderHook((props: AutoInput) => useAuto(props), {
       initialProps: initial,
@@ -650,14 +1216,12 @@ describe("useAuto", () => {
 
     act(() => view.result.current.setParallelism(4));
     await waitFor(() => expect(start).toHaveBeenCalledTimes(4));
-    expect(start.mock.calls.slice(0, 2).map(([, options]) => options?.parallelism)).toEqual([
-      2,
-      2,
-    ]);
-    expect(start.mock.calls.slice(2).map(([, options]) => options?.parallelism)).toEqual([
-      4,
-      4,
-    ]);
+    expect(
+      start.mock.calls.slice(0, 2).map(([, options]) => options?.parallelism),
+    ).toEqual([2, 2]);
+    expect(
+      start.mock.calls.slice(2).map(([, options]) => options?.parallelism),
+    ).toEqual([4, 4]);
 
     act(() => view.result.current.setParallelism(1));
     expect(view.result.current.parallelism).toBe(1);
@@ -702,7 +1266,7 @@ describe("useAuto", () => {
     ]);
   });
 
-  it("suppresses a pull while a manual, repair, or New Task run is active", async () => {
+  it("defers observation while a manual run or linked New Task is active", async () => {
     settings();
     const baseline = createPullsResponse().ready[0]!;
     const start = vi.fn(
@@ -711,7 +1275,9 @@ describe("useAuto", () => {
         _options?: StartRunOptions,
       ): Promise<RunStartOutcome> => acceptedEquivalent(),
     );
-    const states = new Map([[baseline.url, { ...IDLE_RUN_STATE, status: "running" as const }]]);
+    const states = new Map([
+      [baseline.url, { ...IDLE_RUN_STATE, status: "running" as const }],
+    ]);
     const first = input([baseline], { runs: { start, states } });
     const view = renderHook((props: AutoInput) => useAuto(props), {
       initialProps: first,
@@ -719,7 +1285,7 @@ describe("useAuto", () => {
     await waitFor(() => expect(view.result.current.leader).toBe(true));
     const changed = addIssue(baseline);
     view.rerender({ ...first, pulls: [changed] });
-    await waitFor(() => expect(view.result.current.paused).toBe(true));
+    await waitFor(() => expect(view.result.current.status).toBe("watching"));
     expect(start).not.toHaveBeenCalled();
 
     const task: TaskState = {
@@ -798,6 +1364,272 @@ describe("useAuto", () => {
     expect(resumedStart).toHaveBeenCalledOnce();
   });
 
+  it("resumes a persisted progress phase and dispatches once only after it settles blocked", async () => {
+    settings("persisted-progress");
+    const baseline = createPullsResponse().ready[0]!;
+    const firstCheck = baseline.ci.checks![0]!;
+    const progress: PullReadiness = {
+      ...baseline,
+      blockers: ["CI checks pending"],
+      ci: {
+        checks: [
+          { ...firstCheck, state: "failure" },
+          {
+            ...firstCheck,
+            id: "persisted-running-check",
+            state: "pending",
+          },
+        ],
+        complete: true,
+        failed: 1,
+        passed: 0,
+        running: 1,
+        state: "pending",
+        total: 2,
+        unknown: 0,
+      },
+      ready: false,
+    };
+    const blocked: PullReadiness = {
+      ...progress,
+      blockers: ["CI checks failed"],
+      ci: {
+        ...progress.ci,
+        checks: progress.ci.checks!.map((check) =>
+          check.id === "persisted-running-check"
+            ? { ...check, state: "success" as const }
+            : check,
+        ),
+        passed: 1,
+        running: 0,
+        state: "failure",
+      },
+    };
+    const start = vi.fn<AutoInput["runs"]["start"]>(async () =>
+      acceptedEquivalent(),
+    );
+    const first = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: input([baseline], { runs: runInput(start) }),
+    });
+    await waitFor(() => expect(first.result.current.leader).toBe(true));
+    first.rerender(input([progress], { runs: runInput(start) }));
+    await act(async () => Promise.resolve());
+    expect(start).not.toHaveBeenCalled();
+    first.unmount();
+
+    const resumed = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: input([progress], { runs: runInput(start) }),
+    });
+    await waitFor(() => expect(resumed.result.current.leader).toBe(true));
+    expect(start).not.toHaveBeenCalled();
+    resumed.rerender(input([blocked], { runs: runInput(start) }));
+    await waitFor(() => expect(start).toHaveBeenCalledOnce());
+  });
+
+  it.each([
+    ["manual", { kind: "fix" as const, source: "manual" as const }],
+    ["review", { kind: "fix" as const, source: "review" as const }],
+    ["repair", { kind: "repair" as const, source: "manual" as const }],
+  ])("defers new incidents during an active %s run", async (_name, run) => {
+    settings(`active-${_name}`);
+    const baseline = createPullsResponse().ready[0]!;
+    const changed = addIssue(
+      baseline,
+      `${_name}-comment`,
+      "2026-07-22T09:00:00.000Z",
+    );
+    const start = vi.fn<AutoInput["runs"]["start"]>(async () =>
+      acceptedEquivalent(),
+    );
+    const initial = input([baseline], { runs: runInput(start) });
+    const view = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+    });
+    await waitFor(() => expect(view.result.current.leader).toBe(true));
+
+    view.rerender({
+      ...initial,
+      pulls: [changed],
+      runs: {
+        start,
+        states: new Map([
+          [
+            changed.url,
+            {
+              ...IDLE_RUN_STATE,
+              ...run,
+              status: "running" as const,
+            },
+          ],
+        ]),
+      },
+    });
+    await act(async () => Promise.resolve());
+    expect(start).not.toHaveBeenCalled();
+
+    view.rerender({ ...initial, pulls: [changed] });
+    await waitFor(() => expect(start).toHaveBeenCalledOnce());
+  });
+
+  it("keeps a queued incident on its captured agent across retries, migration, reload, and selector changes", async () => {
+    vi.useFakeTimers();
+    settings("agent-snapshot");
+    const baseline = createPullsResponse().ready[0]!;
+    const firstIncident = addIssue(
+      baseline,
+      "claude-comment",
+      "2026-07-22T02:00:00.000Z",
+    );
+    const firstStart = vi.fn<AutoInput["runs"]["start"]>(async () => ({
+      code: "workspace_running",
+      kind: "retryable",
+      message: "Busy",
+      source: "auto",
+    }));
+    const initial = input([baseline], {
+      agent: "claude",
+      runs: runInput(firstStart),
+    });
+    const first = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+    });
+    await act(async () => Promise.resolve());
+    first.rerender({ ...initial, pulls: [firstIncident] });
+    await act(async () => Promise.resolve());
+    expect(firstStart).toHaveBeenCalledOnce();
+    expect(firstStart.mock.calls[0]?.[1]).toMatchObject({ agent: "claude" });
+
+    first.rerender({ ...initial, agent: "codex", pulls: [firstIncident] });
+    await act(async () => Promise.resolve());
+    expect(firstStart).toHaveBeenCalledOnce();
+
+    const evidenceKey = getAutoEvidenceStorageKey("jake");
+    const legacy = JSON.parse(window.localStorage.getItem(evidenceKey)!);
+    expect(legacy).toMatchObject({
+      pending: {
+        [baseline.url]: [expect.objectContaining({ agent: "claude" })],
+      },
+      retry: {
+        [baseline.url]: expect.objectContaining({ agent: "claude" }),
+      },
+      version: 3,
+    });
+    legacy.version = 1;
+    for (const observed of Object.values(legacy.observed) as Array<
+      Record<string, unknown>
+    >) {
+      delete observed.phase;
+    }
+    for (const incidents of Object.values(legacy.pending) as Array<
+      Array<Record<string, unknown>>
+    >) {
+      for (const incident of incidents) delete incident.agent;
+    }
+    for (const retry of Object.values(legacy.retry) as Array<
+      Record<string, unknown>
+    >) {
+      delete retry.agent;
+    }
+    window.localStorage.setItem(evidenceKey, JSON.stringify(legacy));
+    first.unmount();
+
+    const resumedStart = vi
+      .fn<AutoInput["runs"]["start"]>()
+      .mockResolvedValue(acceptedEquivalent());
+    const resumedInput = input([firstIncident], {
+      agent: "codex",
+      runs: runInput(resumedStart),
+    });
+    const resumed = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: resumedInput,
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    expect(resumedStart).toHaveBeenCalledOnce();
+    expect(resumedStart.mock.calls[0]?.[1]).toMatchObject({ agent: "claude" });
+    expect(JSON.parse(window.localStorage.getItem(evidenceKey)!)).toMatchObject(
+      {
+        version: 3,
+      },
+    );
+
+    const secondIncident = addIssue(
+      firstIncident,
+      "codex-comment",
+      "2026-07-22T03:00:00.000Z",
+    );
+    resumed.rerender({ ...resumedInput, pulls: [secondIncident] });
+    await act(async () => Promise.resolve());
+    expect(resumedStart).toHaveBeenCalledTimes(2);
+    expect(resumedStart.mock.calls[1]?.[1]).toMatchObject({ agent: "codex" });
+  });
+
+  it("migrates v2 evidence without inventing a transition or changing queued agents", async () => {
+    settings("v2-evidence");
+    const baseline = createPullsResponse().ready[0]!;
+    const updatedAt = "2026-07-22T08:00:00.000Z";
+    const blocked = addIssue(baseline, "v2-comment", updatedAt);
+    const first = renderHook(() => useAuto(input([baseline])));
+    await waitFor(() => expect(first.result.current.leader).toBe(true));
+    first.unmount();
+
+    const key = getAutoEvidenceStorageKey("jake");
+    const evidence = JSON.parse(window.localStorage.getItem(key)!);
+    const incidentIdentity = JSON.stringify(["issue", "v2-comment", updatedAt]);
+    evidence.version = 2;
+    for (const observed of Object.values(evidence.observed) as Array<
+      Record<string, unknown>
+    >) {
+      delete observed.phase;
+    }
+    evidence.pending[baseline.url] = [
+      {
+        agent: "codex",
+        identity: incidentIdentity,
+        trigger: {
+          id: "v2-comment",
+          kind: "issue_comment",
+          updatedAt,
+        },
+      },
+    ];
+    evidence.retry[baseline.url] = {
+      agent: "codex",
+      attempt: 1,
+      identities: [incidentIdentity],
+      notBefore: 0,
+    };
+    window.localStorage.setItem(key, JSON.stringify(evidence));
+
+    const start = vi.fn<AutoInput["runs"]["start"]>(async () =>
+      acceptedEquivalent(),
+    );
+    const resumed = renderHook(() =>
+      useAuto(
+        input([blocked], {
+          agent: "claude",
+          runs: runInput(start),
+        }),
+      ),
+    );
+    await waitFor(() => expect(start).toHaveBeenCalledOnce());
+    expect(start.mock.calls[0]![1]).toMatchObject({
+      agent: "codex",
+      triggers: [
+        expect.objectContaining({
+          id: "v2-comment",
+          kind: "issue_comment",
+        }),
+      ],
+    });
+    expect(JSON.parse(window.localStorage.getItem(key)!)).toMatchObject({
+      observed: {
+        [baseline.url]: expect.objectContaining({ phase: "blocked" }),
+      },
+      version: 3,
+    });
+    resumed.unmount();
+  });
+
   it("migrates v1 settings and keeps parallelism in sync across reloads and storage events", async () => {
     window.localStorage.setItem(
       AUTO_SETTINGS_STORAGE_KEY,
@@ -808,7 +1640,9 @@ describe("useAuto", () => {
 
     await waitFor(() => expect(first.result.current.leader).toBe(true));
     expect(first.result.current.parallelism).toBe(1);
-    expect(JSON.parse(window.localStorage.getItem(AUTO_SETTINGS_STORAGE_KEY)!)).toEqual({
+    expect(
+      JSON.parse(window.localStorage.getItem(AUTO_SETTINGS_STORAGE_KEY)!),
+    ).toEqual({
       enabled: true,
       epoch: "legacy-epoch",
       parallelism: 1,
@@ -932,7 +1766,9 @@ describe("useAuto", () => {
       initialProps: input([pull]),
     });
     await waitFor(() => expect(view.result.current.leader).toBe(true));
-    expect(window.localStorage.getItem(getAutoEvidenceStorageKey("jake"))).not.toBeNull();
+    expect(
+      window.localStorage.getItem(getAutoEvidenceStorageKey("jake")),
+    ).not.toBeNull();
 
     view.rerender(input([], { authoritative: false }));
     await act(async () => Promise.resolve());
@@ -1038,24 +1874,38 @@ describe("useAuto", () => {
   );
 
   it.each([
-    ["rebaseline", { code: "head_changed", kind: "rebaseline", message: "Moved", source: "auto" }],
-    ["failed", { code: "invalid", kind: "failed", message: "Rejected", source: "auto" }],
-  ] as const)("settles a %s start outcome without looping", async (_name, outcome) => {
-    settings();
-    const baseline = createPullsResponse().ready[0]!;
-    const start = vi.fn(async (): Promise<RunStartOutcome> => outcome);
-    const initial = input([baseline], { runs: runInput(start) });
-    const view = renderHook((props: AutoInput) => useAuto(props), {
-      initialProps: initial,
-    });
-    await waitFor(() => expect(view.result.current.leader).toBe(true));
-    const changed = addIssue(baseline);
-    view.rerender({ ...initial, pulls: [changed] });
-    await waitFor(() => expect(start).toHaveBeenCalledOnce());
-    view.rerender({ ...initial, pulls: [{ ...changed }] });
-    await act(async () => Promise.resolve());
-    expect(start).toHaveBeenCalledOnce();
-  });
+    [
+      "rebaseline",
+      {
+        code: "head_changed",
+        kind: "rebaseline",
+        message: "Moved",
+        source: "auto",
+      },
+    ],
+    [
+      "failed",
+      { code: "invalid", kind: "failed", message: "Rejected", source: "auto" },
+    ],
+  ] as const)(
+    "settles a %s start outcome without looping",
+    async (_name, outcome) => {
+      settings();
+      const baseline = createPullsResponse().ready[0]!;
+      const start = vi.fn(async (): Promise<RunStartOutcome> => outcome);
+      const initial = input([baseline], { runs: runInput(start) });
+      const view = renderHook((props: AutoInput) => useAuto(props), {
+        initialProps: initial,
+      });
+      await waitFor(() => expect(view.result.current.leader).toBe(true));
+      const changed = addIssue(baseline);
+      view.rerender({ ...initial, pulls: [changed] });
+      await waitFor(() => expect(start).toHaveBeenCalledOnce());
+      view.rerender({ ...initial, pulls: [{ ...changed }] });
+      await act(async () => Promise.resolve());
+      expect(start).toHaveBeenCalledOnce();
+    },
+  );
 
   it("is StrictMode-safe and dispatches one request for one incident", async () => {
     settings();

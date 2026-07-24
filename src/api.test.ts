@@ -1,15 +1,22 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  createRelease,
   getCheckLog,
+  getPullCommitDiff,
+  getPullCommits,
   getPullDiff,
   getPullRequestCacheStatsForTests,
   getPulls,
   getReleaseOptions,
+  getReleasePipelines,
   isCheckLog,
+  isPullCommitDiff,
+  isPullCommits,
   isPullDiff,
   isPullsResponse,
   isReleaseOptions,
+  isReleasePipelinesResponse,
   mergePull,
   parseGitHubActionsJobUrl,
   PullDiffHttpError,
@@ -24,13 +31,19 @@ import {
 } from "./test/fixtures";
 import type {
   CheckLog,
+  CreateReleaseRequest,
+  CreateReleaseResponse,
+  PullCommitDiff,
+  PullCommits,
   PullDiff,
   PullsResponse,
   ReleaseOptions,
+  ReleasePipelinesResponse,
 } from "./types";
 
 const BASE_SHA = "dddddddddddddddddddddddddddddddddddddddd";
 const VIEWER_LOGIN = "jake";
+const COMMIT_SHA = "cccccccccccccccccccccccccccccccccccccccc";
 
 const createCheckLog = (overrides: Partial<CheckLog> = {}): CheckLog => ({
   cached: false,
@@ -41,6 +54,37 @@ const createCheckLog = (overrides: Partial<CheckLog> = {}): CheckLog => ({
   number: 102,
   repository: "appwrite/cloud",
   runId: "123456789",
+  ...overrides,
+});
+
+const createPullCommits = (
+  overrides: Partial<PullCommits> = {},
+): PullCommits => ({
+  baseRefOid: BASE_SHA,
+  commits: [
+    {
+      authorLogin: "jake",
+      authorName: "Jake",
+      authoredAt: "2026-07-24T00:00:00.000Z",
+      message: "Commit message",
+      sha: COMMIT_SHA,
+      url: `https://github.com/appwrite/cloud/commit/${COMMIT_SHA}`,
+    },
+  ],
+  complete: true,
+  count: 1,
+  headRefOid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  number: 102,
+  repository: "appwrite/cloud",
+  warning: null,
+  ...overrides,
+});
+
+const createPullCommitDiff = (
+  overrides: Partial<PullCommitDiff> = {},
+): PullCommitDiff => ({
+  ...createDegradedPullDiff(),
+  commitSha: COMMIT_SHA,
   ...overrides,
 });
 
@@ -111,6 +155,45 @@ const createReleaseOptions = (): ReleaseOptions => ({
   warnings: [],
 });
 
+const createReleasePipelines = (): ReleasePipelinesResponse => ({
+  generatedAt: "2026-07-21T08:02:00.000Z",
+  releases: [
+    {
+      id: "456",
+      pipeline: {
+        checkedAt: "2026-07-21T08:01:00.000Z",
+        lookup: "complete",
+        runs: [
+          {
+            attempt: 2,
+            createdAt: "2026-07-21T07:50:00.000Z",
+            id: "123456789",
+            name: "Production Deployment",
+            path: ".github/workflows/production.yml",
+            startedAt: "2026-07-21T07:51:00.000Z",
+            state: "succeeded",
+            updatedAt: "2026-07-21T08:00:00.000Z",
+            url: "https://github.com/appwrite/cloud/actions/runs/123456789",
+            workflowId: "987654321",
+          },
+        ],
+      },
+      publishedAt: "2026-07-21T07:45:00.000Z",
+      repository: "appwrite/cloud",
+      tag: "v1.2.4",
+    },
+  ],
+});
+
+const createReleaseResponse = (): CreateReleaseResponse => ({
+  id: "123",
+  name: "v1.2.4",
+  publishedAt: "2026-07-21T08:04:00.000Z",
+  repository: "appwrite/cloud",
+  tag: "v1.2.4",
+  url: "https://github.com/appwrite/cloud/releases/tag/v1.2.4",
+});
+
 afterEach(() => {
   resetApiActionTokenForTests();
   resetCheckLogCacheForTests();
@@ -120,6 +203,7 @@ afterEach(() => {
 describe("streamReleaseVerification", () => {
   it("uses one server-owned batch request and validates its terminal totals", async () => {
     const request = {
+      agent: "claude" as const,
       releaseId: "123",
       repository: "appwrite/cloud",
       tag: "v1.2.3",
@@ -190,6 +274,7 @@ describe("streamReleaseVerification", () => {
 
   it("rejects duplicate per-pull terminals even when the final totals look valid", async () => {
     const request = {
+      agent: "claude" as const,
       releaseId: "123",
       repository: "appwrite/cloud",
       tag: "v1.2.3",
@@ -251,6 +336,74 @@ describe("streamReleaseVerification", () => {
       })(),
     ).rejects.toThrow("invalid release verification state transition");
   });
+
+  it("rejects a nested start event from a different agent than the batch", async () => {
+    const request = {
+      agent: "claude" as const,
+      releaseId: "123",
+      repository: "appwrite/cloud",
+      tag: "v1.2.3",
+    };
+    const identity = {
+      batchId: "batch-1",
+      headSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      pullNumber: 41,
+      pullUrl: "https://github.com/appwrite/cloud/pull/41",
+    };
+    const pull = {
+      agent: request.agent,
+      headSha: identity.headSha,
+      pullNumber: identity.pullNumber,
+      pullUrl: identity.pullUrl,
+      releaseId: request.releaseId,
+      repository: request.repository,
+      tag: request.tag,
+    };
+    const events = [
+      { batchId: "batch-1", pulls: [pull], type: "batch-start", ...request },
+      { ...identity, state: "queued", type: "verification" },
+      {
+        ...identity,
+        event: {
+          agent: "codex",
+          headSha: identity.headSha,
+          pullNumber: identity.pullNumber,
+          pullUrl: identity.pullUrl,
+          releaseId: request.releaseId,
+          repository: request.repository,
+          runId: "run-1",
+          tag: request.tag,
+          type: "start",
+        },
+        state: "running",
+        type: "verification",
+      },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ token: "action-token" }), {
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+            { status: 200 },
+          ),
+        ),
+    );
+
+    await expect(
+      (async () => {
+        for await (const _event of streamReleaseVerification(request)) {
+          // Consume the validated stream.
+        }
+      })(),
+    ).rejects.toThrow("different agent");
+  });
 });
 
 describe("mergePull", () => {
@@ -292,6 +445,7 @@ describe("mergePull", () => {
 
     await expect(
       mergePull({
+        agent: "claude",
         expectedHeadRefOid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         number: 7,
         repository: "appwrite/cloud",
@@ -329,9 +483,105 @@ describe("mergePull", () => {
 
     await expect(
       mergePull({
+        agent: "claude",
         expectedHeadRefOid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         number: 7,
         repository: "appwrite/cloud",
+      }),
+    ).rejects.toThrow("unexpected response");
+  });
+});
+
+describe("createRelease", () => {
+  it.each([true, false])(
+    "forwards prerelease=%s in the exact request body",
+    async (prerelease) => {
+      const request: CreateReleaseRequest = {
+        expectedLatestTag: "v1.2.3",
+        prerelease,
+        repository: "appwrite/cloud",
+        tag: "v1.2.4",
+      };
+      const result = createReleaseResponse();
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ token: "action-token" }), {
+            headers: { "Content-Type": "application/json" },
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify(result), {
+            headers: { "Content-Type": "application/json" },
+            status: 200,
+          }),
+        );
+      vi.stubGlobal("fetch", fetchMock);
+
+      await expect(createRelease(request)).resolves.toEqual(result);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock).toHaveBeenNthCalledWith(
+        2,
+        "/api/releases",
+        expect.objectContaining({
+          body: JSON.stringify(request),
+          method: "POST",
+        }),
+      );
+    },
+  );
+
+  it.each([
+    ["missing", undefined],
+    ["a string", "false"],
+    ["null", null],
+  ])(
+    "rejects %s prerelease before making a request",
+    async (_label, prerelease) => {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      const request = {
+        expectedLatestTag: "v1.2.3",
+        prerelease,
+        repository: "appwrite/cloud",
+        tag: "v1.2.4",
+      } as unknown as CreateReleaseRequest;
+
+      await expect(createRelease(request)).rejects.toThrow(
+        "The release request is invalid.",
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps prerelease out of the response contract", async () => {
+    const result = {
+      ...createReleaseResponse(),
+      prerelease: true,
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ token: "action-token" }), {
+          headers: { "Content-Type": "application/json" },
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(result), {
+          headers: { "Content-Type": "application/json" },
+          status: 200,
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      createRelease({
+        expectedLatestTag: "v1.2.3",
+        prerelease: true,
+        repository: "appwrite/cloud",
+        tag: "v1.2.4",
       }),
     ).rejects.toThrow("unexpected response");
   });
@@ -625,6 +875,22 @@ describe("isPullsResponse", () => {
 });
 
 describe("getPulls", () => {
+  it("uses the cached endpoint by default", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(createPullsResponse()), {
+        headers: { "Content-Type": "application/json" },
+        status: 200,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getPulls()).resolves.toEqual(createPullsResponse());
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/pulls",
+      expect.objectContaining({ cache: "no-store" }),
+    );
+  });
+
   it("uses the cache-bypass endpoint for a manual refresh", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify(createPullsResponse()), {
@@ -949,6 +1215,120 @@ describe("pull diff validation", () => {
     mutate(diff);
 
     expect(isPullDiff(diff)).toBe(false);
+  });
+});
+
+describe("pull commit validation and requests", () => {
+  const identity = (commits: PullCommits) => ({
+    baseRefOid: commits.baseRefOid,
+    headRefOid: commits.headRefOid,
+    number: commits.number,
+    repository: commits.repository,
+    viewerLogin: VIEWER_LOGIN,
+  });
+
+  it("validates exact canonical commit lists and commit diffs", () => {
+    const commits = createPullCommits();
+    const diff = createPullCommitDiff({
+      baseRefOid: commits.baseRefOid,
+      headRefOid: commits.headRefOid,
+      number: commits.number,
+      repository: commits.repository,
+    });
+
+    expect(isPullCommits(commits)).toBe(true);
+    expect(isPullCommitDiff(diff)).toBe(true);
+
+    const duplicate = createPullCommits({
+      commits: [commits.commits[0]!, commits.commits[0]!],
+      complete: false,
+      count: 2,
+      warning: "GitHub returned duplicate commits.",
+    });
+    expect(isPullCommits(duplicate)).toBe(false);
+    expect(
+      isPullCommits(
+        createPullCommits({
+          commits: [
+            {
+              ...commits.commits[0]!,
+              url: `https://github.com/other/repo/commit/${COMMIT_SHA}`,
+            },
+          ],
+        }),
+      ),
+    ).toBe(false);
+    expect(isPullCommitDiff({ ...diff, commitSha: "invalid" })).toBe(false);
+  });
+
+  it("coalesces and caches lazy list and exact commit diff requests", async () => {
+    const commits = createPullCommits();
+    const diff = createPullCommitDiff({
+      baseRefOid: commits.baseRefOid,
+      headRefOid: commits.headRefOid,
+      number: commits.number,
+      repository: commits.repository,
+    });
+    const fetchMock = vi.fn((input: RequestInfo | URL) =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify(
+            String(input).includes(`/commits/${COMMIT_SHA}?`) ? diff : commits,
+          ),
+          { status: 200 },
+        ),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const pull = identity(commits);
+
+    await expect(
+      Promise.all([getPullCommits(pull), getPullCommits(pull)]),
+    ).resolves.toEqual([commits, commits]);
+    await expect(
+      Promise.all([
+        getPullCommitDiff(pull, COMMIT_SHA),
+        getPullCommitDiff(pull, COMMIT_SHA.toUpperCase()),
+      ]),
+    ).resolves.toEqual([diff, diff]);
+    await getPullCommits(pull);
+    await getPullCommitDiff(pull, COMMIT_SHA);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/pulls/appwrite/cloud/102/commits?base=${BASE_SHA}&head=${commits.headRefOid}`,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/pulls/appwrite/cloud/102/commits/${COMMIT_SHA}?base=${BASE_SHA}&head=${commits.headRefOid}`,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+  });
+
+  it("preserves structured commit failures without caching them", async () => {
+    const commits = createPullCommits();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            code: "pull_commits_incomplete",
+            error: "GitHub could not revalidate commits.",
+          }),
+          { status: 503 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(commits), { status: 200 }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getPullCommits(identity(commits))).rejects.toMatchObject({
+      code: "pull_commits_incomplete",
+      status: 503,
+    });
+    await expect(getPullCommits(identity(commits))).resolves.toEqual(commits);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -1732,6 +2112,177 @@ describe("GitHub Actions check logs", () => {
       }),
     ).rejects.toThrow("identity is invalid");
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("getReleasePipelines", () => {
+  it("uses cached and forced endpoints while forwarding its abort signal", async () => {
+    const pipelines = createReleasePipelines();
+    const fetchMock = vi.fn().mockImplementation(
+      async () =>
+        new Response(JSON.stringify(pipelines), {
+          headers: { "Content-Type": "application/json" },
+          status: 200,
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const controller = new AbortController();
+
+    await expect(
+      getReleasePipelines(controller.signal, false),
+    ).resolves.toEqual(pipelines);
+    await expect(getReleasePipelines(controller.signal)).resolves.toEqual(
+      pipelines,
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/releases/pipelines",
+      expect.objectContaining({
+        cache: "no-store",
+        signal: controller.signal,
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/releases/pipelines?refresh=1",
+      expect.objectContaining({
+        cache: "no-store",
+        signal: controller.signal,
+      }),
+    );
+  });
+
+  it("rejects unexpected keys at every pipeline level", () => {
+    const response = createReleasePipelines() as unknown as Record<
+      string,
+      unknown
+    >;
+    response.extra = true;
+    expect(isReleasePipelinesResponse(response)).toBe(false);
+
+    const release = createReleasePipelines();
+    (
+      release.releases[0] as unknown as Record<string, unknown>
+    ).repositoryUrl = "https://github.com/appwrite/cloud";
+    expect(isReleasePipelinesResponse(release)).toBe(false);
+
+    const pipeline = createReleasePipelines();
+    (
+      pipeline.releases[0]!.pipeline as unknown as Record<string, unknown>
+    ).warning = null;
+    expect(isReleasePipelinesResponse(pipeline)).toBe(false);
+
+    const run = createReleasePipelines();
+    (
+      run.releases[0]!.pipeline.runs[0] as unknown as Record<string, unknown>
+    ).conclusion = "success";
+    expect(isReleasePipelinesResponse(run)).toBe(false);
+  });
+
+  it("rejects malformed run values and non-canonical Actions URLs", () => {
+    const cases: Array<(response: ReleasePipelinesResponse) => void> = [
+      (response) => {
+        response.releases[0]!.pipeline.runs[0]!.attempt = 0;
+      },
+      (response) => {
+        response.releases[0]!.pipeline.runs[0]!.state =
+          "success" as "succeeded";
+      },
+      (response) => {
+        response.releases[0]!.pipeline.runs[0]!.createdAt = "not-a-date";
+      },
+      (response) => {
+        response.releases[0]!.pipeline.runs[0]!.startedAt = "not-a-date";
+      },
+      (response) => {
+        response.releases[0]!.pipeline.runs[0]!.url =
+          "https://github.com/appwrite/cloud/actions/runs/123456789?attempt=2";
+      },
+      (response) => {
+        response.releases[0]!.pipeline.runs[0]!.workflowId = "0";
+      },
+    ];
+
+    for (const mutate of cases) {
+      const response = createReleasePipelines();
+      mutate(response);
+      expect(isReleasePipelinesResponse(response)).toBe(false);
+    }
+  });
+
+  it("rejects duplicate release identities, run IDs, and workflow IDs", () => {
+    const duplicateRelease = createReleasePipelines();
+    duplicateRelease.releases.push({
+      ...duplicateRelease.releases[0]!,
+      pipeline: {
+        ...duplicateRelease.releases[0]!.pipeline,
+        runs: [...duplicateRelease.releases[0]!.pipeline.runs],
+      },
+    });
+    expect(isReleasePipelinesResponse(duplicateRelease)).toBe(false);
+
+    for (const field of ["id", "workflowId"] as const) {
+      const duplicateRun = createReleasePipelines();
+      const first = duplicateRun.releases[0]!.pipeline.runs[0]!;
+      duplicateRun.releases[0]!.pipeline.runs.push({
+        ...first,
+        id: field === "id" ? first.id : "123456790",
+        workflowId:
+          field === "workflowId" ? first.workflowId : "987654322",
+        url:
+          field === "id"
+            ? first.url
+            : "https://github.com/appwrite/cloud/actions/runs/123456790",
+      });
+      expect(isReleasePipelinesResponse(duplicateRun)).toBe(false);
+    }
+  });
+
+  it("treats case-variant repositories as distinct release identities", () => {
+    const response = createReleasePipelines();
+    const original = response.releases[0]!;
+    response.releases.push({
+      ...original,
+      pipeline: {
+        ...original.pipeline,
+        runs: original.pipeline.runs.map((item) => ({
+          ...item,
+          url: item.url.replace(
+            "github.com/appwrite/cloud/",
+            "github.com/Appwrite/cloud/",
+          ),
+        })),
+      },
+      repository: "Appwrite/cloud",
+    });
+
+    expect(isReleasePipelinesResponse(response)).toBe(true);
+  });
+
+  it("rejects an invalid pipeline timestamp", () => {
+    const response = createReleasePipelines();
+    response.releases[0]!.pipeline.checkedAt = "not-a-date";
+
+    expect(isReleasePipelinesResponse(response)).toBe(false);
+  });
+
+  it("rejects an invalid successful response", async () => {
+    const pipelines = createReleasePipelines();
+    pipelines.releases[0]!.pipeline.runs[0]!.url =
+      "https://github.com/other/repository/actions/runs/123456789";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify(pipelines), {
+          headers: { "Content-Type": "application/json" },
+          status: 200,
+        }),
+      ),
+    );
+
+    await expect(getReleasePipelines()).rejects.toThrow(
+      "unexpected response",
+    );
   });
 });
 
