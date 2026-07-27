@@ -14,6 +14,7 @@ import {
 import { motion, useReducedMotion } from "motion/react";
 import {
   memo,
+  type KeyboardEvent,
   type MouseEvent,
   type UIEvent,
   useCallback,
@@ -53,6 +54,7 @@ import {
   type ToggleViewedFile,
   type ViewedFiles,
 } from "../diffs";
+import { keyboardEventBlocked } from "../keyboard";
 import type { PullMovement } from "../movements";
 import { getPullKey, type PullKey } from "../preferences";
 import { usePullRowContinuity } from "../row-continuity";
@@ -181,6 +183,52 @@ const hasActivePullIdentity = (identity: PullKey): boolean => {
 type FocusScope = "blockers" | "commits" | "diff";
 
 const FOCUS_SCOPE_SEPARATOR = "\0";
+
+type PanelFocusRequest = {
+  diffKey: string;
+  generation: number;
+  identity: PullKey;
+  scope: FocusScope;
+};
+
+const disclosureToken: Record<FocusScope, string> = {
+  blockers: "blockers",
+  commits: "commits",
+  diff: "diff",
+};
+
+const panelSelector: Record<FocusScope, string> = {
+  blockers: "[data-blocker-panel]",
+  commits: "[data-commits-panel]",
+  diff: "[data-diff-panel]",
+};
+
+const panelEntry = (
+  panel: HTMLElement,
+  scope: FocusScope,
+): HTMLElement | null => {
+  if (scope === "blockers") {
+    return panel.querySelector<HTMLElement>(
+      "[data-blocker-item][tabindex='0']",
+    );
+  }
+
+  if (scope === "commits") {
+    return (
+      panel.querySelector<HTMLElement>("[data-commit-selected]") ??
+      panel.querySelector<HTMLElement>(
+        "[data-pull-focus-token^='commit:']:not([disabled])",
+      )
+    );
+  }
+
+  return (
+    panel.querySelector<HTMLElement>(
+      "button[data-file-index][aria-current='true']",
+    ) ??
+    panel.querySelector<HTMLElement>("button[data-file-index]:not([disabled])")
+  );
+};
 
 const scopedFocusToken = (target: HTMLElement, token: string): string => {
   const scope: FocusScope | null = target.closest("[data-blocker-panel]")
@@ -1108,6 +1156,7 @@ function DiffTrigger({ disclosure }: { disclosure: DiffDisclosure }) {
     <Button
       aria-controls={disclosure.contentId}
       aria-expanded={disclosure.expanded}
+      aria-keyshortcuts="f"
       className="min-h-11 sm:min-h-7"
       data-pull-focus-token="diff"
       disabled={!disclosure.available}
@@ -1130,6 +1179,7 @@ function CommitsTrigger({ disclosure }: { disclosure: CommitsDisclosure }) {
     <Button
       aria-controls={disclosure.contentId}
       aria-expanded={disclosure.expanded}
+      aria-keyshortcuts="c"
       className="min-h-11 sm:min-h-7"
       data-pull-focus-token="commits"
       disabled={!disclosure.available}
@@ -1160,6 +1210,7 @@ function BlockerTrigger({
       aria-label={expanded ? "Hide blocker details" : "Show blocker details"}
       aria-controls={contentId}
       aria-expanded={expanded}
+      aria-keyshortcuts="b"
       className="min-h-11 sm:min-h-7"
       data-pull-focus-token="blockers"
       disabled={!available}
@@ -1788,6 +1839,192 @@ function PullRow({
           ? getFallbackBlockers(pull)
           : [];
   const row = useRef<HTMLLIElement>(null);
+  const panelFocusGeneration = useRef(0);
+  const panelFocusRequest = useRef<PanelFocusRequest | null>(null);
+  const requestPanelEntry = useCallback(
+    (scope: FocusScope) => {
+      panelFocusRequest.current = {
+        diffKey,
+        generation: ++panelFocusGeneration.current,
+        identity,
+        scope,
+      };
+    },
+    [diffKey, identity],
+  );
+  const disclosureFor = useCallback((scope: FocusScope): HTMLElement | null => {
+    return (
+      row.current?.querySelector<HTMLElement>(
+        `[data-pull-focus-token="${disclosureToken[scope]}"]`,
+      ) ?? null
+    );
+  }, []);
+  const togglePanel = useCallback(
+    (scope: FocusScope, focusEntry: boolean): void => {
+      const trigger = disclosureFor(scope);
+      if (
+        trigger === null ||
+        trigger.matches(":disabled") ||
+        trigger.getAttribute("aria-disabled") === "true"
+      ) {
+        return;
+      }
+      if (focusEntry && trigger.getAttribute("aria-expanded") !== "true") {
+        requestPanelEntry(scope);
+      }
+      trigger.click();
+    },
+    [disclosureFor, requestPanelEntry],
+  );
+  useLayoutEffect(() => {
+    const request = panelFocusRequest.current;
+    if (
+      request === null ||
+      request.identity !== identity ||
+      request.diffKey !== diffKey
+    ) {
+      return;
+    }
+    const expanded =
+      request.scope === "blockers"
+        ? blockersExpanded
+        : request.scope === "commits"
+          ? commitsExpanded
+          : disclosure.expanded;
+    if (!expanded) {
+      panelFocusRequest.current = null;
+      return;
+    }
+
+    const finish = (): boolean => {
+      if (
+        panelFocusRequest.current?.generation !== request.generation ||
+        panelFocusRequest.current.identity !== identity ||
+        panelFocusRequest.current.diffKey !== diffKey
+      ) {
+        return true;
+      }
+      const panel =
+        row.current?.querySelector<HTMLElement>(panelSelector[request.scope]) ??
+        null;
+      if (panel === null) return false;
+      const target = panelEntry(panel, request.scope);
+      if (target !== null) {
+        panelFocusRequest.current = null;
+        target.focus({ preventScroll: true });
+        target.scrollIntoView?.({ block: "nearest" });
+        return true;
+      }
+      if (panel.querySelector('[role="alert"]') !== null) {
+        panelFocusRequest.current = null;
+        return true;
+      }
+      return false;
+    };
+
+    if (finish() || row.current === null) return;
+    const observer = new MutationObserver(() => {
+      if (finish()) observer.disconnect();
+    });
+    observer.observe(row.current, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [
+    blockersExpanded,
+    commitsExpanded,
+    diffKey,
+    disclosure.expanded,
+    disclosure.state,
+    identity,
+  ]);
+  useEffect(
+    () => () => {
+      panelFocusRequest.current = null;
+    },
+    [diffKey, identity],
+  );
+  const handleRowKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLLIElement>): void => {
+      const nestedPanel = (event.target as HTMLElement).closest<HTMLElement>(
+        "[data-blocker-panel], [data-commits-panel], [data-diff-panel]",
+      );
+      const trigger = (event.target as HTMLElement).closest<HTMLElement>(
+        '[data-pull-focus-token="blockers"], [data-pull-focus-token="commits"], [data-pull-focus-token="diff"]',
+      );
+      const rowFocused = event.target === event.currentTarget;
+      const allowRepeat =
+        rowFocused && (event.key === "ArrowLeft" || event.key === "ArrowRight");
+      if (keyboardEventBlocked(event.nativeEvent, document, { allowRepeat })) {
+        return;
+      }
+
+      if (event.key === "Escape") {
+        if (nestedPanel !== null) {
+          const scope: FocusScope = nestedPanel.matches("[data-blocker-panel]")
+            ? "blockers"
+            : nestedPanel.matches("[data-commits-panel]")
+              ? "commits"
+              : "diff";
+          event.preventDefault();
+          event.stopPropagation();
+          disclosureFor(scope)?.focus({ preventScroll: true });
+          return;
+        }
+        if (trigger !== null) {
+          event.preventDefault();
+          event.stopPropagation();
+          row.current?.focus({ preventScroll: true });
+        }
+        return;
+      }
+
+      if (!rowFocused || event.shiftKey) return;
+      const shortcut: FocusScope | null =
+        event.key === "f"
+          ? "diff"
+          : event.key === "b"
+            ? "blockers"
+            : event.key === "c"
+              ? "commits"
+              : null;
+      if (shortcut !== null) {
+        event.preventDefault();
+        event.stopPropagation();
+        togglePanel(shortcut, true);
+        return;
+      }
+
+      if (event.key === "ArrowRight") {
+        const first = [
+          ...event.currentTarget.querySelectorAll<HTMLElement>(
+            '[data-row-actions] [data-pull-focus-token="blockers"], [data-row-actions] [data-pull-focus-token="commits"], [data-row-actions] [data-pull-focus-token="diff"]',
+          ),
+        ].find(
+          (candidate) =>
+            !candidate.matches(":disabled") &&
+            candidate.getAttribute("aria-disabled") !== "true",
+        );
+        if (first === undefined) return;
+        event.preventDefault();
+        event.stopPropagation();
+        first.focus({ preventScroll: true });
+        return;
+      }
+
+      if (event.key === "ArrowLeft") {
+        const expanded = [
+          ...event.currentTarget.querySelectorAll<HTMLElement>(
+            '[data-row-actions] [aria-expanded="true"]',
+          ),
+        ];
+        if (expanded.length === 0) return;
+        event.preventDefault();
+        event.stopPropagation();
+        panelFocusRequest.current = null;
+        expanded.forEach((control) => control.click());
+      }
+    },
+    [disclosureFor, togglePanel],
+  );
   const focusWasActive = useRef(false);
   if (hasActivePullIdentity(identity)) focusWasActive.current = true;
   if (entry.focus === null) focusWasActive.current = false;
@@ -1971,14 +2208,17 @@ function PullRow({
 
   return (
     <motion.li
+      aria-label={`${pull.repository} pull request ${pull.number}: ${pull.title}`}
       aria-hidden={exiting || undefined}
+      className="rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
       data-pull-identity={identity}
       data-pull-focus-token="row"
       inert={exiting || undefined}
       onBlurCapture={releaseFocus}
       onFocusCapture={(event) => captureFocus(event.target)}
+      onKeyDown={handleRowKeyDown}
       ref={row}
-      tabIndex={-1}
+      tabIndex={0}
       animate={{ opacity: 1, y: 0 }}
       exit={reducedMotion ? { opacity: 0 } : { opacity: 0, y: -6 }}
       initial={reducedMotion ? false : { opacity: 0, y: 6 }}
@@ -2046,13 +2286,18 @@ function PullRow({
                   className="flex flex-wrap items-center justify-end gap-2"
                   data-pull-actions=""
                 >
+                  {variant === "progress" && (
+                    <CommitsTrigger disclosure={commitsDisclosure} />
+                  )}
                   <BlockerTrigger
                     available={blockerAvailable}
                     contentId={blockerContentId}
                     expanded={blockersExpanded}
                     toggle={toggleBlockers}
                   />
-                  <CommitsTrigger disclosure={commitsDisclosure} />
+                  {variant === "blocked" && (
+                    <CommitsTrigger disclosure={commitsDisclosure} />
+                  )}
                   <DiffTrigger disclosure={disclosure} />
                 </div>
               </div>

@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import KeyboardShortcuts from "./components/KeyboardShortcuts";
 import {
   dashboardKeyboardCommand,
+  keyboardEventBlocked,
   RELEASE_FOCUS_REQUEST,
   useDashboardKeyboard,
   type KeyboardItem,
@@ -217,6 +218,60 @@ describe("dashboardKeyboardCommand", () => {
         new KeyboardEvent("keydown", { key: "J", shiftKey: true }),
       ),
     ).toBeNull();
+  });
+});
+
+describe("keyboardEventBlocked", () => {
+  it("blocks handled, composing, modified, repeated, editable, and overlaid events", () => {
+    const input = document.createElement("input");
+    expect(
+      keyboardEventBlocked({
+        altKey: false,
+        ctrlKey: false,
+        defaultPrevented: false,
+        isComposing: false,
+        metaKey: false,
+        repeat: false,
+        target: input,
+      }),
+    ).toBe(true);
+    expect(
+      keyboardEventBlocked(
+        new KeyboardEvent("keydown", { altKey: true, key: "f" }),
+      ),
+    ).toBe(true);
+    expect(
+      keyboardEventBlocked(
+        new KeyboardEvent("keydown", { isComposing: true, key: "f" }),
+      ),
+    ).toBe(true);
+    expect(
+      keyboardEventBlocked(
+        new KeyboardEvent("keydown", { key: "f", repeat: true }),
+      ),
+    ).toBe(true);
+
+    const overlay = document.createElement("div");
+    overlay.dataset.slot = "dialog-content";
+    overlay.dataset.state = "open";
+    document.body.append(overlay);
+    expect(
+      keyboardEventBlocked(new KeyboardEvent("keydown", { key: "f" })),
+    ).toBe(true);
+    overlay.remove();
+  });
+
+  it("allows unmodified non-editable events and explicit repeats", () => {
+    expect(
+      keyboardEventBlocked(new KeyboardEvent("keydown", { key: "f" })),
+    ).toBe(false);
+    expect(
+      keyboardEventBlocked(
+        new KeyboardEvent("keydown", { key: "ArrowDown", repeat: true }),
+        document,
+        { allowRepeat: true },
+      ),
+    ).toBe(false);
   });
 });
 

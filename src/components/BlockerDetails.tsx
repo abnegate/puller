@@ -5,13 +5,23 @@ import {
   LoaderCircle,
   MessageSquareText,
 } from "lucide-react";
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import {
+  memo,
+  type KeyboardEvent,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { getCheckLog, parseGitHubActionsJobUrl } from "@/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 
+import { keyboardEventBlocked } from "../keyboard";
 import type {
   CICheck,
   GitHubActionsJob,
@@ -328,6 +338,7 @@ const DetailLink = memo(function DetailLink({
     <a
       className="inline-flex min-h-8 items-center gap-1 rounded-md px-1 text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       data-pull-focus-token={focusToken}
+      data-blocker-safe-focus=""
       href={href}
       rel="noopener noreferrer"
       target="_blank"
@@ -497,6 +508,7 @@ const FailedCheck = memo(function FailedCheck({
             aria-label={`${check.name} logs`}
             className="max-h-72 w-full max-w-full overflow-auto rounded-lg border border-border/70 bg-zinc-950 p-3 font-mono text-[11px] leading-5 text-zinc-100 shadow-inner dark:bg-black/60"
             data-pull-focus-token={`${focusToken}:log`}
+            data-blocker-safe-focus=""
             role="region"
             tabIndex={0}
           >
@@ -559,10 +571,14 @@ const FailedCheck = memo(function FailedCheck({
 });
 
 const FailedChecks = memo(function FailedChecks({
+  active,
+  blockerKey,
   checks,
   pull,
   viewerLogin,
 }: {
+  active: boolean;
+  blockerKey: string;
   checks: FailedCheckEntry[];
   pull: PullReadiness;
   viewerLogin: string | null;
@@ -575,7 +591,13 @@ const FailedChecks = memo(function FailedChecks({
     supported === 0 ? 0 : Math.floor(CHECK_LOG_BODY_BUDGET_BYTES / supported);
 
   return (
-    <section className="min-w-0 rounded-lg border bg-muted/15">
+    <section
+      aria-label="Failed checks"
+      className="min-w-0 rounded-lg border bg-muted/15 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      data-blocker-item=""
+      data-blocker-key={blockerKey}
+      tabIndex={active ? 0 : -1}
+    >
       <div className="flex items-center gap-2 px-3 py-2">
         <CircleAlert aria-hidden="true" className="size-3.5 text-destructive" />
         <h4 className="m-0 text-xs font-medium">Failed checks</h4>
@@ -636,14 +658,24 @@ const Thread = memo(function Thread({ thread }: { thread: ReviewThread }) {
 });
 
 const ReviewThreads = memo(function ReviewThreads({
+  active,
+  blockerKey,
   expected,
   threads,
 }: {
+  active: boolean;
+  blockerKey: string;
   expected: number;
   threads: ReviewThread[];
 }) {
   return (
-    <section className="rounded-lg border bg-muted/15">
+    <section
+      aria-label="Unresolved comments"
+      className="rounded-lg border bg-muted/15 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      data-blocker-item=""
+      data-blocker-key={blockerKey}
+      tabIndex={active ? 0 : -1}
+    >
       <div className="flex items-center gap-2 px-3 py-2">
         <MessageSquareText
           aria-hidden="true"
@@ -678,8 +710,12 @@ const ReviewThreads = memo(function ReviewThreads({
 });
 
 const GreptileReview = memo(function GreptileReview({
+  active,
+  blockerKey,
   pull,
 }: {
+  active: boolean;
+  blockerKey: string;
   pull: PullReadiness;
 }) {
   const current = isCurrentGreptileReview(pull);
@@ -690,7 +726,13 @@ const GreptileReview = memo(function GreptileReview({
   );
 
   return (
-    <section className="rounded-lg border bg-muted/15">
+    <section
+      aria-label="Greptile review"
+      className="rounded-lg border bg-muted/15 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      data-blocker-item=""
+      data-blocker-key={blockerKey}
+      tabIndex={active ? 0 : -1}
+    >
       <div className="flex flex-wrap items-center gap-2 px-3 py-2">
         <GitPullRequest
           aria-hidden="true"
@@ -744,6 +786,8 @@ const GreptileReview = memo(function GreptileReview({
 });
 
 function BlockerDetails({ pull, viewerLogin }: BlockerDetailsProps) {
+  const root = useRef<HTMLDivElement>(null);
+  const focusedKey = useRef<string | null>(null);
   const failedChecks = useMemo(
     () => getFailedChecks(pull.ci.checks ?? [], pull.repository),
     [pull.ci.checks, pull.repository],
@@ -757,24 +801,173 @@ function BlockerDetails({ pull, viewerLogin }: BlockerDetailsProps) {
     !pull.checks.commentsComplete || !pull.checks.threadsComplete;
   const ciEvidenceIncomplete =
     pull.ci.state === "unknown" || pull.ci.complete === false;
+  const evidenceUnavailable =
+    missingEvidence ||
+    ciEvidenceIncomplete ||
+    (!failedCI && !unresolved && !greptileBlocking);
+  const keys = useMemo(
+    () => [
+      ...(failedCI ? ["failed-checks"] : []),
+      ...(unresolved ? ["review-threads"] : []),
+      "greptile",
+      ...(evidenceUnavailable ? ["evidence"] : []),
+    ],
+    [evidenceUnavailable, failedCI, unresolved],
+  );
+  const previousKeys = useRef(keys);
+  const [selectedKey, setSelectedKey] = useState<string | null>(
+    keys[0] ?? null,
+  );
+  const activeKey = useMemo(() => {
+    if (selectedKey !== null && keys.includes(selectedKey)) return selectedKey;
+    const previousIndex =
+      selectedKey === null ? 0 : previousKeys.current.indexOf(selectedKey);
+    return keys[Math.min(Math.max(previousIndex, 0), keys.length - 1)] ?? null;
+  }, [keys, selectedKey]);
+
+  useLayoutEffect(() => {
+    previousKeys.current = keys;
+    if (selectedKey === activeKey) return;
+    const restore = focusedKey.current === selectedKey;
+    focusedKey.current = restore ? activeKey : focusedKey.current;
+    setSelectedKey(activeKey);
+    if (!restore || activeKey === null) return;
+    root.current
+      ?.querySelector<HTMLElement>(`[data-blocker-key="${activeKey}"]`)
+      ?.focus({ preventScroll: true });
+  }, [activeKey, keys, selectedKey]);
+
+  const handleFocus = useCallback((target: EventTarget | null): void => {
+    const item =
+      target instanceof Element
+        ? target.closest<HTMLElement>("[data-blocker-item]")
+        : null;
+    const key = item?.dataset.blockerKey ?? null;
+    if (key === null) return;
+    focusedKey.current = key;
+    setSelectedKey(key);
+  }, []);
+  const handleBlur = useCallback((): void => {
+    queueMicrotask(() => {
+      if (
+        root.current?.contains(
+          document.activeElement instanceof Node
+            ? document.activeElement
+            : null,
+        )
+      ) {
+        return;
+      }
+      focusedKey.current = null;
+    });
+  }, []);
+  const handleKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLDivElement>): void => {
+      const item = (event.target as HTMLElement).closest<HTMLElement>(
+        "[data-blocker-item]",
+      );
+      if (item === null || !event.currentTarget.contains(item)) return;
+      const navigation = ["ArrowDown", "ArrowUp", "End", "Home"].includes(
+        event.key,
+      );
+      if (
+        keyboardEventBlocked(event.nativeEvent, document, {
+          allowRepeat: navigation,
+        })
+      ) {
+        return;
+      }
+
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.target !== item) {
+          item.focus({ preventScroll: true });
+          return;
+        }
+        item
+          .closest<HTMLElement>("[data-pull-identity]")
+          ?.querySelector<HTMLElement>('[data-pull-focus-token="blockers"]')
+          ?.focus({ preventScroll: true });
+        return;
+      }
+
+      const items = [
+        ...event.currentTarget.querySelectorAll<HTMLElement>(
+          "[data-blocker-item]",
+        ),
+      ];
+      const index = items.indexOf(item);
+      let next = index;
+      if (event.key === "ArrowDown") {
+        next = Math.min(items.length - 1, index + 1);
+      } else if (event.key === "ArrowUp") {
+        next = Math.max(0, index - 1);
+      } else if (event.key === "Home") {
+        next = 0;
+      } else if (event.key === "End") {
+        next = items.length - 1;
+      } else if (event.key === "Enter" && event.target === item) {
+        event.preventDefault();
+        event.stopPropagation();
+        item
+          .querySelector<HTMLElement>("[data-blocker-safe-focus]")
+          ?.focus({ preventScroll: true });
+        return;
+      } else {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      const destination = items[next];
+      if (destination === undefined) return;
+      setSelectedKey(destination.dataset.blockerKey ?? null);
+      destination.focus({ preventScroll: true });
+      destination.scrollIntoView?.({ block: "nearest" });
+    },
+    [],
+  );
 
   return (
-    <div className="grid grid-cols-1 gap-2">
+    <div
+      className="grid grid-cols-1 gap-2"
+      data-blocker-list=""
+      onBlurCapture={handleBlur}
+      onFocusCapture={(event) => handleFocus(event.target)}
+      onKeyDown={handleKeyDown}
+      ref={root}
+    >
       {failedCI && (
         <FailedChecks
+          active={activeKey === "failed-checks"}
+          blockerKey="failed-checks"
           checks={failedChecks}
           pull={pull}
           viewerLogin={viewerLogin}
         />
       )}
       {unresolved && (
-        <ReviewThreads expected={pull.unresolved} threads={threads} />
+        <ReviewThreads
+          active={activeKey === "review-threads"}
+          blockerKey="review-threads"
+          expected={pull.unresolved}
+          threads={threads}
+        />
       )}
-      <GreptileReview pull={pull} />
-      {(missingEvidence ||
-        ciEvidenceIncomplete ||
-        (!failedCI && !unresolved && !greptileBlocking)) && (
-        <section className="rounded-lg border bg-muted/15 px-3 py-2.5 text-xs text-muted-foreground">
+      <GreptileReview
+        active={activeKey === "greptile"}
+        blockerKey="greptile"
+        pull={pull}
+      />
+      {evidenceUnavailable && (
+        <section
+          aria-label="Evidence unavailable"
+          className="rounded-lg border bg-muted/15 px-3 py-2.5 text-xs text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          data-blocker-item=""
+          data-blocker-key="evidence"
+          tabIndex={activeKey === "evidence" ? 0 : -1}
+        >
           <h4 className="mb-1 font-medium text-foreground">
             Evidence unavailable
           </h4>

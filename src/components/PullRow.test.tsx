@@ -524,6 +524,12 @@ describe("PullRow ready presentation", () => {
     expect(actions).toContainElement(files);
     expect(actions).toContainElement(merge);
     expect(
+      commits.compareDocumentPosition(files) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      files.compareDocumentPosition(merge) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
       container.querySelector("[data-ready-diff-content]"),
     ).not.toBeInTheDocument();
     expect(screen.getByLabelText("Favourite pull request")).toBeInTheDocument();
@@ -2016,12 +2022,14 @@ describe("PullRow progress and blocker presentation", () => {
       expect(actions).toContainElement(details);
       expect(actions).toContainElement(commits);
       expect(actions).toContainElement(files);
+      const first = variant === "progress" ? commits : details;
+      const second = variant === "progress" ? details : commits;
       expect(
-        details.compareDocumentPosition(commits) &
+        first.compareDocumentPosition(second) &
           Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy();
       expect(
-        commits.compareDocumentPosition(files) &
+        second.compareDocumentPosition(files) &
           Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy();
       expect(
@@ -2034,6 +2042,162 @@ describe("PullRow progress and blocker presentation", () => {
       expect(screen.queryByRole("button", { name: "Merge" })).toBeNull();
     },
   );
+
+  it.each([
+    ["progress", "Commits"],
+    ["blocked", "Show blocker details"],
+    ["ready", "Commits"],
+  ] as const)(
+    "focuses the first %s row disclosure with ArrowRight",
+    (variant, expected) => {
+      const pull =
+        variant === "ready"
+          ? getReadyPull()
+          : variant === "progress"
+            ? createPendingPull()
+            : getBlockedPull();
+      const { container } = renderRow(pull, variant);
+      const row = container.querySelector<HTMLElement>("[data-pull-identity]")!;
+
+      row.focus();
+      fireEvent.keyDown(row, { key: "ArrowRight" });
+
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: expected }),
+      );
+      expect(getPullDiff).not.toHaveBeenCalled();
+      expect(getPullCommits).not.toHaveBeenCalled();
+    },
+  );
+
+  it("opens each disclosure from the focused row and enters its safe first item", async () => {
+    const pull = getBlockedPull();
+    vi.mocked(getPullDiff).mockResolvedValue(pullDiff(pull));
+    vi.mocked(getPullCommits).mockResolvedValue(pullCommits(pull));
+    vi.mocked(getPullCommitDiff).mockResolvedValue(pullCommitDiff(pull));
+    const { container } = renderRow(pull, "blocked");
+    const row = container.querySelector<HTMLElement>("[data-pull-identity]")!;
+    const files = screen.getByRole("button", { name: "Files changed" });
+    const blockers = screen.getByRole("button", {
+      name: "Show blocker details",
+    });
+    const commits = screen.getByRole("button", { name: "Commits" });
+
+    expect(row).toHaveAttribute("tabindex", "0");
+    expect(row).toHaveAttribute(
+      "aria-label",
+      `${pull.repository} pull request ${pull.number}: ${pull.title}`,
+    );
+    expect(files).toHaveAttribute("aria-keyshortcuts", "f");
+    expect(blockers).toHaveAttribute("aria-keyshortcuts", "b");
+    expect(commits).toHaveAttribute("aria-keyshortcuts", "c");
+
+    row.focus();
+    fireEvent.keyDown(row, { key: "b" });
+    await waitFor(() =>
+      expect(document.activeElement).toHaveAttribute(
+        "data-blocker-key",
+        "failed-checks",
+      ),
+    );
+
+    row.focus();
+    fireEvent.keyDown(row, { key: "c" });
+    await waitFor(() =>
+      expect(document.activeElement).toHaveAttribute(
+        "data-pull-focus-token",
+        expect.stringMatching(/^commit:/),
+      ),
+    );
+
+    row.focus();
+    fireEvent.keyDown(row, { key: "f" });
+    await waitFor(() =>
+      expect(document.activeElement).toHaveAttribute(
+        "data-pull-focus-token",
+        "file:src/ready.ts",
+      ),
+    );
+    expect(getPullCommits).toHaveBeenCalledOnce();
+    expect(getPullDiff).toHaveBeenCalledOnce();
+  });
+
+  it("collapses open panels with ArrowLeft and escapes panel, trigger, then row", async () => {
+    const pull = getBlockedPull();
+    const { container } = renderRow(pull, "blocked");
+    const row = container.querySelector<HTMLElement>("[data-pull-identity]")!;
+    const blockers = screen.getByRole("button", {
+      name: "Show blocker details",
+    });
+
+    row.focus();
+    fireEvent.keyDown(row, { key: "b" });
+    const item = await waitFor(() => {
+      const current = container.querySelector<HTMLElement>(
+        "[data-blocker-item][tabindex='0']",
+      );
+      expect(current).not.toBeNull();
+      return current!;
+    });
+    item.focus();
+    fireEvent.keyDown(item, { key: "Escape" });
+    expect(document.activeElement).toBe(blockers);
+
+    fireEvent.keyDown(blockers, { key: "Escape" });
+    expect(document.activeElement).toBe(row);
+
+    fireEvent.keyDown(row, { key: "ArrowLeft" });
+    expect(blockers).toHaveAttribute("aria-expanded", "false");
+    expect(getPullDiff).not.toHaveBeenCalled();
+    expect(getPullCommits).not.toHaveBeenCalled();
+  });
+
+  it("does not move focus to a retry action when keyboard-opened files fail", async () => {
+    const pull = getBlockedPull();
+    vi.mocked(getPullDiff).mockRejectedValue(new Error("Diff unavailable"));
+    const { container } = renderRow(pull, "blocked");
+    const row = container.querySelector<HTMLElement>("[data-pull-identity]")!;
+
+    row.focus();
+    fireEvent.keyDown(row, { key: "f" });
+    await screen.findByRole("alert");
+
+    expect(document.activeElement).toBe(row);
+    expect(document.activeElement).not.toBe(
+      screen.getByRole("button", { name: "Retry" }),
+    );
+    expect(getPullDiff).toHaveBeenCalledOnce();
+  });
+
+  it("cancels stale async entry focus when the panel closes before loading", async () => {
+    const pull = getBlockedPull();
+    const pending = deferred<PullDiff>();
+    vi.mocked(getPullDiff).mockReturnValue(pending.promise);
+    const { container } = renderRow(pull, "blocked");
+    const row = container.querySelector<HTMLElement>("[data-pull-identity]")!;
+    const outside = document.createElement("button");
+    document.body.append(outside);
+
+    try {
+      row.focus();
+      fireEvent.keyDown(row, { key: "f" });
+      expect(
+        screen.getByRole("button", { name: "Files changed" }),
+      ).toHaveAttribute("aria-expanded", "true");
+      row.focus();
+      fireEvent.keyDown(row, { key: "f" });
+      outside.focus();
+
+      await act(async () => pending.resolve(pullDiff(pull)));
+
+      expect(document.activeElement).toBe(outside);
+      expect(
+        screen.getByRole("button", { name: "Files changed" }),
+      ).toHaveAttribute("aria-expanded", "false");
+    } finally {
+      outside.remove();
+    }
+  });
 
   it("shows semantic movement direction without relying on animation", () => {
     const movement: PullMovement = {

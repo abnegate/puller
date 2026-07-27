@@ -36,6 +36,17 @@ const BlockerDetails = ({ pull }: { pull: PullReadiness }) => (
   <BlockerDetailsComponent pull={pull} viewerLogin="jake" />
 );
 
+const BlockerHarness = ({ pull }: { pull: PullReadiness }) => (
+  <div data-pull-identity={`${pull.repository}#${pull.number}`}>
+    <button data-pull-focus-token="blockers" type="button">
+      Blocker details
+    </button>
+    <div data-blocker-panel="">
+      <BlockerDetails pull={pull} />
+    </div>
+  </div>
+);
+
 const JOB_URL =
   "https://github.com/appwrite/cloud/actions/runs/123456789/job/987654321";
 
@@ -205,6 +216,118 @@ describe("BlockerDetails", () => {
     ).toHaveAttribute(
       "data-pull-focus-token",
       `blocker:greptile:${pull.greptile.commentId}:open`,
+    );
+  });
+
+  it("roves blocker categories without triggering network actions", () => {
+    const pull = createPullsResponse().notReady[0]!;
+    render(<BlockerDetails pull={pull} />);
+    const items = screen
+      .getAllByRole("region")
+      .filter((region) => region.hasAttribute("data-blocker-item"));
+    const expected = [
+      "Failed checks",
+      "Unresolved comments",
+      "Greptile review",
+    ];
+
+    expect(items.slice(0, expected.length)).toHaveLength(expected.length);
+    expected.forEach((label, index) => {
+      expect(items[index]).toHaveAccessibleName(label);
+      expect(items[index]).toHaveAttribute(
+        "tabindex",
+        index === 0 ? "0" : "-1",
+      );
+    });
+
+    items[0]!.focus();
+    fireEvent.keyDown(items[0]!, { key: "ArrowDown" });
+    expect(document.activeElement).toBe(items[1]);
+    fireEvent.keyDown(items[1]!, { key: "End" });
+    expect(document.activeElement).toBe(items.at(-1));
+    fireEvent.keyDown(items.at(-1)!, { key: "Home" });
+    expect(document.activeElement).toBe(items[0]);
+    fireEvent.keyDown(items[0]!, { key: "ArrowUp" });
+    expect(document.activeElement).toBe(items[0]);
+    expect(getCheckLog).not.toHaveBeenCalled();
+  });
+
+  it("Enter focuses only an already-rendered safe log or link", () => {
+    const pull = createPullsResponse().notReady[0]!;
+    render(<BlockerDetails pull={pull} />);
+    const failed = screen.getByRole("region", { name: "Failed checks" });
+
+    failed.focus();
+    fireEvent.keyDown(failed, { key: "Enter" });
+
+    expect(document.activeElement).toBe(
+      within(failed).getByRole("link", { name: "Open check" }),
+    );
+    expect(getCheckLog).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: /Retry .* logs/ })).toBeNull();
+  });
+
+  it("escapes from a blocker child to its item, then to the disclosure", () => {
+    const pull = createPullsResponse().notReady[0]!;
+    render(<BlockerHarness pull={pull} />);
+    const failed = screen.getByRole("region", { name: "Failed checks" });
+    const link = within(failed).getByRole("link", { name: "Open check" });
+    const trigger = screen.getByRole("button", { name: "Blocker details" });
+
+    link.focus();
+    fireEvent.keyDown(link, { key: "Escape" });
+    expect(document.activeElement).toBe(failed);
+
+    fireEvent.keyDown(failed, { key: "Escape" });
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("preserves the active blocker while asynchronous logs mount", async () => {
+    const pull = withSupportedCheck();
+    const pending = deferred<CheckLog>();
+    vi.mocked(getCheckLog).mockReturnValue(pending.promise);
+    render(<BlockerDetails pull={pull} />);
+    const greptile = screen.getByRole("region", { name: "Greptile review" });
+
+    greptile.focus();
+    await act(async () => pending.resolve(checkLog(pull)));
+
+    expect(document.activeElement).toBe(greptile);
+    expect(greptile).toHaveAttribute("tabindex", "0");
+    expect(
+      screen.getByRole("region", { name: "Integration tests logs" }),
+    ).toBeInTheDocument();
+  });
+
+  it("falls forward, then backward, when the active blocker disappears", () => {
+    const pull = createPullsResponse().notReady[0]!;
+    const view = render(<BlockerDetails pull={pull} />);
+    const unresolved = screen.getByRole("region", {
+      name: "Unresolved comments",
+    });
+    unresolved.focus();
+
+    view.rerender(
+      <BlockerDetails
+        pull={{ ...pull, unresolved: 0, unresolvedThreads: [] }}
+      />,
+    );
+    expect(document.activeElement).toBe(
+      screen.getByRole("region", { name: "Greptile review" }),
+    );
+
+    const incomplete = {
+      ...pull,
+      checks: { ...pull.checks, commentsComplete: false },
+    };
+    view.rerender(<BlockerDetails pull={incomplete} />);
+    const evidence = screen.getByRole("region", {
+      name: "Evidence unavailable",
+    });
+    evidence.focus();
+    view.rerender(<BlockerDetails pull={pull} />);
+    expect(document.activeElement).toBe(
+      screen.getByRole("region", { name: "Greptile review" }),
     );
   });
 

@@ -101,6 +101,29 @@ const commandForKey = (key: string): DashboardKeyboardCommand | null => {
 const isEditableTarget = (target: EventTarget | null): boolean =>
   target instanceof Element && target.closest(EDITABLE_SELECTOR) !== null;
 
+export const keyboardEventBlocked = (
+  event: Pick<
+    KeyboardEvent,
+    | "altKey"
+    | "ctrlKey"
+    | "defaultPrevented"
+    | "isComposing"
+    | "metaKey"
+    | "repeat"
+    | "target"
+  >,
+  target: Document = document,
+  options: { allowRepeat?: boolean } = {},
+): boolean =>
+  event.defaultPrevented ||
+  event.isComposing ||
+  event.altKey ||
+  event.ctrlKey ||
+  event.metaKey ||
+  (!options.allowRepeat && event.repeat) ||
+  isEditableTarget(event.target) ||
+  target.querySelector(OPEN_OVERLAY_SELECTOR) !== null;
+
 export const dashboardKeyboardCommand = (
   event: Pick<
     KeyboardEvent,
@@ -117,13 +140,15 @@ export const dashboardKeyboardCommand = (
   target: Document = document,
 ): DashboardKeyboardCommand | null => {
   const command = commandForKey(event.key);
-  if (command === null || event.defaultPrevented || event.isComposing)
-    return null;
-  if (event.altKey || event.ctrlKey || event.metaKey) return null;
+  if (command === null) return null;
   if (event.shiftKey && command !== "help") return null;
-  if (event.repeat && command !== "next" && command !== "previous") return null;
-  if (isEditableTarget(event.target)) return null;
-  if (target.querySelector(OPEN_OVERLAY_SELECTOR) !== null) return null;
+  if (
+    keyboardEventBlocked(event, target, {
+      allowRepeat: command === "next" || command === "previous",
+    })
+  ) {
+    return null;
+  }
   return command;
 };
 
