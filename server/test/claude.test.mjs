@@ -1916,6 +1916,42 @@ describe("Claude Code run manager", () => {
     expect(context.value.activeWorkspaceCount()).toBe(0);
   });
 
+  it("uses manual fix copy when a failed run also cannot clean its workspace", async () => {
+    const cleanup = vi.fn(async () => {
+      throw new Error("cleanup failed");
+    });
+    const context = manager({
+      resolver: {
+        resolveReview: vi.fn(async () => ({
+          branch: "fix/auto",
+          cleanup,
+          cwd: "/trusted/manual/owner-repo-7",
+          headRefOid: SHA,
+          remote: "origin",
+          repository: "owner/repo",
+        })),
+      },
+    });
+    const output = channel();
+    const run = await context.value.start(input, output.value);
+
+    context.child.emit("close", 1, null);
+    await run.done;
+
+    expect(output.events).toContainEqual({
+      text: "The isolated fix workspace could not be removed. The run reservation was released; inspect Puller's local workspace storage.",
+      type: "diagnostic",
+    });
+    expect(output.events).not.toContainEqual(
+      expect.objectContaining({
+        text: expect.stringContaining("review workspace"),
+      }),
+    );
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(context.value.activeCount()).toBe(0);
+    expect(context.value.activeWorkspaceCount()).toBe(0);
+  });
+
   it("cleans and releases a manual workspace when process startup fails so retry succeeds", async () => {
     const cleanup = vi.fn(async () => undefined);
     const child = fakeChild(114);

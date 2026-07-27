@@ -333,6 +333,10 @@ function byteLength(value) {
   return Buffer.byteLength(value, "utf8");
 }
 
+function workspaceCleanupFailure(source) {
+  return source === "manual" ? MANUAL_CLEANUP_FAILURE : REVIEW_CLEANUP_FAILURE;
+}
+
 function reviewAbortError(source = "review") {
   const label =
     source === "manual" ? "fix" : source === "auto" ? "Auto" : "review";
@@ -1470,8 +1474,7 @@ export function createClaudeRunManager({
   }
 
   function reviewWorkspaceCleanup(workspace, source = "review") {
-    const failure =
-      source === "manual" ? MANUAL_CLEANUP_FAILURE : REVIEW_CLEANUP_FAILURE;
+    const failure = workspaceCleanupFailure(source);
     if (typeof workspace?.cleanup !== "function") {
       throw new ActionError(
         500,
@@ -2685,7 +2688,7 @@ export function createClaudeRunManager({
             } else {
               write(run, {
                 type: "diagnostic",
-                text: REVIEW_CLEANUP_FAILURE,
+                text: workspaceCleanupFailure(run.source),
               });
             }
           }
