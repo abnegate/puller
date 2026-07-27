@@ -1234,6 +1234,31 @@ describe("Claude Code run manager", () => {
       ["push", "--no-verify", "origin", "HEAD:refs/heads/fix/auto"],
       ["status", "--porcelain=v1", "--untracked-files=all"],
     ]);
+    const pushOptions = context.git.mock.calls.find(([, arguments_]) =>
+      arguments_.includes("push"),
+    )[2];
+    expect(pushOptions.env).toMatchObject({
+      GIT_ASKPASS: "/usr/bin/false",
+      GIT_ATTR_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+      GIT_NO_REPLACE_OBJECTS: "1",
+      GIT_OPTIONAL_LOCKS: "0",
+      GIT_SSH_COMMAND:
+        "ssh -oBatchMode=yes -oConnectTimeout=15 -oStrictHostKeyChecking=yes",
+      GIT_TERMINAL_PROMPT: "0",
+      HOME: "/Users/test",
+      PATH: "/usr/local/bin:/usr/bin:/bin",
+      SSH_ASKPASS: "/usr/bin/false",
+      SSH_AUTH_SOCK: "/private/tmp/agent.sock",
+    });
+    expect(pushOptions.env).not.toHaveProperty("DO_SPACES_SECRET");
+    expect(pushOptions.env).not.toHaveProperty("DO_TOKEN");
+    expect(pushOptions.env).not.toHaveProperty("GITHUB_PERSONAL_ACCESS_TOKEN");
+    expect(pushOptions.env).not.toHaveProperty("GOOGLE_API_KEY");
+    expect(pushOptions.env).not.toHaveProperty("TF_API_KEY");
+    expect(pushOptions.env).not.toHaveProperty("UNRELATED_VALUE");
     expect(context.resolver.verifyReview).toHaveBeenCalledOnce();
   });
 
@@ -2686,6 +2711,129 @@ describe("Claude Code run manager", () => {
     expect(resolver.verifyReview).toHaveBeenCalledOnce();
     expect(reportDiagnostic).toHaveBeenCalledWith(
       expect.stringContaining("Cancellation raced an accepted push"),
+    );
+    expect(output.events).toContainEqual({
+      message: "The client disconnected.",
+      type: "cancelled",
+    });
+    expect(output.events).not.toContainEqual({
+      exitCode: 0,
+      type: "complete",
+    });
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(context.value.activeCount()).toBe(0);
+    expect(context.value.activeWorkspaceCount()).toBe(0);
+  });
+
+  it("reconciles an accepted Auto push when the client disconnects during completion verification", async () => {
+    const verificationStarted = deferred();
+    const cleanup = vi.fn(async () => undefined);
+    const reportDiagnostic = vi.fn();
+    const invalidate = vi.fn();
+    const refreshReadiness = vi.fn(async () => undefined);
+    let committed = false;
+    let statusCalls = 0;
+    const git = vi.fn(async (_command, arguments_) => {
+      if (arguments_.includes("rev-parse")) {
+        return {
+          stderr: "",
+          stdout: `${committed ? PUBLISHED_SHA : SHA}\n`,
+        };
+      }
+      if (arguments_.includes("status")) {
+        statusCalls += 1;
+        return {
+          stderr: "",
+          stdout: statusCalls === 1 ? " M src/index.ts\n" : "",
+        };
+      }
+      if (arguments_.includes("commit")) {
+        committed = true;
+      }
+      return { stderr: "", stdout: "" };
+    });
+    let authorizationCalls = 0;
+    const loadReviewAuthorization = vi.fn(async () => {
+      authorizationCalls += 1;
+      return autoAuthorization(
+        {},
+        authorizationCalls >= 6 ? PUBLISHED_SHA : SHA,
+      );
+    });
+    const resolver = {
+      clear: vi.fn(),
+      resolveReview: vi.fn(async () => ({
+        branch: "fix/auto",
+        cleanup,
+        cwd: "/trusted/auto/owner-repo-7",
+        headRefOid: SHA,
+        remote: "origin",
+        repository: "owner/repo",
+      })),
+      verifyReview: vi
+        .fn()
+        .mockImplementationOnce((_workspace, { signal }) => {
+          verificationStarted.resolve(signal);
+          return new Promise(() => undefined);
+        })
+        .mockImplementationOnce(async (workspace) => ({
+          ...workspace,
+          headRefOid: PUBLISHED_SHA,
+        })),
+    };
+    const comment = issueComment();
+    const context = manager({
+      diffService: { invalidate },
+      git,
+      loadPull: vi.fn(async () =>
+        exact({
+          pull: rawPull({
+            comments: [greptileComment(), comment],
+            reviewThreads: [],
+            unresolvedThreads: [],
+          }),
+        }),
+      ),
+      loadReviewAuthorization,
+      refreshReadiness,
+      reportDiagnostic,
+      resolver,
+    });
+    const output = channel();
+    const started = await context.value.start(
+      autoInput([
+        {
+          kind: "issue_comment",
+          id: comment.id,
+          updatedAt: comment.updatedAt,
+        },
+      ]),
+      output.value,
+    );
+
+    context.child.emit("close", 0, null);
+    const completionSignal = await verificationStarted.promise;
+    expect(completionSignal.aborted).toBe(false);
+    output.close();
+    await started.done;
+
+    expect(resolver.verifyReview).toHaveBeenCalledTimes(2);
+    expect(reportDiagnostic).toHaveBeenCalledWith(
+      expect.stringContaining("Cancellation raced an accepted push"),
+    );
+    expect(invalidate).toHaveBeenCalledWith({
+      number: 7,
+      repository: "owner/repo",
+    });
+    expect(resolver.clear).toHaveBeenCalledWith({
+      number: 7,
+      repository: "owner/repo",
+    });
+    await vi.waitFor(() =>
+      expect(refreshReadiness).toHaveBeenCalledWith({
+        number: 7,
+        repository: "owner/repo",
+      }),
     );
     expect(output.events).toContainEqual({
       message: "The client disconnected.",

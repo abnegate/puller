@@ -99,6 +99,7 @@ const REVIEW_ENVIRONMENT = [
   "USER",
   "__CF_USER_TEXT_ENCODING",
 ];
+const REVIEW_GIT_ENVIRONMENT = [...REVIEW_ENVIRONMENT, "TEMP", "TMP", "TMPDIR"];
 const FIX_ENVIRONMENT_FORCED = [
   "CLAUDE_CODE_DISABLE_TERMINAL_TITLE",
   "ENABLE_CLAUDEAI_MCP_SERVERS",
@@ -1038,6 +1039,29 @@ export function reviewClaudeEnvironment(environment, temporary) {
   };
 }
 
+export function reviewGitEnvironment(environment) {
+  const selected = {};
+  for (const name of REVIEW_GIT_ENVIRONMENT) {
+    const value = environment[name];
+    if (typeof value === "string" && !value.includes("\0")) {
+      selected[name] = value;
+    }
+  }
+  return {
+    ...selected,
+    GIT_ASKPASS: "/usr/bin/false",
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_OPTIONAL_LOCKS: "0",
+    GIT_SSH_COMMAND: REVIEW_SSH_COMMAND,
+    GIT_TERMINAL_PROMPT: "0",
+    SSH_ASKPASS: "/usr/bin/false",
+  };
+}
+
 export function createStreamRedactor({
   cwd = "",
   delay = DEFAULT_REDACTION_DELAY,
@@ -1567,18 +1591,7 @@ export function createClaudeRunManager({
       [...SAFE_GIT_CONFIGURATION, "-C", run.workspaceKey, ...arguments_],
       {
         encoding: "utf8",
-        env: {
-          LANG: "C",
-          LC_ALL: "C",
-          PATH:
-            typeof environment.PATH === "string"
-              ? environment.PATH
-              : "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
-          GIT_CONFIG_GLOBAL: "/dev/null",
-          GIT_CONFIG_NOSYSTEM: "1",
-          GIT_CONFIG_SYSTEM: "/dev/null",
-          GIT_TERMINAL_PROMPT: "0",
-        },
+        env: reviewGitEnvironment(environment),
         maxBuffer: 4 * 1024 * 1024,
         signal,
         windowsHide: true,
@@ -1715,18 +1728,7 @@ export function createClaudeRunManager({
         [...SAFE_GIT_CONFIGURATION, "-C", cwd, "rev-parse", "--verify", "HEAD"],
         {
           encoding: "utf8",
-          env: {
-            LANG: "C",
-            LC_ALL: "C",
-            PATH:
-              typeof environment.PATH === "string"
-                ? environment.PATH
-                : "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
-            GIT_CONFIG_GLOBAL: "/dev/null",
-            GIT_CONFIG_NOSYSTEM: "1",
-            GIT_CONFIG_SYSTEM: "/dev/null",
-            GIT_TERMINAL_PROMPT: "0",
-          },
+          env: reviewGitEnvironment(environment),
           maxBuffer: 4 * 1024 * 1024,
           signal,
           windowsHide: true,
@@ -1954,6 +1956,20 @@ export function createClaudeRunManager({
         }),
       )
       .catch(() => undefined);
+  }
+
+  async function finishReview(run, publish = null) {
+    try {
+      if (publish !== null) {
+        await publish(run);
+      }
+      await completeReview(run);
+    } catch (error) {
+      if (run.review.pushStarted && reviewAbort(error, run)) {
+        await reconcileReviewPush(run);
+      }
+      throw error;
+    }
   }
 
   function terminate(
@@ -2627,10 +2643,10 @@ export function createClaudeRunManager({
             };
           } else if (code === 0 && run.source === "review") {
             try {
-              if (run.agent === "codex") {
-                await publishCodexReview(run);
-              }
-              await completeReview(run);
+              await finishReview(
+                run,
+                run.agent === "codex" ? publishCodexReview : null,
+              );
               terminalEvent = { type: "complete", exitCode: 0 };
             } catch {
               terminalEvent = {
@@ -2643,8 +2659,7 @@ export function createClaudeRunManager({
             (run.source === "auto" || run.source === "manual")
           ) {
             try {
-              await publishFixReview(run);
-              await completeReview(run);
+              await finishReview(run, publishFixReview);
               terminalEvent = { type: "complete", exitCode: 0 };
             } catch {
               terminalEvent = {
