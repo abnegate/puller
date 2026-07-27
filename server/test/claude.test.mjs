@@ -988,7 +988,7 @@ describe("Claude Code run manager", () => {
     expect(prepareCodex).toHaveBeenCalledWith(
       expect.objectContaining({
         purpose: "fix",
-        target: "/trusted/workspace",
+        target: "/trusted/auto/owner-repo-7",
       }),
     );
     expect(context.spawn).toHaveBeenCalledWith(
@@ -1022,6 +1022,15 @@ describe("Claude Code run manager", () => {
     expect(output.events.at(-1)).toEqual({ type: "complete", exitCode: 0 });
     expect(cleanup).toHaveBeenCalledOnce();
     expect(context.createTemporary).not.toHaveBeenCalled();
+    expect(context.resolver.resolve).not.toHaveBeenCalled();
+    expect(context.resolver.resolveReview).toHaveBeenCalledOnce();
+    expect(context.loadReviewAuthorization).toHaveBeenCalledTimes(6);
+    expect(
+      context.git.mock.calls.some(([, arguments_]) =>
+        arguments_.includes("push"),
+      ),
+    ).toBe(true);
+    expect(context.resolver.verifyReview).toHaveBeenCalledOnce();
   });
 
   it("handles a synchronous Codex stdin error after installing its listener", async () => {
@@ -1108,7 +1117,7 @@ describe("Claude Code run manager", () => {
     expect(cleanup).toHaveBeenCalledOnce();
   });
 
-  it("refreshes GitHub, resolves locally, spawns shell-free, and normalizes streaming events", async () => {
+  it("authorizes an isolated manual workspace, spawns shell-free, and lets Puller publish the result", async () => {
     const context = manager();
     const output = channel();
     const run = await context.value.start(input, output.value);
@@ -1118,19 +1127,27 @@ describe("Claude Code run manager", () => {
       number: 7,
       repository: "owner/repo",
     });
-    expect(context.resolver.resolve).toHaveBeenCalledWith(input);
+    expect(context.resolver.resolve).not.toHaveBeenCalled();
+    expect(context.resolver.resolveReview).toHaveBeenCalledWith({
+      expectedHeadRefOid: SHA,
+      headRefName: "fix/auto",
+      number: 7,
+      repository: "owner/repo",
+      signal: expect.any(AbortSignal),
+    });
+    expect(context.loadReviewAuthorization).toHaveBeenCalledTimes(2);
     expect(context.spawn).toHaveBeenCalledOnce();
     expect(context.spawn.mock.calls[0][0]).toBe("claude");
     expect(context.spawn.mock.calls[0][1]).toEqual(
       claudeArguments(
         buildPrompt(pull(), input.message),
-        "/trusted/workspace",
+        "/trusted/auto/owner-repo-7",
         "/private/tmp/puller-fix-run",
         ENVIRONMENT,
       ),
     );
     expect(context.spawn.mock.calls[0][2]).toMatchObject({
-      cwd: "/trusted/workspace",
+      cwd: "/trusted/auto/owner-repo-7",
       detached: true,
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
@@ -1159,7 +1176,7 @@ describe("Claude Code run manager", () => {
     context.child.stdout.write("not json\n");
     context.child.stdout.write('{"type":"system","subtype":"init"}\n');
     context.child.stdout.write(
-      '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Edited /trusted/workspace/src/a.js ghp_abcdefghijklmnop"}}}\n',
+      '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Edited /trusted/auto/owner-repo-7/src/a.js ghp_abcdefghijklmnop"}}}\n',
     );
     context.child.stdout.write(
       '{"type":"assistant","message":{"content":[{"type":"text","text":"duplicate"}]}}\n',
@@ -1192,6 +1209,32 @@ describe("Claude Code run manager", () => {
     expect(context.removeTemporary).toHaveBeenCalledWith(
       "/private/tmp/puller-fix-run",
     );
+    expect(context.loadReviewAuthorization).toHaveBeenCalledTimes(6);
+    expect(
+      context.git.mock.calls.map(([, arguments_]) =>
+        arguments_.slice(arguments_.indexOf("-C") + 2),
+      ),
+    ).toEqual([
+      ["rev-parse", "--verify", "HEAD"],
+      ["rev-parse", "--verify", "HEAD"],
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+      ["add", "--all"],
+      [
+        "-c",
+        "commit.gpgSign=false",
+        "-c",
+        "user.name=Puller",
+        "-c",
+        "user.email=puller@localhost",
+        "commit",
+        "--no-verify",
+        "-m",
+        "fix: address pull request blockers",
+      ],
+      ["push", "--no-verify", "origin", "HEAD:refs/heads/fix/auto"],
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+    ]);
+    expect(context.resolver.verifyReview).toHaveBeenCalledOnce();
   });
 
   it("normalizes blank instructions and spawns with the default readiness task", async () => {
@@ -1199,9 +1242,13 @@ describe("Claude Code run manager", () => {
     const blank = { ...input, message: " \n\t " };
     const run = await context.value.start(blank, channel().value);
 
-    expect(context.resolver.resolve).toHaveBeenCalledWith({
-      ...blank,
-      message: "",
+    expect(context.resolver.resolve).not.toHaveBeenCalled();
+    expect(context.resolver.resolveReview).toHaveBeenCalledWith({
+      expectedHeadRefOid: SHA,
+      headRefName: "fix/auto",
+      number: 7,
+      repository: "owner/repo",
+      signal: expect.any(AbortSignal),
     });
     const args = context.spawn.mock.calls[0][1];
     const prompt = args.at(-1);
@@ -1730,6 +1777,184 @@ describe("Claude Code run manager", () => {
       context.value.start(input, channel().value),
     ).rejects.toMatchObject({ code: "head_changed" });
     expect(context.spawn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "incomplete authorization",
+      { complete: false },
+      "review_proof_incomplete",
+      503,
+    ],
+    [
+      "a closed or unauthored pull request",
+      autoAuthorization({}, SHA, {
+        authored: false,
+        available: false,
+        open: false,
+        state: "CLOSED",
+      }),
+      "review_pull_unavailable",
+      404,
+    ],
+    [
+      "a fork pull request",
+      autoAuthorization({}, SHA, {
+        headRepository: "fork/repo",
+        isCrossRepository: true,
+      }),
+      "review_fork_unsupported",
+      409,
+    ],
+    [
+      "insufficient push permission",
+      autoAuthorization({}, SHA, { viewerPermission: "READ" }),
+      "review_permission_denied",
+      403,
+    ],
+    [
+      "a changed pull request head",
+      autoAuthorization({}, OTHER_SHA),
+      "review_identity_changed",
+      409,
+    ],
+  ])(
+    "rejects manual fixes for %s before creating a worktree",
+    async (_name, authorization, code, status) => {
+      const context = manager({
+        loadReviewAuthorization: vi.fn(async () => authorization),
+      });
+
+      await expect(
+        context.value.start(input, channel().value),
+      ).rejects.toMatchObject({ code, status });
+
+      expect(context.resolver.resolve).not.toHaveBeenCalled();
+      expect(context.resolver.resolveReview).not.toHaveBeenCalled();
+      expect(context.spawn).not.toHaveBeenCalled();
+      expect(context.value.activeCount()).toBe(0);
+      expect(context.value.activeWorkspaceCount()).toBe(0);
+    },
+  );
+
+  it("cleans a manual workspace and releases its reservation when authorization changes after creation", async () => {
+    const cleanup = vi.fn(async () => undefined);
+    const coordinator = createRunCoordinator({ limit: 1 });
+    const loadReviewAuthorization = vi
+      .fn()
+      .mockResolvedValueOnce(autoAuthorization())
+      .mockResolvedValueOnce(
+        autoAuthorization({}, SHA, { viewerLogin: "other-viewer" }),
+      )
+      .mockResolvedValue(autoAuthorization());
+    const context = manager({
+      coordinator,
+      loadReviewAuthorization,
+      resolver: {
+        resolveReview: vi.fn(async () => ({
+          branch: "fix/auto",
+          cleanup,
+          cwd: "/trusted/manual/owner-repo-7",
+          headRefOid: SHA,
+          remote: "origin",
+          repository: "owner/repo",
+        })),
+      },
+    });
+
+    await expect(
+      context.value.start(input, channel().value),
+    ).rejects.toMatchObject({ code: "review_identity_changed", status: 409 });
+
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(context.resolver.resolve).not.toHaveBeenCalled();
+    expect(context.spawn).not.toHaveBeenCalled();
+    expect(context.value.activeCount()).toBe(0);
+    expect(context.value.activeWorkspaceCount()).toBe(0);
+    expect(coordinator.activeCount()).toBe(0);
+    expect(coordinator.activeWorkspaceCount()).toBe(0);
+
+    const retry = await context.value.start(input, channel().value);
+    context.child.emit("close", 1, null);
+    await retry.done;
+    expect(cleanup).toHaveBeenCalledTimes(2);
+    expect(coordinator.activeCount()).toBe(0);
+    expect(coordinator.activeWorkspaceCount()).toBe(0);
+  });
+
+  it("reports a manual-specific verification failure when the fix makes no changes", async () => {
+    const cleanup = vi.fn(async () => undefined);
+    const context = manager({
+      git: vi.fn(async (_command, arguments_) => ({
+        stderr: "",
+        stdout: arguments_.includes("rev-parse") ? `${SHA}\n` : "",
+      })),
+      resolver: {
+        resolveReview: vi.fn(async () => ({
+          branch: "fix/auto",
+          cleanup,
+          cwd: "/trusted/manual/owner-repo-7",
+          headRefOid: SHA,
+          remote: "origin",
+          repository: "owner/repo",
+        })),
+      },
+    });
+    const output = channel();
+    const run = await context.value.start(input, output.value);
+
+    context.child.emit("close", 0, null);
+    await run.done;
+
+    expect(output.events.at(-1)).toEqual({
+      message:
+        "The fix agent finished, but Puller could not safely publish and verify its isolated changes. Refresh the pull request before retrying.",
+      type: "error",
+    });
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(context.value.activeCount()).toBe(0);
+    expect(context.value.activeWorkspaceCount()).toBe(0);
+  });
+
+  it("cleans and releases a manual workspace when process startup fails so retry succeeds", async () => {
+    const cleanup = vi.fn(async () => undefined);
+    const child = fakeChild(114);
+    const spawn = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error("spawn failed");
+      })
+      .mockImplementationOnce(() => child);
+    const coordinator = createRunCoordinator({ limit: 1 });
+    const context = manager({
+      coordinator,
+      loadReviewAuthorization: vi.fn(async () => autoAuthorization()),
+      resolver: {
+        resolveReview: vi.fn(async () => ({
+          branch: "fix/auto",
+          cleanup,
+          cwd: "/trusted/manual/owner-repo-7",
+          headRefOid: SHA,
+          remote: "origin",
+          repository: "owner/repo",
+        })),
+      },
+      spawn,
+    });
+
+    await expect(context.value.start(input, channel().value)).rejects.toThrow(
+      "spawn failed",
+    );
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(coordinator.activeCount()).toBe(0);
+    expect(coordinator.activeWorkspaceCount()).toBe(0);
+
+    const retry = await context.value.start(input, channel().value);
+    child.emit("close", 1, null);
+    await retry.done;
+    expect(cleanup).toHaveBeenCalledTimes(2);
+    expect(coordinator.activeCount()).toBe(0);
+    expect(coordinator.activeWorkspaceCount()).toBe(0);
   });
 
   it("enforces one run per pull and five globally across pending validation", async () => {
@@ -2596,7 +2821,17 @@ describe("Claude Code run manager", () => {
         snapshot(null, { ready: [], notReady: [firstPull, secondPull] }),
       ),
     };
-    const resolver = { resolve: vi.fn(async () => "/same/workspace") };
+    const resolver = {
+      resolve: vi.fn(async () => "/legacy/workspace"),
+      resolveReview: vi.fn(async ({ repository }) => ({
+        branch: "fix/auto",
+        cleanup: vi.fn(async () => undefined),
+        cwd: "/same/workspace",
+        headRefOid: SHA,
+        remote: "origin",
+        repository,
+      })),
+    };
     const child = fakeChild(103);
     const spawn = vi
       .fn()
@@ -2605,7 +2840,14 @@ describe("Claude Code run manager", () => {
         throw new Error("spawn failed");
       })
       .mockImplementationOnce(() => fakeChild(104));
-    const context = manager({ cache, resolver, spawn });
+    const context = manager({
+      cache,
+      loadReviewAuthorization: vi.fn(async ({ number, repository }) =>
+        autoAuthorization({ number, repository }),
+      ),
+      resolver,
+      spawn,
+    });
 
     const settled = await Promise.allSettled([
       context.value.start(input, channel().value),
@@ -2621,7 +2863,7 @@ describe("Claude Code run manager", () => {
     });
     expect(context.value.activeWorkspaceCount()).toBe(1);
 
-    child.emit("close", 0, null);
+    child.emit("close", 1, null);
     await settled.find(({ status }) => status === "fulfilled").value.done;
     await expect(
       context.value.start(secondInput, channel().value),
@@ -2630,7 +2872,7 @@ describe("Claude Code run manager", () => {
 
     const retry = await context.value.start(secondInput, channel().value);
     expect(context.value.activeWorkspaceCount()).toBe(1);
-    spawn.mock.results.at(-1).value.emit("close", 0, null);
+    spawn.mock.results.at(-1).value.emit("close", 1, null);
     await retry.done;
     expect(context.value.activeWorkspaceCount()).toBe(0);
   });
@@ -2648,8 +2890,10 @@ describe("Claude Code run manager", () => {
         },
       })}\n`;
 
-    context.child.stdout.write(delta(`${"visible ".repeat(8)}/trusted/work`));
-    context.child.stdout.write(delta("space/src/index.js ghp_abcdef"));
+    context.child.stdout.write(
+      delta(`${"visible ".repeat(8)}/trusted/auto/owner-`),
+    );
+    context.child.stdout.write(delta("repo-7/src/index.js ghp_abcdef"));
     context.child.stdout.write(delta("ghijklmnop"));
     expect(output.events.some(({ type }) => type === "text")).toBe(true);
     context.child.emit("close", 0, null);
@@ -2660,7 +2904,7 @@ describe("Claude Code run manager", () => {
       .map((event) => event.text)
       .join("");
     expect(text).toContain("[workspace]/src/index.js [secret]");
-    expect(text).not.toContain("/trusted/workspace");
+    expect(text).not.toContain("/trusted/auto/owner-repo-7");
     expect(text).not.toContain("ghp_abcdefghijklmnop");
   });
 

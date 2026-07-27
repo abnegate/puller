@@ -49,8 +49,14 @@ const REVIEW_CLEANUP_FAILURE =
   "The isolated review workspace could not be removed. The run reservation was released; inspect Puller's local review workspace storage.";
 const REVIEW_CLEANUP_RUN_FAILURE =
   "The agent finished, but Puller could not remove its isolated review workspace. Its push may have succeeded. The run reservation was released.";
+const MANUAL_CLEANUP_FAILURE =
+  "The isolated fix workspace could not be removed. The run reservation was released; inspect Puller's local workspace storage.";
+const MANUAL_CLEANUP_RUN_FAILURE =
+  "The fix agent finished, but Puller could not remove its isolated workspace. Its push may have succeeded. The run reservation was released.";
 const AUTO_VERIFICATION_FAILURE =
   "The Auto agent finished, but Puller could not safely publish and verify its isolated changes. Refresh the pull request before retrying.";
+const MANUAL_VERIFICATION_FAILURE =
+  "The fix agent finished, but Puller could not safely publish and verify its isolated changes. Refresh the pull request before retrying.";
 const REVIEW_SSH_COMMAND =
   "ssh -oBatchMode=yes -oConnectTimeout=15 -oStrictHostKeyChecking=yes";
 const REVIEW_VERIFICATION_FAILURE =
@@ -327,11 +333,13 @@ function byteLength(value) {
   return Buffer.byteLength(value, "utf8");
 }
 
-function reviewAbortError() {
+function reviewAbortError(source = "review") {
+  const label =
+    source === "manual" ? "fix" : source === "auto" ? "Auto" : "review";
   return new ActionError(
     499,
     "client_closed",
-    "The request closed before the review run completed.",
+    `The request closed before the ${label} run completed.`,
   );
 }
 
@@ -1461,7 +1469,9 @@ export function createClaudeRunManager({
     }
   }
 
-  function reviewWorkspaceCleanup(workspace) {
+  function reviewWorkspaceCleanup(workspace, source = "review") {
+    const failure =
+      source === "manual" ? MANUAL_CLEANUP_FAILURE : REVIEW_CLEANUP_FAILURE;
     if (typeof workspace?.cleanup !== "function") {
       throw new ActionError(
         500,
@@ -1486,7 +1496,7 @@ export function createClaudeRunManager({
                 new ActionError(
                   500,
                   "review_workspace_cleanup_failed",
-                  REVIEW_CLEANUP_FAILURE,
+                  failure,
                 ),
               ),
             ),
@@ -1503,7 +1513,7 @@ export function createClaudeRunManager({
                   new ActionError(
                     500,
                     "review_workspace_cleanup_failed",
-                    REVIEW_CLEANUP_FAILURE,
+                    failure,
                   ),
                 ),
               ),
@@ -1750,7 +1760,8 @@ export function createClaudeRunManager({
     );
   }
 
-  async function publishAutoReview(run) {
+  async function publishFixReview(run) {
+    const automatic = run.source === "auto";
     try {
       const initial = (
         await reviewGit(run, ["rev-parse", "--verify", "HEAD"])
@@ -1761,7 +1772,7 @@ export function createClaudeRunManager({
         throw new ActionError(
           409,
           "review_head_changed",
-          "The Auto worktree head changed outside Puller's publish step.",
+          `The ${automatic ? "Auto" : "fix"} worktree head changed outside Puller's publish step.`,
         );
       }
       const status = await reviewGit(run, [
@@ -1772,8 +1783,8 @@ export function createClaudeRunManager({
       if (String(status.stdout ?? "").trim() === "") {
         throw new ActionError(
           409,
-          "auto_unchanged",
-          "The Auto agent finished without producing a change.",
+          automatic ? "auto_unchanged" : "fix_unchanged",
+          `The ${automatic ? "Auto" : "fix"} agent finished without producing a change.`,
         );
       }
 
@@ -1810,8 +1821,8 @@ export function createClaudeRunManager({
       if (String(clean.stdout ?? "").trim() !== "") {
         throw new ActionError(
           500,
-          "auto_publish_failed",
-          "The Auto worktree was not clean after Puller published it.",
+          automatic ? "auto_publish_failed" : "fix_publish_failed",
+          `The ${automatic ? "Auto" : "fix"} worktree was not clean after Puller published it.`,
         );
       }
     } catch (error) {
@@ -1992,10 +2003,11 @@ export function createClaudeRunManager({
 
   function stop(run, event) {
     if (run.reviewController && !run.reviewController.signal.aborted) {
+      const prefix = run.source === "manual" ? "fix" : "review";
       run.reviewController.abort(
         new ActionError(
           event.type === "limit" ? 504 : 499,
-          event.type === "limit" ? "review_timeout" : "review_cancelled",
+          event.type === "limit" ? `${prefix}_timeout` : `${prefix}_cancelled`,
           event.message,
         ),
       );
@@ -2084,7 +2096,8 @@ export function createClaudeRunManager({
     const input = validateRunInput(value, messageLimit);
     const label = agentLabel(input.agent);
     const source = input.source ?? "manual";
-    const isolated = source === "review" || source === "auto";
+    const isolated =
+      source === "review" || source === "auto" || source === "manual";
     if (
       isolated &&
       ((source === "review" &&
@@ -2095,8 +2108,12 @@ export function createClaudeRunManager({
     ) {
       throw new ActionError(
         503,
-        "review_runs_unavailable",
-        "Review tasks are unavailable.",
+        source === "manual"
+          ? "fix_runs_unavailable"
+          : "review_runs_unavailable",
+        source === "manual"
+          ? "Fix tasks are unavailable."
+          : "Review tasks are unavailable.",
       );
     }
     const pullKey = `${input.repository.toLowerCase()}#${input.number}`;
@@ -2178,7 +2195,7 @@ export function createClaudeRunManager({
     let activeReviewRun = null;
     const closeReview = () => {
       if (reviewController && !reviewController.signal.aborted) {
-        reviewController.abort(reviewAbortError());
+        reviewController.abort(reviewAbortError(source));
       }
       if (activeReviewRun && !activeReviewRun.closed) {
         stop(activeReviewRun, {
@@ -2194,8 +2211,12 @@ export function createClaudeRunManager({
             reviewController.abort(
               new ActionError(
                 504,
-                "review_preflight_timeout",
-                "The review run preflight timed out.",
+                source === "manual"
+                  ? "fix_preflight_timeout"
+                  : "review_preflight_timeout",
+                source === "manual"
+                  ? "The fix run preflight timed out."
+                  : "The review run preflight timed out.",
               ),
             ),
           reviewPreflightTimeout,
@@ -2268,7 +2289,7 @@ export function createClaudeRunManager({
             }),
           signal,
         );
-        releaseReviewWorkspace = reviewWorkspaceCleanup(workspace);
+        releaseReviewWorkspace = reviewWorkspaceCleanup(workspace, source);
         const authorization = validateReviewReauthorization(
           diffAuthorization,
           await loadAuthorization(),
@@ -2296,69 +2317,67 @@ export function createClaudeRunManager({
         auto = source === "auto" ? freshAutoPull(pull, input) : null;
         if (auto === null) {
           pull = freshManualPull(pull, input);
-          cwd = await resolver.resolve(input);
-        } else {
-          if (!SHA.test(pull.baseRefOid ?? "")) {
-            throw new ActionError(
-              409,
-              "snapshot_incomplete",
-              "A complete fresh pull request base is required for Auto.",
-            );
-          }
-          const signal = reviewController.signal;
-          const authorizationInput = {
-            ...input,
-            expectedBaseRefOid: pull.baseRefOid,
-          };
-          const loadAuthorization = () =>
-            waitForReview(
-              () =>
-                loadReviewAuthorization(
-                  {
-                    number: input.number,
-                    repository: input.repository,
-                  },
-                  signal,
-                ),
-              signal,
-            );
-          const initialAuthorization = validateReviewAuthorization(
-            await loadAuthorization(),
-            authorizationInput,
-            input.expectedHeadRefOid,
-          );
-          const workspace = await waitForReview(
-            () =>
-              resolver.resolveReview({
-                expectedHeadRefOid: initialAuthorization.headRefOid,
-                headRefName: initialAuthorization.headRefName,
-                number: initialAuthorization.number,
-                repository: initialAuthorization.repository,
-                signal,
-              }),
-            signal,
-          );
-          releaseReviewWorkspace = reviewWorkspaceCleanup(workspace);
-          const authorization = validateReviewReauthorization(
-            initialAuthorization,
-            await loadAuthorization(),
-            authorizationInput,
-          );
-          await waitForReview(
-            () =>
-              proveReviewHead(workspace.cwd, authorization.headRefOid, signal),
-            signal,
-          );
-          review = {
-            authorization,
-            cleanup: releaseReviewWorkspace,
-            input: authorizationInput,
-            pushStarted: false,
-            reconciliation: null,
-            workspace,
-          };
-          cwd = workspace.cwd;
         }
+        if (!SHA.test(pull.baseRefOid ?? "")) {
+          throw new ActionError(
+            409,
+            "snapshot_incomplete",
+            `A complete fresh pull request base is required for ${source === "auto" ? "Auto" : "manual fixes"}.`,
+          );
+        }
+        const signal = reviewController.signal;
+        const authorizationInput = {
+          ...input,
+          expectedBaseRefOid: pull.baseRefOid,
+        };
+        const loadAuthorization = () =>
+          waitForReview(
+            () =>
+              loadReviewAuthorization(
+                {
+                  number: input.number,
+                  repository: input.repository,
+                },
+                signal,
+              ),
+            signal,
+          );
+        const initialAuthorization = validateReviewAuthorization(
+          await loadAuthorization(),
+          authorizationInput,
+          input.expectedHeadRefOid,
+        );
+        const workspace = await waitForReview(
+          () =>
+            resolver.resolveReview({
+              expectedHeadRefOid: initialAuthorization.headRefOid,
+              headRefName: initialAuthorization.headRefName,
+              number: initialAuthorization.number,
+              repository: initialAuthorization.repository,
+              signal,
+            }),
+          signal,
+        );
+        releaseReviewWorkspace = reviewWorkspaceCleanup(workspace, source);
+        const authorization = validateReviewReauthorization(
+          initialAuthorization,
+          await loadAuthorization(),
+          authorizationInput,
+        );
+        await waitForReview(
+          () =>
+            proveReviewHead(workspace.cwd, authorization.headRefOid, signal),
+          signal,
+        );
+        review = {
+          authorization,
+          cleanup: releaseReviewWorkspace,
+          input: authorizationInput,
+          pushStarted: false,
+          reconciliation: null,
+          workspace,
+        };
+        cwd = workspace.cwd;
       }
       workspaceKey = await canonicalize(cwd);
       if (stopping || channel.closed?.() || reviewController?.signal.aborted) {
@@ -2616,15 +2635,21 @@ export function createClaudeRunManager({
                 message: REVIEW_VERIFICATION_FAILURE,
               };
             }
-          } else if (code === 0 && run.source === "auto") {
+          } else if (
+            code === 0 &&
+            (run.source === "auto" || run.source === "manual")
+          ) {
             try {
-              await publishAutoReview(run);
+              await publishFixReview(run);
               await completeReview(run);
               terminalEvent = { type: "complete", exitCode: 0 };
             } catch {
               terminalEvent = {
                 type: "error",
-                message: AUTO_VERIFICATION_FAILURE,
+                message:
+                  run.source === "auto"
+                    ? AUTO_VERIFICATION_FAILURE
+                    : MANUAL_VERIFICATION_FAILURE,
               };
             }
           } else if (code === 0) {
@@ -2638,7 +2663,11 @@ export function createClaudeRunManager({
             };
           }
         }
-        if (run.source === "review" || run.source === "auto") {
+        if (
+          run.source === "review" ||
+          run.source === "auto" ||
+          run.source === "manual"
+        ) {
           try {
             await run.review.cleanup();
           } catch (error) {
@@ -2648,7 +2677,10 @@ export function createClaudeRunManager({
             } else if (terminalEvent?.type === "complete") {
               terminalEvent = {
                 type: "error",
-                message: REVIEW_CLEANUP_RUN_FAILURE,
+                message:
+                  run.source === "manual"
+                    ? MANUAL_CLEANUP_RUN_FAILURE
+                    : REVIEW_CLEANUP_RUN_FAILURE,
               };
             } else {
               write(run, {
