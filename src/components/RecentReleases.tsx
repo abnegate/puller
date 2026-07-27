@@ -1,4 +1,12 @@
-import { useEffect, useId, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import {
   ChevronDown,
   ChevronLeft,
@@ -15,6 +23,11 @@ import {
 } from "lucide-react";
 
 import { agentLabel } from "@/agent";
+import {
+  keyboardEventBlocked,
+  RELEASE_FOCUS_REQUEST,
+  type ReleaseFocusRequest,
+} from "@/keyboard";
 import type {
   Agent,
   RecentRelease,
@@ -68,6 +81,39 @@ type RecentReleasesProps = {
 };
 
 export const PAGE_SIZE = 20;
+
+type ReleaseNavigation = "first" | "last" | "next" | "previous";
+
+type ReleaseFocusTarget = {
+  identity: string;
+  revision: number;
+};
+
+const releaseElement = (
+  identity: string,
+  selector: "[data-release-disclosure]" | "[data-release-identity]",
+): HTMLElement | null =>
+  [...document.querySelectorAll<HTMLElement>(selector)].find((element) => {
+    const value =
+      selector === "[data-release-disclosure]"
+        ? element.dataset.releaseDisclosure
+        : element.dataset.releaseIdentity;
+    return value === identity;
+  }) ?? null;
+
+const releasedPullElement = (
+  identity: string,
+  index: number,
+): HTMLElement | null =>
+  [
+    ...document.querySelectorAll<HTMLElement>(
+      "[data-release-pull][data-release-identity]",
+    ),
+  ].find(
+    (element) =>
+      element.dataset.releaseIdentity === identity &&
+      Number(element.dataset.releasePull) === index,
+  ) ?? null;
 
 const statusLabels: Record<VerificationStatus, string> = {
   cancelled: "Cancelled",
@@ -510,27 +556,102 @@ const verifyAllDisabledReason = (
 
 function ReleasedPullRow({
   pull,
+  pullIndex,
   release,
+  releaseIdentity,
   run,
   batchActive,
   directActive,
   cancel,
+  onCollapse,
+  onFocusRelease,
+  onFocusPull,
+  onNavigateRelease,
   start,
 }: {
   cancel: (key: string) => Promise<void>;
   batchActive: boolean;
   directActive: boolean;
+  onCollapse: () => void;
+  onFocusPull: (index: number) => void;
+  onFocusRelease: () => void;
+  onNavigateRelease: (navigation: ReleaseNavigation) => void;
   pull: ReleasedPull;
+  pullIndex: number;
   release: RecentRelease;
+  releaseIdentity: string;
   run: VerificationRunState;
   start: (release: RecentRelease, pull: ReleasedPull) => Promise<void>;
 }) {
   const key = verificationKey(release, pull);
   const active = isVerificationActive(run);
   const supported = canVerifyRelease(release, pull);
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLLIElement>): void => {
+    const repeated = event.key === "ArrowDown" || event.key === "ArrowUp";
+    if (
+      keyboardEventBlocked(event.nativeEvent, document, {
+        allowRepeat: repeated,
+      }) ||
+      event.shiftKey
+    ) {
+      return;
+    }
+
+    const wrapperFocused = event.target === event.currentTarget;
+    const owned =
+      event.key === "ArrowDown" ||
+      event.key === "ArrowLeft" ||
+      event.key === "ArrowUp" ||
+      event.key === "End" ||
+      event.key === "Escape" ||
+      event.key === "Home" ||
+      event.key === "j" ||
+      event.key === "k" ||
+      (event.key === "Enter" && wrapperFocused);
+    if (!owned) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (event.key === "ArrowLeft" || event.key === "Escape") {
+      onCollapse();
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      if (pullIndex === 0) onFocusRelease();
+      else onFocusPull(pullIndex - 1);
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      if (pullIndex === release.pulls.length - 1) onNavigateRelease("next");
+      else onFocusPull(pullIndex + 1);
+      return;
+    }
+    if (event.key === "j") {
+      onNavigateRelease("next");
+      return;
+    }
+    if (event.key === "k") {
+      onNavigateRelease("previous");
+      return;
+    }
+    if (event.key === "Home") {
+      onNavigateRelease("first");
+      return;
+    }
+    if (event.key === "End") onNavigateRelease("last");
+  };
 
   return (
-    <li className="px-3 py-2.5">
+    <li
+      aria-keyshortcuts="Enter ArrowUp ArrowDown ArrowLeft Escape j k Home End"
+      aria-label={`${pull.repository} #${pull.number}: ${pull.title}`}
+      className="rounded-md px-3 py-2.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+      data-release-identity={releaseIdentity}
+      data-release-pull={pullIndex}
+      onKeyDown={handleKeyDown}
+      tabIndex={-1}
+    >
       <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <div className="min-w-0">
           <p className="text-[11px] leading-4 text-muted-foreground">
@@ -605,10 +726,22 @@ function ReleasedPullRow({
 
 function ReleaseGroup({
   batches,
+  identity,
+  onFocus,
+  onFocusPull,
+  onNavigate,
+  onOpenChange,
+  open,
   release,
   runs,
 }: {
   batches: ReturnType<typeof useReleaseVerificationBatches>;
+  identity: string;
+  onFocus: (identity: string) => void;
+  onFocusPull: (identity: string, index: number) => void;
+  onNavigate: (identity: string, navigation: ReleaseNavigation) => void;
+  onOpenChange: (identity: string, open: boolean) => void;
+  open: boolean;
   release: RecentRelease;
   runs: ReturnType<typeof useVerificationRuns>;
 }) {
@@ -625,7 +758,7 @@ function ReleaseGroup({
   );
   const disabledReasonId = useId();
   const pullListId = useId();
-  const [open, setOpen] = useState(false);
+  const disclosure = useRef<HTMLButtonElement | null>(null);
   const [individual, setIndividual] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
@@ -644,9 +777,80 @@ function ReleaseGroup({
     setIndividual((current) => new Set(current).add(key));
     await runs.start(selectedRelease, pull);
   };
+  const focusDisclosure = (): void => {
+    disclosure.current?.focus({ preventScroll: true });
+  };
+  const collapseToDisclosure = (): void => {
+    onOpenChange(identity, false);
+    focusDisclosure();
+  };
+  const handleDisclosureKeyDown = (
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+  ): void => {
+    const repeated = event.key === "j" || event.key === "k";
+    if (
+      keyboardEventBlocked(event.nativeEvent, document, {
+        allowRepeat: repeated,
+      }) ||
+      event.shiftKey
+    ) {
+      return;
+    }
+
+    const owned =
+      event.key === " " ||
+      event.key === "ArrowLeft" ||
+      event.key === "ArrowRight" ||
+      event.key === "End" ||
+      event.key === "Enter" ||
+      event.key === "Home" ||
+      event.key === "j" ||
+      event.key === "k" ||
+      (event.key === "ArrowDown" && open);
+    if (!owned) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (
+      event.key === " " ||
+      event.key === "ArrowRight" ||
+      event.key === "Enter"
+    ) {
+      onOpenChange(identity, true);
+      return;
+    }
+    if (event.key === "ArrowLeft") {
+      onOpenChange(identity, false);
+      focusDisclosure();
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      onFocusPull(identity, 0);
+      return;
+    }
+    if (event.key === "j") {
+      onNavigate(identity, "next");
+      return;
+    }
+    if (event.key === "k") {
+      onNavigate(identity, "previous");
+      return;
+    }
+    if (event.key === "Home") {
+      onNavigate(identity, "first");
+      return;
+    }
+    if (event.key === "End") onNavigate(identity, "last");
+  };
 
   return (
-    <Collapsible className="min-w-0 w-full" onOpenChange={setOpen} open={open}>
+    <Collapsible
+      className="min-w-0 w-full"
+      data-release-identity={identity}
+      onOpenChange={(next) => onOpenChange(identity, next)}
+      open={open}
+    >
       <Card className="min-w-0 w-full gap-0 overflow-hidden py-0" size="sm">
         <CardHeader className="gap-2 px-3 py-2.5">
           <div className="min-w-0 overflow-hidden">
@@ -736,7 +940,13 @@ function ReleaseGroup({
               <CollapsibleTrigger asChild>
                 <Button
                   aria-controls={pullListId}
+                  aria-keyshortcuts="Enter Space ArrowRight ArrowLeft ArrowDown j k Home End"
                   aria-label={`${open ? "Hide" : "Show"} ${pullCount} ${pullLabel} in ${release.tag}`}
+                  className="focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                  data-release-disclosure={identity}
+                  onFocus={() => onFocus(identity)}
+                  onKeyDown={handleDisclosureKeyDown}
+                  ref={disclosure}
                   size="icon-sm"
                   title={`${open ? "Hide" : "Show"} ${pullLabel}`}
                   type="button"
@@ -779,7 +989,7 @@ function ReleaseGroup({
               aria-label={`Pull requests in ${release.name}`}
               className="min-w-0 w-full divide-y"
             >
-              {release.pulls.map((pull) =>
+              {release.pulls.map((pull, pullIndex) =>
                 (() => {
                   const key = verificationKey(release, pull);
                   const direct = runs.states.get(key);
@@ -792,8 +1002,16 @@ function ReleaseGroup({
                       cancel={runs.cancel}
                       directActive={activeDirect}
                       key={pull.url}
+                      onCollapse={collapseToDisclosure}
+                      onFocusPull={(index) => onFocusPull(identity, index)}
+                      onFocusRelease={focusDisclosure}
+                      onNavigateRelease={(navigation) =>
+                        onNavigate(identity, navigation)
+                      }
                       pull={pull}
+                      pullIndex={pullIndex}
                       release={release}
+                      releaseIdentity={identity}
                       run={
                         activeDirect || individual.has(key)
                           ? (direct ?? IDLE_VERIFICATION_STATE)
@@ -832,6 +1050,18 @@ export default function RecentReleases({
 }: RecentReleasesProps) {
   const releases = data?.releases ?? [];
   const [page, setPage] = useState(1);
+  const [openReleases, setOpenReleases] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [focusRevision, setFocusRevision] = useState(0);
+  const releasesRef = useRef(releases);
+  const previousReleases = useRef(releases);
+  const selectedRelease = useRef<string | null>(null);
+  const releaseFocusActive = useRef(false);
+  const focusRequest = useRef<ReleaseFocusTarget | null>(null);
+  const focusGeneration = useRef(0);
+  const externalGeneration = useRef(0);
+  releasesRef.current = releases;
   const pageCount = Math.max(1, Math.ceil(releases.length / PAGE_SIZE));
   const currentPage = Math.min(page, pageCount);
   const paginated =
@@ -862,10 +1092,192 @@ export default function RecentReleases({
   const hasPartialHistory =
     warnings.length > 0 || (data?.partial === true && !suppressedWarningsOnly);
 
+  const focusRelease = useCallback((identity: string): void => {
+    const index = releasesRef.current.findIndex(
+      (release) =>
+        releaseVerificationKey(release) === identity &&
+        release.pulls.length > 0,
+    );
+    if (index < 0) return;
+
+    selectedRelease.current = identity;
+    releaseFocusActive.current = true;
+    const revision = ++focusGeneration.current;
+    focusRequest.current = { identity, revision };
+    setPage(Math.floor(index / PAGE_SIZE) + 1);
+    setFocusRevision(revision);
+  }, []);
+
+  const focusPull = useCallback((identity: string, index: number): void => {
+    selectedRelease.current = identity;
+    releaseFocusActive.current = true;
+    const element = releasedPullElement(identity, index);
+    if (element === null) return;
+    element.focus({ preventScroll: true });
+    element.scrollIntoView?.({ block: "nearest" });
+  }, []);
+
+  const navigateRelease = useCallback(
+    (identity: string, navigation: ReleaseNavigation): void => {
+      const candidates = releasesRef.current
+        .filter((release) => release.pulls.length > 0)
+        .map(releaseVerificationKey);
+      if (candidates.length === 0) return;
+      const index = candidates.indexOf(identity);
+      let destination: string;
+      if (navigation === "first") destination = candidates[0]!;
+      else if (navigation === "last") destination = candidates.at(-1)!;
+      else if (navigation === "next") {
+        destination =
+          index < 0
+            ? candidates[0]!
+            : candidates[Math.min(index + 1, candidates.length - 1)]!;
+      } else {
+        destination =
+          index < 0 ? candidates.at(-1)! : candidates[Math.max(index - 1, 0)]!;
+      }
+      focusRelease(destination);
+    },
+    [focusRelease],
+  );
+
+  const setReleaseOpen = useCallback(
+    (identity: string, open: boolean): void => {
+      setOpenReleases((current) => {
+        const next = new Set(current);
+        if (open) next.add(identity);
+        else next.delete(identity);
+        return next;
+      });
+    },
+    [],
+  );
+
+  useLayoutEffect(() => {
+    const request = focusRequest.current;
+    if (request === null || request.revision !== focusRevision) return;
+    const index = releases.findIndex(
+      (release) => releaseVerificationKey(release) === request.identity,
+    );
+    if (index < 0 || currentPage !== Math.floor(index / PAGE_SIZE) + 1) return;
+
+    const element = releaseElement(
+      request.identity,
+      "[data-release-disclosure]",
+    );
+    if (element === null) return;
+    focusRequest.current = null;
+    element.focus({ preventScroll: true });
+    element.scrollIntoView?.({ block: "nearest" });
+  }, [currentPage, focusRevision, releases]);
+
+  useEffect(() => {
+    const handleFocus = (event: FocusEvent): void => {
+      const element = event.target instanceof Element ? event.target : null;
+      const owner = element?.closest<HTMLElement>("[data-release-identity]");
+      if (owner?.dataset.releaseIdentity) {
+        selectedRelease.current = owner.dataset.releaseIdentity;
+        releaseFocusActive.current = true;
+        return;
+      }
+      if (element !== document.body) releaseFocusActive.current = false;
+    };
+    document.addEventListener("focusin", handleFocus);
+    return () => document.removeEventListener("focusin", handleFocus);
+  }, []);
+
+  useEffect(() => {
+    const handleReleaseFocus = (event: Event): void => {
+      const generation = (event as CustomEvent<ReleaseFocusRequest>).detail
+        ?.generation;
+      if (
+        typeof generation !== "number" ||
+        generation <= externalGeneration.current
+      ) {
+        return;
+      }
+      externalGeneration.current = generation;
+
+      const candidates = releasesRef.current
+        .filter((release) => release.pulls.length > 0)
+        .map(releaseVerificationKey);
+      const remembered = selectedRelease.current;
+      const destination =
+        remembered !== null && candidates.includes(remembered)
+          ? remembered
+          : candidates[0];
+      if (destination) focusRelease(destination);
+    };
+    document.addEventListener(RELEASE_FOCUS_REQUEST, handleReleaseFocus);
+    return () =>
+      document.removeEventListener(RELEASE_FOCUS_REQUEST, handleReleaseFocus);
+  }, [focusRelease]);
+
+  useLayoutEffect(() => {
+    const previous = previousReleases.current;
+    previousReleases.current = releases;
+    if (!releaseFocusActive.current) return;
+
+    const selected = selectedRelease.current;
+    if (selected === null) return;
+    const current = releases.find(
+      (release) =>
+        releaseVerificationKey(release) === selected &&
+        release.pulls.length > 0,
+    );
+    if (current) {
+      const activeOwner =
+        document.activeElement instanceof Element
+          ? document.activeElement.closest<HTMLElement>(
+              "[data-release-identity]",
+            )
+          : null;
+      if (activeOwner?.dataset.releaseIdentity !== selected) {
+        focusRelease(selected);
+      }
+      return;
+    }
+
+    const previousIdentities = previous
+      .filter((release) => release.pulls.length > 0)
+      .map(releaseVerificationKey);
+    const currentIdentities = new Set(
+      releases
+        .filter((release) => release.pulls.length > 0)
+        .map(releaseVerificationKey),
+    );
+    const index = previousIdentities.indexOf(selected);
+    if (index < 0) return;
+    const destination =
+      previousIdentities
+        .slice(index + 1)
+        .find((identity) => currentIdentities.has(identity)) ??
+      previousIdentities
+        .slice(0, index)
+        .reverse()
+        .find((identity) => currentIdentities.has(identity));
+
+    if (destination) focusRelease(destination);
+    else {
+      selectedRelease.current = null;
+      releaseFocusActive.current = false;
+    }
+  }, [focusRelease, releases]);
+
   useEffect(() => {
     if (data === null) return;
     setPage((current) => Math.min(current, pageCount));
   }, [data, pageCount]);
+
+  useEffect(() => {
+    const identities = new Set(releases.map(releaseVerificationKey));
+    setOpenReleases((current) => {
+      const next = new Set(
+        [...current].filter((identity) => identities.has(identity)),
+      );
+      return next.size === current.size ? current : next;
+    });
+  }, [releases]);
 
   return (
     <TooltipProvider>
@@ -1018,14 +1430,26 @@ export default function RecentReleases({
                     </Badge>
                   </header>
                   <div className="grid gap-2 pl-1">
-                    {date.releases.map((release) => (
-                      <ReleaseGroup
-                        batches={batches}
-                        key={releaseVerificationKey(release)}
-                        release={release}
-                        runs={runs}
-                      />
-                    ))}
+                    {date.releases.map((release) => {
+                      const identity = releaseVerificationKey(release);
+                      return (
+                        <ReleaseGroup
+                          batches={batches}
+                          identity={identity}
+                          key={identity}
+                          onFocus={(focused) => {
+                            selectedRelease.current = focused;
+                            releaseFocusActive.current = true;
+                          }}
+                          onFocusPull={focusPull}
+                          onNavigate={navigateRelease}
+                          onOpenChange={setReleaseOpen}
+                          open={openReleases.has(identity)}
+                          release={release}
+                          runs={runs}
+                        />
+                      );
+                    })}
                   </div>
                 </section>
               ))}

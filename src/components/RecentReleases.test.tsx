@@ -23,6 +23,7 @@ import type {
   VerificationRunEvent,
   VerificationRunRequest,
 } from "@/types";
+import { RELEASE_FOCUS_REQUEST, type ReleaseFocusRequest } from "@/keyboard";
 import RecentReleases, { groupReleasesByDate } from "./RecentReleases";
 
 const api = vi.hoisted(() => ({
@@ -152,6 +153,14 @@ const expandRelease = (tag: string): HTMLElement => {
   });
   fireEvent.click(toggle);
   return toggle;
+};
+
+const requestReleaseFocus = (generation: number): void => {
+  document.dispatchEvent(
+    new CustomEvent<ReleaseFocusRequest>(RELEASE_FOCUS_REQUEST, {
+      detail: { generation },
+    }),
+  );
 };
 
 afterEach(() => {
@@ -852,6 +861,251 @@ describe("RecentReleases", () => {
         name: "Show 1 pull request in v2.0.0",
       }),
     ).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("focuses the first or last-active release disclosure and rejects stale focus requests", async () => {
+    const view = render(
+      <RecentReleases
+        data={response(releaseHistory(3))}
+        error={null}
+        loading={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    act(() => requestReleaseFocus(1));
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", {
+          name: "Show 1 pull request in v1.2.1",
+        }),
+      ),
+    );
+
+    fireEvent.keyDown(document.activeElement!, { key: "j" });
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", {
+        name: "Show 1 pull request in v1.2.2",
+      }),
+    );
+
+    const refresh = screen.getByRole("button", {
+      name: "Refresh recent releases",
+    });
+    refresh.focus();
+    act(() => requestReleaseFocus(1));
+    expect(document.activeElement).toBe(refresh);
+
+    act(() => requestReleaseFocus(2));
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", {
+          name: "Show 1 pull request in v1.2.2",
+        }),
+      ),
+    );
+    expect(view.container.querySelector("[data-release-page]")).toHaveAttribute(
+      "data-release-page",
+      "1",
+    );
+    expect(api.stream).not.toHaveBeenCalled();
+    expect(api.streamBatch).not.toHaveBeenCalled();
+  });
+
+  it("traverses release disclosures across pages and retains open state", async () => {
+    render(
+      <RecentReleases
+        data={response(releaseHistory(21))}
+        error={null}
+        loading={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    act(() => requestReleaseFocus(1));
+    const first = await screen.findByRole("button", {
+      name: "Show 1 pull request in v1.2.1",
+    });
+    fireEvent.keyDown(first, { key: "ArrowRight" });
+    expect(
+      screen.getByRole("button", {
+        name: "Hide 1 pull request in v1.2.1",
+      }),
+    ).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.keyDown(document.activeElement!, { key: "End" });
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", {
+          name: "Show 1 pull request in v1.2.21",
+        }),
+      ),
+    );
+    expect(screen.getByText("Page 2 of 2")).toBeVisible();
+
+    fireEvent.keyDown(document.activeElement!, { key: "Home" });
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", {
+          name: "Hide 1 pull request in v1.2.1",
+        }),
+      ),
+    );
+    expect(screen.getByText("Page 1 of 2")).toBeVisible();
+    expect(
+      screen.getByRole("list", { name: "Pull requests in Release 1" }),
+    ).toBeVisible();
+    expect(api.stream).not.toHaveBeenCalled();
+    expect(api.streamBatch).not.toHaveBeenCalled();
+  });
+
+  it("navigates released pull targets without activating nested actions", async () => {
+    const first = release("one");
+    const secondPull = {
+      ...first.pulls[0]!,
+      headSha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      number: 42,
+      title: "Second released change",
+      url: "https://github.com/appwrite/cloud/pull/42",
+    };
+    const firstWithTwo = { ...first, pulls: [first.pulls[0]!, secondPull] };
+    const second = release("two");
+    render(
+      <RecentReleases
+        data={response([firstWithTwo, second])}
+        error={null}
+        loading={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    act(() => requestReleaseFocus(1));
+    const disclosure = await screen.findByRole("button", {
+      name: "Show 2 pull requests in v1.2.3",
+    });
+    expect(disclosure).toHaveAttribute(
+      "aria-keyshortcuts",
+      "Enter Space ArrowRight ArrowLeft ArrowDown j k Home End",
+    );
+    fireEvent.keyDown(disclosure, { key: "Enter" });
+    expect(disclosure).toHaveAttribute("aria-expanded", "true");
+    fireEvent.keyDown(disclosure, { key: "ArrowDown" });
+
+    const firstPull = document.querySelector<HTMLElement>(
+      '[data-release-pull="0"]',
+    )!;
+    const secondPullRow = document.querySelector<HTMLElement>(
+      '[data-release-pull="1"]',
+    )!;
+    expect(document.activeElement).toBe(firstPull);
+    expect(firstPull).toHaveAccessibleName(
+      "appwrite/cloud #41: Released change one",
+    );
+    expect(firstPull).toHaveAttribute("tabindex", "-1");
+    expect(within(firstPull).getByRole("link")).not.toHaveAttribute(
+      "tabindex",
+      "-1",
+    );
+    expect(
+      within(firstPull).getByRole("button", { name: "Verify" }),
+    ).not.toHaveAttribute("tabindex", "-1");
+
+    fireEvent.keyDown(firstPull, { key: "Enter" });
+    expect(document.activeElement).toBe(firstPull);
+    expect(api.stream).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(within(firstPull).getByRole("link"), {
+      key: "ArrowDown",
+    });
+    expect(document.activeElement).toBe(secondPullRow);
+    fireEvent.keyDown(secondPullRow, { key: "ArrowUp" });
+    expect(document.activeElement).toBe(firstPull);
+    fireEvent.keyDown(firstPull, { key: "ArrowUp" });
+    expect(document.activeElement).toBe(disclosure);
+
+    fireEvent.keyDown(disclosure, { key: "ArrowDown" });
+    fireEvent.keyDown(firstPull, { key: "ArrowDown" });
+    fireEvent.keyDown(secondPullRow, { key: "ArrowDown" });
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", {
+        name: "Show 1 pull request in v1.2.4",
+      }),
+    );
+
+    disclosure.focus();
+    fireEvent.keyDown(disclosure, { key: "ArrowDown" });
+    expect(document.activeElement).toBe(firstPull);
+    fireEvent.keyDown(firstPull, { key: "Escape" });
+    expect(document.activeElement).toBe(disclosure);
+    expect(disclosure).toHaveAttribute("aria-expanded", "false");
+    expect(api.stream).not.toHaveBeenCalled();
+    expect(api.streamBatch).not.toHaveBeenCalled();
+  });
+
+  it("preserves a focused release across refresh and falls forward then backward when removed", async () => {
+    const first = releaseHistory(3);
+    const view = render(
+      <RecentReleases
+        data={response(first)}
+        error={null}
+        loading={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+    act(() => requestReleaseFocus(1));
+    await screen.findByRole("button", {
+      name: "Show 1 pull request in v1.2.1",
+    });
+    fireEvent.keyDown(document.activeElement!, { key: "j" });
+    expect(document.activeElement).toHaveAccessibleName(
+      "Show 1 pull request in v1.2.2",
+    );
+
+    view.rerender(
+      <RecentReleases
+        data={response([
+          first[2]!,
+          { ...first[1]!, name: "Refreshed" },
+          first[0]!,
+        ])}
+        error={null}
+        loading={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+    await waitFor(() =>
+      expect(document.activeElement).toHaveAccessibleName(
+        "Show 1 pull request in v1.2.2",
+      ),
+    );
+
+    view.rerender(
+      <RecentReleases
+        data={response([first[2]!, first[0]!])}
+        error={null}
+        loading={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+    await waitFor(() =>
+      expect(document.activeElement).toHaveAccessibleName(
+        "Show 1 pull request in v1.2.1",
+      ),
+    );
+
+    view.rerender(
+      <RecentReleases
+        data={response([first[2]!])}
+        error={null}
+        loading={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+    await waitFor(() =>
+      expect(document.activeElement).toHaveAccessibleName(
+        "Show 1 pull request in v1.2.3",
+      ),
+    );
   });
 
   it("keeps verification streaming while its pull list is collapsed", async () => {
