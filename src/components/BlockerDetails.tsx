@@ -507,6 +507,7 @@ const FailedCheck = memo(function FailedCheck({
           <pre
             aria-label={`${check.name} logs`}
             className="max-h-72 w-full max-w-full overflow-auto rounded-lg border border-border/70 bg-zinc-950 p-3 font-mono text-[11px] leading-5 text-zinc-100 shadow-inner dark:bg-black/60"
+            data-keyboard-scroll-region=""
             data-pull-focus-token={`${focusToken}:log`}
             data-blocker-safe-focus=""
             role="region"

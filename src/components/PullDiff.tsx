@@ -1188,10 +1188,14 @@ const FilePatch = memo(function FilePatch({
 
   return (
     <div
+      aria-label={`${file.path} patch`}
       className="min-h-0 w-full min-w-0 flex-1 overflow-x-auto font-mono text-[11px] leading-5 [container-type:inline-size] sm:text-xs"
       data-diff-file-patch=""
+      data-keyboard-scroll-region=""
       onScroll={(event) => onScrollLeftChange(event.currentTarget.scrollLeft)}
       ref={patch}
+      role="region"
+      tabIndex={0}
     >
       <div className="w-max min-w-full" data-diff-patch-canvas="">
         {file.hunks.map((hunk, hunkIndex) => (

@@ -9,6 +9,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { useCallback, useRef, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -113,6 +114,13 @@ function Harness({
               key={item.key}
               tabIndex={-1}
             >
+              <pre
+                aria-label={`Output ${item.identity}`}
+                data-keyboard-scroll-region=""
+                tabIndex={0}
+              >
+                Native output
+              </pre>
               <button onClick={onAction} type="button">
                 Dangerous action {item.identity}
               </button>
@@ -297,6 +305,56 @@ describe("keyboardEventBlocked", () => {
     ).toBe(true);
     overlay.remove();
   });
+
+  it("reserves navigation keys for a focused native scroll region without blocking its owning row", () => {
+    const row = document.createElement("div");
+    const terminal = document.createElement("pre");
+    const line = document.createElement("span");
+    terminal.dataset.keyboardScrollRegion = "";
+    terminal.append(line);
+    row.append(terminal);
+    document.body.append(row);
+
+    expect(
+      keyboardEventBlocked(
+        new KeyboardEvent("keydown", { key: "Home" }),
+        document,
+      ),
+    ).toBe(false);
+    expect(
+      keyboardEventBlocked({
+        altKey: false,
+        ctrlKey: false,
+        defaultPrevented: false,
+        isComposing: false,
+        metaKey: false,
+        repeat: false,
+        target: row,
+      }),
+    ).toBe(false);
+    expect(
+      keyboardEventBlocked({
+        altKey: false,
+        ctrlKey: false,
+        defaultPrevented: false,
+        isComposing: false,
+        metaKey: false,
+        repeat: false,
+        target: terminal,
+      }),
+    ).toBe(true);
+    expect(
+      keyboardEventBlocked({
+        altKey: false,
+        ctrlKey: false,
+        defaultPrevented: false,
+        isComposing: false,
+        metaKey: false,
+        repeat: false,
+        target: line,
+      }),
+    ).toBe(true);
+  });
 });
 
 describe("useDashboardKeyboard", () => {
@@ -379,6 +437,26 @@ describe("useDashboardKeyboard", () => {
     document.removeEventListener(RELEASE_FOCUS_REQUEST, releases);
   });
 
+  it("leaves dashboard navigation and row actions untouched while native output owns focus", () => {
+    const action = vi.fn();
+    render(
+      <Harness
+        items={[pull("repo#1", 0, "ready"), pull("repo#2", 1, "ready")]}
+        onAction={action}
+      />,
+    );
+    const output = screen.getByRole("generic", { name: "Output repo#1" });
+    output.focus();
+
+    fireEvent.keyDown(output, { key: "Home" });
+    fireEvent.keyDown(output, { key: "End" });
+    fireEvent.keyDown(output, { key: "j" });
+    fireEvent.keyDown(output, { key: "k" });
+
+    expect(output).toHaveFocus();
+    expect(action).not.toHaveBeenCalled();
+  });
+
   it("preserves a focused identity when it moves and falls forward then backward when it disappears", async () => {
     const first = pull("repo#1", 0, "ready");
     const second = pull("repo#2", 1, "ready");
@@ -444,6 +522,30 @@ describe("useDashboardKeyboard", () => {
       name: "Keyboard shortcuts",
     });
     expect(dialog).toHaveTextContent("Next / previous pull request or task");
+    expect(
+      within(dialog).getByRole("region", {
+        name: "Keyboard shortcut reference",
+      }),
+    ).toHaveClass("overflow-y-auto");
+    for (const name of [
+      "Global",
+      "Pull requests",
+      "Files",
+      "Commits",
+      "Blockers",
+      "Releases",
+    ]) {
+      expect(
+        within(dialog).getByRole("heading", { name, level: 3 }),
+      ).toBeVisible();
+    }
+    expect(dialog).toHaveTextContent("Open files, blockers, or commits");
+    expect(dialog).toHaveTextContent("Collapse file and move to the next file");
+    expect(dialog).toHaveTextContent("Enter the selected commit diff");
+    expect(dialog).toHaveTextContent(
+      "Return to the blocker, then Blocker details",
+    );
+    expect(dialog).toHaveTextContent("Enter the release’s pull requests");
     expect(dialog).toContainElement(document.activeElement as HTMLElement);
     expect(trigger).toHaveAttribute("aria-keyshortcuts", "?");
 

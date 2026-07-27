@@ -724,6 +724,13 @@ describe("PullDiff", () => {
     expect(headers).toHaveLength(2);
     expect(names).toHaveLength(2);
     expect(patches).toHaveLength(2);
+    for (const [index, patch] of patches.entries()) {
+      expect(patch).toHaveAttribute("data-keyboard-scroll-region", "");
+      expect(patch).toHaveAttribute("tabindex", "0");
+      expect(patch).toHaveAccessibleName(
+        `${files[index]!.dataset.diffFilePath} patch`,
+      );
+    }
     expect(bodies).toHaveLength(2);
     expect(navigation).toHaveClass(
       "self-stretch",

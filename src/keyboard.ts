@@ -65,6 +65,8 @@ const OPEN_OVERLAY_SELECTOR = [
   "[role='menu'][data-state='open']",
 ].join(",");
 
+const KEYBOARD_SCROLL_REGION_SELECTOR = "[data-keyboard-scroll-region]";
+
 export type DashboardKeyboardCommand =
   | "end"
   | "help"
@@ -101,6 +103,10 @@ const commandForKey = (key: string): DashboardKeyboardCommand | null => {
 const isEditableTarget = (target: EventTarget | null): boolean =>
   target instanceof Element && target.closest(EDITABLE_SELECTOR) !== null;
 
+const isKeyboardScrollRegionTarget = (target: EventTarget | null): boolean =>
+  target instanceof Element &&
+  target.closest(KEYBOARD_SCROLL_REGION_SELECTOR) !== null;
+
 type GuardedKeyboardEvent = Pick<
   KeyboardEvent,
   | "altKey"
@@ -124,6 +130,7 @@ export const keyboardEventBlocked = (
   event.metaKey ||
   (!options.allowRepeat && event.repeat) ||
   isEditableTarget(event.target) ||
+  isKeyboardScrollRegionTarget(event.target) ||
   target.querySelector(OPEN_OVERLAY_SELECTOR) !== null;
 
 export const dashboardKeyboardCommand = (

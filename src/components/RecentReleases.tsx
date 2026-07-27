@@ -441,6 +441,7 @@ function VerificationTerminal({
         aria-label={`${label} verification output for ${pull.repository} #${pull.number}`}
         aria-live="polite"
         className="max-h-56 min-h-16 overflow-auto p-2.5 font-mono text-[11px] leading-relaxed whitespace-pre-wrap"
+        data-keyboard-scroll-region=""
         ref={terminal}
         role="log"
         tabIndex={0}

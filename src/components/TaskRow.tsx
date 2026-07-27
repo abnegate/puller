@@ -253,6 +253,7 @@ function TaskRow({
                     aria-busy={active}
                     aria-live="polite"
                     className="max-h-56 min-h-20 overflow-auto rounded-xl bg-zinc-950 p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap text-zinc-100"
+                    data-keyboard-scroll-region=""
                     data-task-terminal=""
                     onScroll={handleScroll}
                     ref={terminal}

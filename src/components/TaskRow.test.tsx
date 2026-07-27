@@ -156,6 +156,10 @@ describe("TaskRow", () => {
     expect(screen.getByRole("log")).toHaveTextContent("Updating files…");
     expect(screen.getByRole("log")).toHaveAttribute("aria-busy", "true");
     expect(screen.getByRole("log")).toHaveAttribute("tabindex", "0");
+    expect(screen.getByRole("log")).toHaveAttribute(
+      "data-keyboard-scroll-region",
+      "",
+    );
     expect(screen.getByText("Claude running")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Cancel task" }));

@@ -2305,6 +2305,18 @@ describe("RecentReleases", () => {
     );
     const log = await within(firstList).findByRole("log");
     expect(log).toHaveTextContent("Verified pull 41.");
+    expect(log).toHaveAttribute("data-keyboard-scroll-region", "");
+    log.focus();
+    for (const key of ["Home", "End", "ArrowDown", "j"]) {
+      expect(fireEvent.keyDown(log, { key })).toBe(true);
+      expect(log).toHaveFocus();
+    }
+    expect(api.stream).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByRole("button", {
+        name: "Hide 1 pull request in v1.2.3",
+      }),
+    ).toHaveAttribute("aria-expanded", "true");
     await waitFor(() =>
       expect(within(firstList).getAllByText("Verified").length).toBeGreaterThan(
         0,

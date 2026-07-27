@@ -299,6 +299,25 @@ describe("BlockerDetails", () => {
     ).toBeInTheDocument();
   });
 
+  it("lets a focused failed-check log keep native navigation keys", async () => {
+    const pull = withSupportedCheck();
+    vi.mocked(getCheckLog).mockResolvedValue(checkLog(pull));
+    render(<BlockerDetails pull={pull} />);
+    const log = await screen.findByRole("region", {
+      name: "Integration tests logs",
+    });
+    const failed = screen.getByRole("region", { name: "Failed checks" });
+    log.focus();
+
+    expect(log).toHaveAttribute("data-keyboard-scroll-region", "");
+    for (const key of ["Home", "End", "ArrowDown", "ArrowUp"]) {
+      expect(fireEvent.keyDown(log, { key })).toBe(true);
+      expect(log).toHaveFocus();
+    }
+    expect(failed).toHaveAttribute("tabindex", "0");
+    expect(getCheckLog).toHaveBeenCalledOnce();
+  });
+
   it("falls forward, then backward, when the active blocker disappears", () => {
     const pull = createPullsResponse().notReady[0]!;
     const view = render(<BlockerDetails pull={pull} />);
