@@ -3,11 +3,7 @@ export type CIState = "success" | "pending" | "failure" | "none" | "unknown";
 export type Agent = "claude" | "codex";
 
 export type CICheckState =
-  | Exclude<CIState, "none">
-  | "in_progress"
-  | "neutral"
-  | "queued"
-  | "skipped";
+  Exclude<CIState, "none"> | "in_progress" | "neutral" | "queued" | "skipped";
 
 export type CICheck = {
   detailsUrl: string | null;
@@ -325,8 +321,7 @@ export type MergePullRepairResponse = {
 };
 
 export type MergePullResponse =
-  | MergePullSuccessResponse
-  | MergePullRepairResponse;
+  MergePullSuccessResponse | MergePullRepairResponse;
 
 export type RepairState =
   | "repair_queued"
@@ -376,11 +371,32 @@ export type RepairEvent =
       updatedAt: string;
     };
 
-export type CreateReleaseRequest = {
+export type ReleasePreviewPull = {
+  number: number;
+  title: string;
+  url: string;
+};
+
+export type ReleasePreviewRequest = {
   expectedLatestTag: string | null;
-  prerelease: boolean;
   repository: string;
   tag: string;
+};
+
+export type ReleasePreview = {
+  baseTag: string | null;
+  body: string;
+  digest: string;
+  name: string;
+  pulls: ReleasePreviewPull[];
+  repository: string;
+  tag: string;
+  targetOid: string;
+};
+
+export type CreateReleaseRequest = ReleasePreviewRequest & {
+  prerelease: boolean;
+  preview: ReleasePreview;
 };
 
 export type CreateReleaseResponse = {
@@ -402,12 +418,18 @@ export type VerificationRunRequest = {
   tag: string;
 };
 
+export type VerificationOutcome = "verified" | "not_verified" | "unavailable";
+
 export type VerificationRunEvent =
   | ({ runId: string; type: "start" } & VerificationRunRequest)
   | { text: string; type: "text" }
   | { name: string; status?: string; type: "tool" }
   | { text: string; type: "diagnostic" }
-  | { exitCode: number; type: "complete" }
+  | {
+      exitCode: number;
+      outcome: VerificationOutcome;
+      type: "complete";
+    }
   | { message: string; type: "error" }
   | { message?: string; type: "cancelled" }
   | { message: string; type: "limit" };
@@ -420,12 +442,7 @@ export type ReleaseVerificationRequest = {
 };
 
 export type ReleaseVerificationState =
-  | "queued"
-  | "running"
-  | "complete"
-  | "error"
-  | "cancelled"
-  | "existing";
+  "queued" | "running" | "complete" | "error" | "cancelled" | "existing";
 
 export type ReleaseVerificationPull = VerificationRunRequest;
 

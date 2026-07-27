@@ -11,6 +11,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { REPOSITORY_PREFERENCES_STORAGE_KEY } from "../repository-preferences";
 import type { Task, TaskOptions } from "../types";
 import NewTaskForm from "./NewTaskForm";
 
@@ -48,6 +49,20 @@ const task: Task = {
 
 afterEach(cleanup);
 beforeEach(() => {
+  const values = new Map<string, string>();
+  Object.defineProperty(window, "localStorage", {
+    configurable: true,
+    value: {
+      clear: () => values.clear(),
+      getItem: (key: string) => values.get(key) ?? null,
+      key: (index: number) => [...values.keys()][index] ?? null,
+      get length() {
+        return values.size;
+      },
+      removeItem: (key: string) => values.delete(key),
+      setItem: (key: string, value: string) => values.set(key, value),
+    } satisfies Storage,
+  });
   Element.prototype.scrollIntoView = vi.fn();
 });
 
@@ -64,9 +79,9 @@ describe("NewTaskForm", () => {
       />,
     );
 
-    expect(screen.getByRole("form", { name: "New task" })).toBeInTheDocument();
+    expect(screen.getByRole("form", { name: "New PR" })).toBeInTheDocument();
     const container = screen
-      .getByRole("form", { name: "New task" })
+      .getByRole("form", { name: "New PR" })
       .closest("[data-new-task-form]");
     expect(container).toHaveClass("rounded-none", "bg-transparent", "ring-0");
     expect(container).not.toHaveClass("rounded-xl", "bg-card", "ring-1");
@@ -78,12 +93,12 @@ describe("NewTaskForm", () => {
     expect(
       screen.getByRole("combobox", { name: "Base branch" }),
     ).toHaveTextContent("1.9.x");
-    expect(screen.getByRole("button", { name: "Start task" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Create PR" })).toBeDisabled();
 
-    fireEvent.change(screen.getByRole("textbox", { name: "New task" }), {
+    fireEvent.change(screen.getByRole("textbox", { name: "New PR" }), {
       target: { value: "Add task support" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Start task" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create PR" }));
 
     await waitFor(() =>
       expect(start).toHaveBeenCalledWith({
@@ -92,7 +107,45 @@ describe("NewTaskForm", () => {
         repository: "appwrite/cloud",
       }),
     );
-    expect(screen.getByRole("textbox", { name: "New task" })).toHaveValue("");
+    expect(screen.getByRole("textbox", { name: "New PR" })).toHaveValue("");
+  });
+
+  it("selects the first favourite repository when the catalog arrives", async () => {
+    window.localStorage.setItem(
+      REPOSITORY_PREFERENCES_STORAGE_KEY,
+      JSON.stringify({
+        favorites: ["appwrite-labs/edge"],
+        version: 1,
+      }),
+    );
+    const view = render(
+      <NewTaskForm
+        error={null}
+        loading
+        options={null}
+        refreshOptions={vi.fn()}
+        start={vi.fn()}
+      />,
+    );
+
+    view.rerender(
+      <NewTaskForm
+        error={null}
+        loading={false}
+        options={options}
+        refreshOptions={vi.fn()}
+        start={vi.fn()}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("combobox", { name: "Repository" }),
+      ).toHaveTextContent("appwrite-labs/edge"),
+    );
+    expect(
+      screen.getByRole("combobox", { name: "Base branch" }),
+    ).toHaveTextContent("main");
   });
 
   it("searches and submits an exact nondefault base branch", async () => {
@@ -121,10 +174,10 @@ describe("NewTaskForm", () => {
       screen.getByRole("combobox", { name: "Base branch" }),
     ).toHaveTextContent("feature/cloud");
 
-    fireEvent.change(screen.getByRole("textbox", { name: "New task" }), {
+    fireEvent.change(screen.getByRole("textbox", { name: "New PR" }), {
       target: { value: "Use the selected branch" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Start task" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create PR" }));
 
     await waitFor(() =>
       expect(start).toHaveBeenCalledWith({
@@ -177,15 +230,15 @@ describe("NewTaskForm", () => {
     ).toHaveValue("");
     fireEvent.click(screen.getByRole("combobox", { name: "Base branch" }));
 
-    fireEvent.change(screen.getByRole("textbox", { name: "New task" }), {
+    fireEvent.change(screen.getByRole("textbox", { name: "New PR" }), {
       target: { value: "Keep this prompt" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Start task" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create PR" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "GitHub could not open the draft PR.",
     );
-    expect(screen.getByRole("textbox", { name: "New task" })).toHaveValue(
+    expect(screen.getByRole("textbox", { name: "New PR" })).toHaveValue(
       "Keep this prompt",
     );
   });
@@ -204,7 +257,7 @@ describe("NewTaskForm", () => {
 
     const status = screen.getByText("The repository catalog is unavailable.");
     expect(status).toHaveAttribute("id", "new-task-status");
-    expect(screen.getByRole("textbox", { name: "New task" })).toHaveAttribute(
+    expect(screen.getByRole("textbox", { name: "New PR" })).toHaveAttribute(
       "aria-describedby",
       "new-task-status",
     );

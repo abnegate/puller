@@ -64,11 +64,22 @@ type AutoIncident = {
   trigger: AutoTrigger;
 };
 
+type RebaselineCode = Extract<RunStartOutcome, { kind: "rebaseline" }>["code"];
+type RevalidationCode = RebaselineCode | "pull_running";
+
+type RebaselineObservation = {
+  code: RevalidationCode;
+  headRefOid: string;
+  identities: string[];
+};
+
 type RetryObservation = {
   agent: Agent;
   attempt: number;
+  refreshAttempt?: number;
   identities: string[];
   notBefore: number;
+  rebaseline?: RebaselineObservation;
 };
 
 type AutoEvidence = {
@@ -114,6 +125,7 @@ export type AutoInput = {
   agent: Agent;
   authoritative: boolean;
   pulls: readonly PullReadiness[];
+  refresh: () => Promise<void>;
   runs: Pick<PullRuns, "start" | "states">;
   tasks: readonly TaskState[];
   viewerLogin: string | null;
@@ -136,8 +148,11 @@ type Leader = {
   claims: Set<string>;
   evidence: AutoEvidence;
   generation: number;
+  refreshed: Set<string>;
+  refreshClaims: Set<string>;
   retryAt: number | null;
   retryTimer: number | null;
+  refresh: Promise<void> | null;
 };
 
 const EMPTY_SUMMARY: EngineSummary = {
@@ -179,6 +194,21 @@ const isAutoParallelism = (value: unknown): value is AutoParallelism =>
 
 const isPullPhase = (value: unknown): value is PullPhase =>
   value === "blocked" || value === "progress" || value === "ready";
+
+const isRevalidationCode = (value: unknown): value is RevalidationCode =>
+  value === "head_changed" ||
+  value === "pull_ready" ||
+  value === "auto_trigger_stale" ||
+  value === "pull_running";
+
+const isRebaselineObservation = (
+  value: unknown,
+): value is RebaselineObservation =>
+  isRecord(value) &&
+  isRevalidationCode(value.code) &&
+  typeof value.headRefOid === "string" &&
+  Array.isArray(value.identities) &&
+  value.identities.every((identity) => typeof identity === "string");
 
 const validEnabledEpoch = (
   enabled: unknown,
@@ -372,10 +402,16 @@ const parseEvidence = (
         typeof item.attempt === "number" &&
         Number.isSafeInteger(item.attempt) &&
         item.attempt >= 0 &&
+        (item.refreshAttempt === undefined ||
+          (typeof item.refreshAttempt === "number" &&
+            Number.isSafeInteger(item.refreshAttempt) &&
+            item.refreshAttempt >= 0)) &&
         Array.isArray(item.identities) &&
         item.identities.every((identity) => typeof identity === "string") &&
         typeof item.notBefore === "number" &&
-        Number.isFinite(item.notBefore),
+        Number.isFinite(item.notBefore) &&
+        (item.rebaseline === undefined ||
+          isRebaselineObservation(item.rebaseline)),
     );
 
     if (!observed || !pending || !attempted || !retry) {
@@ -414,8 +450,7 @@ const parseEvidence = (
       retry: Object.fromEntries(
         Object.entries(parsed.retry).map(([key, item]) => {
           const retry = item as
-            | RetryObservation
-            | Omit<RetryObservation, "agent">;
+            RetryObservation | Omit<RetryObservation, "agent">;
           return [
             key,
             {
@@ -772,7 +807,24 @@ const observePull = (
       (item) => pendingByIdentity.get(item)?.agent !== retry.agent,
     )
   ) {
-    delete evidence.retry[key];
+    const current = evidence.pending[key] ?? [];
+    if (retry.rebaseline?.code === "pull_running" && current.length > 0) {
+      const agent = current[0]!.agent;
+      const incidents = current.filter((incident) => incident.agent === agent);
+      const identities = incidents.map((incident) => incident.identity);
+      evidence.retry[key] = {
+        ...retry,
+        agent,
+        identities,
+        rebaseline: {
+          code: "pull_running",
+          headRefOid: pull.headRefOid,
+          identities,
+        },
+      };
+    } else {
+      delete evidence.retry[key];
+    }
   }
 };
 
@@ -872,6 +924,11 @@ const reconcileEvidence = (
     delete next.attempted[key];
     delete next.retry[key];
   }
+  for (const key of Object.keys(next.retry)) {
+    if ((next.pending[key]?.length ?? 0) === 0) {
+      delete next.retry[key];
+    }
+  }
   next.baseline.pulls = next.baseline.pulls.filter((key) => present.has(key));
   return next;
 };
@@ -905,6 +962,86 @@ const dispatchIncidents = (
   return pending
     .filter((incident) => incident.agent === agent)
     .slice(0, AUTO_TRIGGER_LIMIT);
+};
+
+const sameIdentities = (
+  first: readonly string[],
+  second: readonly string[],
+): boolean => {
+  if (first.length !== second.length) return false;
+  const expected = new Set(first);
+  return second.every((identity) => expected.has(identity));
+};
+
+const revalidationKey = (
+  pullUrl: string,
+  observation: RebaselineObservation,
+): string =>
+  [
+    pullUrl,
+    observation.code,
+    observation.headRefOid.toLowerCase(),
+    [...observation.identities].sort().join("\n"),
+  ].join("\n");
+
+const recordPullRunningRefresh = (
+  evidence: AutoEvidence,
+  claims: ReadonlySet<string>,
+  succeeded: boolean,
+  now: number,
+): {
+  evidence: AutoEvidence;
+  matched: string[];
+  retryAt: number | null;
+} => {
+  const next = cloneEvidence(evidence);
+  const matched: string[] = [];
+  let retryAt: number | null = null;
+
+  for (const [pullUrl, retry] of Object.entries(next.retry)) {
+    const observation = retry.rebaseline;
+    if (observation?.code !== "pull_running") continue;
+    const claim = revalidationKey(pullUrl, observation);
+    if (!claims.has(claim)) continue;
+
+    matched.push(claim);
+    if (succeeded) {
+      retry.refreshAttempt = 0;
+      continue;
+    }
+
+    const refreshAttempt = Math.min(
+      (retry.refreshAttempt ?? 0) + 1,
+      RETRY_MAX_EXPONENT + 1,
+    );
+    const notBefore = now + retryDelay(refreshAttempt);
+    retry.refreshAttempt = refreshAttempt;
+    retry.notBefore = notBefore;
+    retryAt = retryAt === null ? notBefore : Math.min(retryAt, notBefore);
+  }
+
+  return { evidence: next, matched, retryAt };
+};
+
+const hasFreshRebaselineEvidence = (
+  leader: Leader,
+  retry: RetryObservation,
+  pull: PullReadiness,
+  pending: readonly AutoIncident[],
+): boolean => {
+  const stale = retry.rebaseline;
+  if (!stale) return true;
+  if (stale.code === "pull_running") {
+    return leader.refreshed.has(revalidationKey(pull.url, stale));
+  }
+  if (stale.headRefOid.toLowerCase() !== pull.headRefOid.toLowerCase()) {
+    return true;
+  }
+
+  return !sameIdentities(
+    stale.identities,
+    pending.map((incident) => incident.identity),
+  );
 };
 
 const sameTaskPull = (state: TaskState, pull: PullReadiness): boolean =>
@@ -1040,6 +1177,7 @@ export function useAuto({
   agent,
   authoritative,
   pulls,
+  refresh,
   runs,
   tasks,
   viewerLogin,
@@ -1069,6 +1207,7 @@ export function useAuto({
           epoch: settings.epoch,
           parallelism: settings.parallelism,
           pulls,
+          refresh,
           runs,
           tasks,
           viewer: normalizedViewer,
@@ -1155,6 +1294,80 @@ export function useAuto({
     [],
   );
 
+  const requestRefresh = useCallback(
+    (
+      current: Leader,
+      input: EngineInput,
+      claims: readonly string[] = [],
+    ): Promise<void> => {
+      for (const claim of claims) current.refreshClaims.add(claim);
+      if (current.refresh !== null) return current.refresh;
+
+      let activeClaims = new Set<string>();
+      const task = Promise.resolve().then(() => {
+        activeClaims = new Set(current.refreshClaims);
+        current.refreshClaims.clear();
+        return input.refresh();
+      });
+      current.refresh = task;
+      void task
+        .then(
+          () => {
+            if (
+              leaderRef.current !== current ||
+              current.generation !== generationRef.current
+            ) {
+              return;
+            }
+            const result = recordPullRunningRefresh(
+              current.evidence,
+              activeClaims,
+              true,
+              Date.now(),
+            );
+            commit(current, result.evidence, false);
+            for (const claim of result.matched) {
+              current.refreshed.add(claim);
+            }
+          },
+          () => {
+            if (
+              leaderRef.current !== current ||
+              current.generation !== generationRef.current
+            ) {
+              return;
+            }
+            const result = recordPullRunningRefresh(
+              current.evidence,
+              activeClaims,
+              false,
+              Date.now(),
+            );
+            commit(current, result.evidence, false);
+            if (result.retryAt !== null) {
+              scheduleRetry(current, result.retryAt);
+            }
+          },
+        )
+        .finally(() => {
+          if (
+            leaderRef.current !== current ||
+            current.generation !== generationRef.current
+          ) {
+            return;
+          }
+          current.refresh = null;
+          if (current.refreshClaims.size > 0) {
+            void requestRefresh(current, input);
+          } else {
+            processRef.current();
+          }
+        });
+      return task;
+    },
+    [commit, scheduleRetry],
+  );
+
   const launch = useCallback(
     (
       current: Leader,
@@ -1186,7 +1399,6 @@ export function useAuto({
             source: "auto",
           };
         }
-
         if (
           leaderRef.current !== current ||
           current.generation !== generationRef.current
@@ -1229,14 +1441,62 @@ export function useAuto({
             RETRY_MAX_EXPONENT + 1,
           );
           const notBefore = Date.now() + retryDelay(attempt);
+          const rebaseline =
+            outcome.code === "pull_running"
+              ? {
+                  code: outcome.code,
+                  headRefOid: pull.headRefOid,
+                  identities,
+                }
+              : undefined;
+          next.retry[key] = {
+            agent: incidents[0]!.agent,
+            attempt,
+            ...(rebaseline === undefined
+              ? {}
+              : {
+                  refreshAttempt:
+                    previous?.rebaseline?.code === "pull_running"
+                      ? (previous.refreshAttempt ?? 0)
+                      : 0,
+                }),
+            identities,
+            notBefore,
+            ...(rebaseline === undefined ? {} : { rebaseline }),
+          };
+          if (commit(current, next, { error: null, paused: true })) {
+            scheduleRetry(current, notBefore);
+            if (rebaseline !== undefined) {
+              const claim = revalidationKey(key, rebaseline);
+              current.refreshed.delete(claim);
+              void requestRefresh(current, input, [claim]);
+            }
+            processRef.current();
+          }
+          return;
+        }
+
+        if (outcome.kind === "rebaseline") {
+          const previous = current.evidence.retry[key];
+          const attempt = Math.min(
+            (previous?.attempt ?? 0) + 1,
+            RETRY_MAX_EXPONENT + 1,
+          );
+          const notBefore = Date.now() + retryDelay(attempt);
           next.retry[key] = {
             agent: incidents[0]!.agent,
             attempt,
             identities,
             notBefore,
+            rebaseline: {
+              code: outcome.code,
+              headRefOid: pull.headRefOid,
+              identities,
+            },
           };
           if (commit(current, next, { error: null, paused: true })) {
             scheduleRetry(current, notBefore);
+            void requestRefresh(current, input);
             processRef.current();
           }
           return;
@@ -1266,7 +1526,7 @@ export function useAuto({
         }
       })();
     },
-    [commit, scheduleRetry],
+    [commit, requestRefresh, scheduleRetry],
   );
 
   const process = useCallback((): void => {
@@ -1308,6 +1568,8 @@ export function useAuto({
         const work = activeAutoKeys(current, latest);
         let slots = Math.max(0, latest.parallelism - work.size);
         let retryAt: number | null = null;
+        let refreshNeeded = false;
+        const refreshClaims: string[] = [];
         let waiting = false;
         const guarded = cloneEvidence(reconciled);
         const launches: Array<{
@@ -1317,16 +1579,85 @@ export function useAuto({
 
         for (const pull of pullOrder(latest.pulls)) {
           const pending = reconciled.pending[pull.url] ?? [];
-          if (pending.length === 0) continue;
-          if (!evidenceComplete(pull) || phaseOf(latest, pull) !== "blocked") {
-            waiting = true;
+          if (pending.length === 0) {
+            delete guarded.retry[pull.url];
             continue;
           }
-          if (work.has(pull.url) || isPullBusy(latest, pull)) {
-            waiting = true;
-            continue;
-          }
+          const phase = phaseOf(latest, pull);
           const retry = reconciled.retry[pull.url];
+          const autoBusy = work.has(pull.url);
+          const busy = autoBusy || isPullBusy(latest, pull);
+          if (retry?.rebaseline && phase === "ready") {
+            markAttempted(
+              guarded,
+              pull.url,
+              pending.map((incident) => incident.identity),
+            );
+            continue;
+          }
+          if (autoBusy) {
+            waiting = true;
+            continue;
+          }
+          if (busy) {
+            const identities = pending.map((incident) => incident.identity);
+            const rebaseline: RebaselineObservation = {
+              code: "pull_running",
+              headRefOid: pull.headRefOid,
+              identities,
+            };
+            guarded.retry[pull.url] = {
+              agent: retry?.agent ?? pending[0]!.agent,
+              attempt: retry?.attempt ?? 0,
+              refreshAttempt:
+                retry?.rebaseline?.code === "pull_running"
+                  ? (retry.refreshAttempt ?? 0)
+                  : 0,
+              identities,
+              notBefore: now,
+              rebaseline,
+            };
+            current.refreshed.delete(revalidationKey(pull.url, rebaseline));
+            waiting = true;
+            continue;
+          }
+          if (!evidenceComplete(pull) || phase !== "blocked") {
+            waiting = true;
+            continue;
+          }
+          if (
+            retry?.rebaseline &&
+            !hasFreshRebaselineEvidence(current, retry, pull, pending)
+          ) {
+            waiting = true;
+            if (current.refresh !== null) continue;
+            if (retry.notBefore > now) {
+              retryAt =
+                retryAt === null
+                  ? retry.notBefore
+                  : Math.min(retryAt, retry.notBefore);
+              continue;
+            }
+
+            if (retry.rebaseline.code === "pull_running") {
+              refreshClaims.push(revalidationKey(pull.url, retry.rebaseline));
+            } else {
+              const attempt = Math.min(
+                retry.attempt + 1,
+                RETRY_MAX_EXPONENT + 1,
+              );
+              const notBefore = now + retryDelay(attempt);
+              guarded.retry[pull.url] = {
+                ...retry,
+                attempt,
+                notBefore,
+              };
+              retryAt =
+                retryAt === null ? notBefore : Math.min(retryAt, notBefore);
+            }
+            refreshNeeded = true;
+            continue;
+          }
           if (retry && retry.notBefore > now) {
             retryAt =
               retryAt === null
@@ -1343,6 +1674,11 @@ export function useAuto({
           const incidents = dispatchIncidents(pending, retry);
           if (incidents.length === 0) continue;
           const identities = incidents.map((incident) => incident.identity);
+          if (retry?.rebaseline !== undefined) {
+            current.refreshed.delete(
+              revalidationKey(pull.url, retry.rebaseline),
+            );
+          }
           current.claims.add(pull.url);
           work.add(pull.url);
           slots -= 1;
@@ -1360,6 +1696,9 @@ export function useAuto({
           return;
         }
         if (retryAt !== null) scheduleRetry(current, retryAt);
+        if (refreshNeeded) {
+          void requestRefresh(current, latest, refreshClaims);
+        }
         for (const item of launches) {
           launch(current, latest, item.pull, item.incidents);
         }
@@ -1370,7 +1709,7 @@ export function useAuto({
         if (rerunRef.current) processRef.current();
       }
     }
-  }, [commit, launch, scheduleRetry]);
+  }, [commit, launch, requestRefresh, scheduleRetry]);
 
   processRef.current = process;
 
@@ -1469,6 +1808,9 @@ export function useAuto({
               input ?? undefined,
             ),
             generation,
+            refreshed: new Set(),
+            refresh: null,
+            refreshClaims: new Set(),
             retryAt: null,
             retryTimer: null,
           };
@@ -1481,6 +1823,7 @@ export function useAuto({
           });
           if (acquired.retryTimer !== null)
             window.clearTimeout(acquired.retryTimer);
+          acquired.refresh = null;
           acquired.retryAt = null;
           if (leaderRef.current === acquired) leaderRef.current = null;
           if (mountedRef.current) setLeader(false);
@@ -1505,11 +1848,21 @@ export function useAuto({
     return () => {
       cancelled = true;
       controller.abort();
-      release?.();
       const current = leaderRef.current;
+      const refresh =
+        current?.generation === generation ? current.refresh : null;
+      if (refresh === null) {
+        release?.();
+      } else {
+        void refresh.then(
+          () => release?.(),
+          () => release?.(),
+        );
+      }
       if (current?.generation === generation) {
         if (current.retryTimer !== null)
           window.clearTimeout(current.retryTimer);
+        current.refresh = null;
         current.retryAt = null;
         leaderRef.current = null;
       }

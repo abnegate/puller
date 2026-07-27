@@ -10,6 +10,7 @@ import {
   getPulls,
   getReleaseOptions,
   getReleasePipelines,
+  getReleasePreview,
   isCheckLog,
   isPullCommitDiff,
   isPullCommits,
@@ -17,12 +18,14 @@ import {
   isPullsResponse,
   isReleaseOptions,
   isReleasePipelinesResponse,
+  isReleasePreview,
   mergePull,
   parseGitHubActionsJobUrl,
   PullDiffHttpError,
   resetApiActionTokenForTests,
   resetCheckLogCacheForTests,
   streamReleaseVerification,
+  streamVerification,
 } from "./api";
 import {
   createDegradedPullDiff,
@@ -39,6 +42,8 @@ import type {
   PullsResponse,
   ReleaseOptions,
   ReleasePipelinesResponse,
+  ReleasePreview,
+  VerificationRunRequest,
 } from "./types";
 
 const BASE_SHA = "dddddddddddddddddddddddddddddddddddddddd";
@@ -194,10 +199,74 @@ const createReleaseResponse = (): CreateReleaseResponse => ({
   url: "https://github.com/appwrite/cloud/releases/tag/v1.2.4",
 });
 
+const createReleasePreview = (): ReleasePreview => ({
+  baseTag: "v1.2.3",
+  body: "* Fix release behavior by @jake in https://github.com/appwrite/cloud/pull/927",
+  digest: "a".repeat(64),
+  name: "Generated v1.2.4",
+  pulls: [
+    {
+      number: 927,
+      title: "Fix release behavior",
+      url: "https://github.com/appwrite/cloud/pull/927",
+    },
+  ],
+  repository: "appwrite/cloud",
+  tag: "v1.2.4",
+  targetOid: COMMIT_SHA,
+});
+
 afterEach(() => {
   resetApiActionTokenForTests();
   resetCheckLogCacheForTests();
   vi.unstubAllGlobals();
+});
+
+describe("streamVerification", () => {
+  it("preserves a safe server preflight reason before a run starts", async () => {
+    const request: VerificationRunRequest = {
+      agent: "claude",
+      headSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      pullNumber: 41,
+      pullUrl: "https://github.com/appwrite/cloud/pull/41",
+      releaseId: "123",
+      repository: "appwrite/cloud",
+      tag: "v1.2.3",
+    };
+    const message =
+      "GitHub and local Git cannot prove the exact target pull request delta.";
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ token: "action-token" }), {
+            headers: { "Content-Type": "application/json" },
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              code: "verification_delta_unavailable",
+              error: message,
+            }),
+            {
+              headers: { "Content-Type": "application/json" },
+              status: 409,
+            },
+          ),
+        ),
+    );
+
+    await expect(
+      (async () => {
+        for await (const _event of streamVerification(request)) {
+          // Consume the validated stream.
+        }
+      })(),
+    ).rejects.toThrow(message);
+  });
 });
 
 describe("streamReleaseVerification", () => {
@@ -231,7 +300,7 @@ describe("streamReleaseVerification", () => {
         pullUrl: pull.pullUrl,
         state: "complete",
         type: "verification",
-        event: { exitCode: 0, type: "complete" },
+        event: { exitCode: 0, outcome: "verified", type: "complete" },
       },
       {
         batchId: "batch-1",
@@ -272,6 +341,149 @@ describe("streamReleaseVerification", () => {
     ).toHaveLength(1);
   });
 
+  it("preserves each safe child preflight error and accepts accurate error totals", async () => {
+    const request = {
+      agent: "claude" as const,
+      releaseId: "123",
+      repository: "appwrite/cloud",
+      tag: "v1.2.3",
+    };
+    const pull = {
+      headSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      pullNumber: 41,
+      pullUrl: "https://github.com/appwrite/cloud/pull/41",
+      ...request,
+    };
+    const message =
+      "GitHub and local Git cannot prove the exact target pull request delta.";
+    const childError = {
+      batchId: "batch-1",
+      code: "verification_delta_unavailable",
+      headSha: pull.headSha,
+      message,
+      pullNumber: pull.pullNumber,
+      pullUrl: pull.pullUrl,
+      state: "error",
+      type: "verification",
+    } as const;
+    const events = [
+      { batchId: "batch-1", pulls: [pull], type: "batch-start", ...request },
+      {
+        batchId: "batch-1",
+        headSha: pull.headSha,
+        pullNumber: pull.pullNumber,
+        pullUrl: pull.pullUrl,
+        state: "queued",
+        type: "verification",
+      },
+      childError,
+      {
+        batchId: "batch-1",
+        totals: { complete: 0, error: 1, existing: 0, total: 1 },
+        type: "complete",
+      },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ token: "action-token" }), {
+            headers: { "Content-Type": "application/json" },
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+            {
+              headers: { "Content-Type": "application/x-ndjson" },
+              status: 200,
+            },
+          ),
+        ),
+    );
+
+    const received = [];
+    for await (const event of streamReleaseVerification(request)) {
+      received.push(event);
+    }
+
+    expect(received).toContainEqual(childError);
+  });
+
+  it("accepts a sanitized nested technical limit with its outer error code", async () => {
+    const request = {
+      agent: "claude" as const,
+      releaseId: "123",
+      repository: "appwrite/cloud",
+      tag: "v1.2.3",
+    };
+    const pull = {
+      headSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      pullNumber: 41,
+      pullUrl: "https://github.com/appwrite/cloud/pull/41",
+      ...request,
+    };
+    const limit = {
+      batchId: "batch-1",
+      code: "verification_limit",
+      event: {
+        message: "Claude verification exceeded a technical limit.",
+        type: "limit",
+      },
+      headSha: pull.headSha,
+      pullNumber: pull.pullNumber,
+      pullUrl: pull.pullUrl,
+      state: "error",
+      type: "verification",
+    } as const;
+    const events = [
+      { batchId: "batch-1", pulls: [pull], type: "batch-start", ...request },
+      {
+        batchId: "batch-1",
+        headSha: pull.headSha,
+        pullNumber: pull.pullNumber,
+        pullUrl: pull.pullUrl,
+        state: "queued",
+        type: "verification",
+      },
+      limit,
+      {
+        batchId: "batch-1",
+        totals: { complete: 0, error: 1, existing: 0, total: 1 },
+        type: "complete",
+      },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ token: "action-token" }), {
+            headers: { "Content-Type": "application/json" },
+            status: 200,
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+            {
+              headers: { "Content-Type": "application/x-ndjson" },
+              status: 200,
+            },
+          ),
+        ),
+    );
+
+    const received = [];
+    for await (const event of streamReleaseVerification(request)) {
+      received.push(event);
+    }
+
+    expect(received).toContainEqual(limit);
+  });
+
   it("rejects duplicate per-pull terminals even when the final totals look valid", async () => {
     const request = {
       agent: "claude" as const,
@@ -296,13 +508,13 @@ describe("streamReleaseVerification", () => {
       { ...identity, state: "queued", type: "verification" },
       {
         ...identity,
-        event: { exitCode: 0, type: "complete" },
+        event: { exitCode: 0, outcome: "verified", type: "complete" },
         state: "complete",
         type: "verification",
       },
       {
         ...identity,
-        event: { exitCode: 0, type: "complete" },
+        event: { exitCode: 0, outcome: "verified", type: "complete" },
         state: "complete",
         type: "verification",
       },
@@ -492,6 +704,58 @@ describe("mergePull", () => {
   });
 });
 
+describe("getReleasePreview", () => {
+  it("posts the exact release identity and validates canonical pull links", async () => {
+    const request = {
+      expectedLatestTag: "v1.2.3",
+      repository: "appwrite/cloud",
+      tag: "v1.2.4",
+    };
+    const preview = createReleasePreview();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ token: "action-token" }), {
+          headers: { "Content-Type": "application/json" },
+          status: 200,
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(preview), {
+          headers: { "Content-Type": "application/json" },
+          status: 200,
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getReleasePreview(request)).resolves.toEqual(preview);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/releases/preview",
+      expect.objectContaining({
+        body: JSON.stringify(request),
+        method: "POST",
+      }),
+    );
+    expect(isReleasePreview(preview)).toBe(true);
+    const { body: _body, ...withoutBody } = preview;
+    const { name: _name, ...withoutName } = preview;
+    expect(isReleasePreview(withoutBody)).toBe(false);
+    expect(isReleasePreview(withoutName)).toBe(false);
+    expect(
+      isReleasePreview({
+        ...preview,
+        pulls: [
+          {
+            ...preview.pulls[0],
+            url: "https://github.com/other/repo/pull/927",
+          },
+        ],
+      }),
+    ).toBe(false);
+  });
+});
+
 describe("createRelease", () => {
   it.each([true, false])(
     "forwards prerelease=%s in the exact request body",
@@ -499,6 +763,7 @@ describe("createRelease", () => {
       const request: CreateReleaseRequest = {
         expectedLatestTag: "v1.2.3",
         prerelease,
+        preview: createReleasePreview(),
         repository: "appwrite/cloud",
         tag: "v1.2.4",
       };
@@ -544,6 +809,7 @@ describe("createRelease", () => {
       const request = {
         expectedLatestTag: "v1.2.3",
         prerelease,
+        preview: createReleasePreview(),
         repository: "appwrite/cloud",
         tag: "v1.2.4",
       } as unknown as CreateReleaseRequest;
@@ -580,6 +846,7 @@ describe("createRelease", () => {
       createRelease({
         expectedLatestTag: "v1.2.3",
         prerelease: true,
+        preview: createReleasePreview(),
         repository: "appwrite/cloud",
         tag: "v1.2.4",
       }),
@@ -2131,6 +2398,9 @@ describe("getReleasePipelines", () => {
     await expect(
       getReleasePipelines(controller.signal, false),
     ).resolves.toEqual(pipelines);
+    await expect(
+      getReleasePipelines(controller.signal, false, true),
+    ).resolves.toEqual(pipelines);
     await expect(getReleasePipelines(controller.signal)).resolves.toEqual(
       pipelines,
     );
@@ -2144,6 +2414,14 @@ describe("getReleasePipelines", () => {
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
+      "/api/releases/pipelines?discover=1",
+      expect.objectContaining({
+        cache: "no-store",
+        signal: controller.signal,
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
       "/api/releases/pipelines?refresh=1",
       expect.objectContaining({
         cache: "no-store",
@@ -2161,9 +2439,8 @@ describe("getReleasePipelines", () => {
     expect(isReleasePipelinesResponse(response)).toBe(false);
 
     const release = createReleasePipelines();
-    (
-      release.releases[0] as unknown as Record<string, unknown>
-    ).repositoryUrl = "https://github.com/appwrite/cloud";
+    (release.releases[0] as unknown as Record<string, unknown>).repositoryUrl =
+      "https://github.com/appwrite/cloud";
     expect(isReleasePipelinesResponse(release)).toBe(false);
 
     const pipeline = createReleasePipelines();
@@ -2227,8 +2504,7 @@ describe("getReleasePipelines", () => {
       duplicateRun.releases[0]!.pipeline.runs.push({
         ...first,
         id: field === "id" ? first.id : "123456790",
-        workflowId:
-          field === "workflowId" ? first.workflowId : "987654322",
+        workflowId: field === "workflowId" ? first.workflowId : "987654322",
         url:
           field === "id"
             ? first.url
@@ -2280,9 +2556,7 @@ describe("getReleasePipelines", () => {
       ),
     );
 
-    await expect(getReleasePipelines()).rejects.toThrow(
-      "unexpected response",
-    );
+    await expect(getReleasePipelines()).rejects.toThrow("unexpected response");
   });
 });
 

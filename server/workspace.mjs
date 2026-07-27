@@ -1,18 +1,31 @@
 import { execFile as executeFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
 import {
   chmod,
+  cp,
   lstat,
   mkdir,
   mkdtemp,
   readdir,
   readFile,
+  readlink,
   realpath,
   rm,
+  rmdir,
   unlink,
   writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
+import {
+  delimiter,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { promisify } from "node:util";
 
 const execFile = promisify(executeFile);
@@ -1826,6 +1839,430 @@ async function removeEscapingLinks(root, path = root) {
   }
 }
 
+async function hashSnapshotPath(root, path, hash) {
+  const details = await lstat(path);
+  const name = relative(root, path).split(sep).join("/");
+  hash.update(
+    `${details.isDirectory() ? "d" : details.isFile() ? "f" : "l"}\0`,
+  );
+  hash.update(`${name}\0${details.mode & 0o7777}\0`);
+  if (details.isSymbolicLink()) {
+    hash.update(await readlink(path));
+  } else if (details.isFile()) {
+    await new Promise((resolve, reject) => {
+      const stream = createReadStream(path);
+      stream.on("data", (chunk) => hash.update(chunk));
+      stream.once("end", resolve);
+      stream.once("error", reject);
+    });
+  } else if (details.isDirectory()) {
+    for (const entry of (await readdir(path)).sort()) {
+      await hashSnapshotPath(root, join(path, entry), hash);
+    }
+  }
+}
+
+async function snapshotDigest(root) {
+  const hash = createHash("sha256");
+  await hashSnapshotPath(root, root, hash);
+  return hash.digest("hex");
+}
+
+function safeDeltaPath(path) {
+  return (
+    typeof path === "string" &&
+    path !== "" &&
+    !path.includes("\0") &&
+    !path.includes("\\") &&
+    !isAbsolute(path) &&
+    path
+      .split("/")
+      .every((part) => part !== "" && part !== "." && part !== "..")
+  );
+}
+
+function normalizeTargetDelta(value, repository) {
+  if (
+    !value ||
+    value.version !== 1 ||
+    value.repository !== repository ||
+    !Number.isSafeInteger(value.pullNumber) ||
+    value.pullNumber < 1 ||
+    typeof value.baseSha !== "string" ||
+    !SHA.test(value.baseSha) ||
+    typeof value.headSha !== "string" ||
+    !SHA.test(value.headSha) ||
+    typeof value.mergeCommitSha !== "string" ||
+    !SHA.test(value.mergeCommitSha) ||
+    typeof value.mergedAt !== "string" ||
+    Number.isNaN(Date.parse(value.mergedAt)) ||
+    !Number.isSafeInteger(value.changedFiles) ||
+    value.changedFiles < 1 ||
+    !Array.isArray(value.files) ||
+    value.files.length !== value.changedFiles ||
+    typeof value.digest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(value.digest)
+  ) {
+    return null;
+  }
+  const paths = new Set();
+  const files = [];
+  for (const candidate of value.files) {
+    if (
+      !candidate ||
+      !safeDeltaPath(candidate.path) ||
+      paths.has(candidate.path) ||
+      !["added", "modified", "removed"].includes(candidate.status) ||
+      typeof candidate.sha !== "string" ||
+      !SHA.test(candidate.sha) ||
+      typeof candidate.patch !== "string" ||
+      candidate.patch === "" ||
+      candidate.patch.includes("\0") ||
+      !Number.isSafeInteger(candidate.additions) ||
+      candidate.additions < 0 ||
+      !Number.isSafeInteger(candidate.deletions) ||
+      candidate.deletions < 0 ||
+      !Number.isSafeInteger(candidate.changes) ||
+      candidate.changes !== candidate.additions + candidate.deletions
+    ) {
+      return null;
+    }
+    paths.add(candidate.path);
+    files.push({
+      additions: candidate.additions,
+      changes: candidate.changes,
+      deletions: candidate.deletions,
+      path: candidate.path,
+      patch: candidate.patch,
+      sha: candidate.sha.toLowerCase(),
+      status: candidate.status,
+    });
+  }
+  files.sort((left, right) => left.path.localeCompare(right.path));
+  const canonical = {
+    baseSha: value.baseSha.toLowerCase(),
+    changedFiles: value.changedFiles,
+    files,
+    headSha: value.headSha.toLowerCase(),
+    mergeCommitSha: value.mergeCommitSha.toLowerCase(),
+    mergedAt: value.mergedAt,
+    pullNumber: value.pullNumber,
+    repository,
+    version: 1,
+  };
+  const digest = createHash("sha256")
+    .update(JSON.stringify(canonical))
+    .digest("hex");
+  return digest === value.digest
+    ? Object.freeze({ ...canonical, digest })
+    : null;
+}
+
+async function verifiedRawCommand(run, args, options = {}) {
+  try {
+    const result = await run("git", args, {
+      encoding: "utf8",
+      maxBuffer: 4 * 1024 * 1024,
+      windowsHide: true,
+      ...options,
+    });
+    return String(result.stdout ?? "");
+  } catch {
+    throw new WorkspaceError(
+      "The target pull request delta could not be reconstructed.",
+      "verification_delta_unavailable",
+    );
+  }
+}
+
+function gitEnvironment() {
+  return {
+    ...process.env,
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_ATTR_SOURCE: EMPTY_TREE,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_TERMINAL_PROMPT: "0",
+  };
+}
+
+function rawManifest(output) {
+  const values = output.split("\0");
+  if (values.at(-1) === "") values.pop();
+  if (values.length % 2 !== 0) return null;
+  const entries = [];
+  const paths = new Set();
+  for (let index = 0; index < values.length; index += 2) {
+    const match =
+      /^:([0-7]{6}) ([0-7]{6}) ([a-f0-9]{40}) ([a-f0-9]{40}) ([AMD])$/.exec(
+        values[index],
+      );
+    const path = values[index + 1];
+    if (!match || !safeDeltaPath(path) || paths.has(path)) return null;
+    const [, beforeMode, afterMode, beforeOid, afterOid, status] = match;
+    const regular = new Set(["100644", "100755"]);
+    if (
+      (status === "A" &&
+        (beforeMode !== "000000" ||
+          !/^0{40}$/.test(beforeOid) ||
+          !regular.has(afterMode))) ||
+      (status === "D" &&
+        (!regular.has(beforeMode) ||
+          afterMode !== "000000" ||
+          !/^0{40}$/.test(afterOid))) ||
+      (status === "M" && (!regular.has(beforeMode) || !regular.has(afterMode)))
+    ) {
+      return null;
+    }
+    paths.add(path);
+    entries.push({
+      afterMode,
+      afterOid,
+      beforeMode,
+      beforeOid,
+      path,
+      status,
+    });
+  }
+  entries.sort((left, right) => left.path.localeCompare(right.path));
+  return entries;
+}
+
+async function localManifest(run, source, before, after, maximumBytes) {
+  const output = await verifiedRawCommand(
+    run,
+    [
+      ...SAFE_GIT_CONFIGURATION,
+      "--no-replace-objects",
+      "-C",
+      source,
+      "diff-tree",
+      "--no-commit-id",
+      "--raw",
+      "-z",
+      "--no-renames",
+      "--no-abbrev",
+      "-r",
+      before,
+      after,
+    ],
+    { env: gitEnvironment(), maxBuffer: maximumBytes },
+  );
+  const manifest = rawManifest(output);
+  if (manifest === null) {
+    throw new WorkspaceError(
+      "The target pull request contains an unsupported Git delta.",
+      "verification_delta_unavailable",
+    );
+  }
+  for (const entry of manifest) {
+    for (const oid of [entry.beforeOid, entry.afterOid]) {
+      if (/^0{40}$/.test(oid)) continue;
+      const type = await verifiedCommand(run, [
+        ...SAFE_GIT_CONFIGURATION,
+        "--no-replace-objects",
+        "-C",
+        source,
+        "cat-file",
+        "-t",
+        oid,
+      ]);
+      if (type !== "blob") {
+        throw new WorkspaceError(
+          "The target pull request references an unsupported Git object.",
+          "verification_delta_unavailable",
+        );
+      }
+    }
+  }
+  return manifest;
+}
+
+function sameManifest(left, right) {
+  return (
+    left.length === right.length &&
+    left.every((entry, index) =>
+      [
+        "afterMode",
+        "afterOid",
+        "beforeMode",
+        "beforeOid",
+        "path",
+        "status",
+      ].every((key) => entry[key] === right[index]?.[key]),
+    )
+  );
+}
+
+function patchFromDiff(output) {
+  const marker = output.indexOf("\n@@ ");
+  if (marker < 0) return null;
+  return output.slice(marker + 1).replace(/\n$/, "");
+}
+
+function canonicalPatch(patch) {
+  return patch
+    .split("\n")
+    .map((line) =>
+      line.replace(/^(@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@)(?:.*)$/, "$1"),
+    )
+    .join("\n");
+}
+
+async function corroborateDelta(run, source, before, after, manifest, target) {
+  if (manifest.length !== target.files.length) return false;
+  const byPath = new Map(manifest.map((entry) => [entry.path, entry]));
+  for (const file of target.files) {
+    const entry = byPath.get(file.path);
+    const status = { A: "added", D: "removed", M: "modified" }[entry?.status];
+    const blob = file.status === "removed" ? entry?.beforeOid : entry?.afterOid;
+    if (!entry || status !== file.status || blob !== file.sha) return false;
+    const output = await verifiedRawCommand(
+      run,
+      [
+        ...SAFE_GIT_CONFIGURATION,
+        "--no-replace-objects",
+        "-C",
+        source,
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--unified=3",
+        "--inter-hunk-context=1",
+        "--no-color",
+        before,
+        after,
+        "--",
+        file.path,
+      ],
+      {
+        env: gitEnvironment(),
+        maxBuffer: Buffer.byteLength(file.patch, "utf8") + 256 * 1024,
+      },
+    );
+    const local = patchFromDiff(output);
+    if (local === null || canonicalPatch(local) !== canonicalPatch(file.patch))
+      return false;
+  }
+  return true;
+}
+
+async function hashFileWithGit(run, path) {
+  return verifiedCommand(
+    run,
+    [
+      ...SAFE_GIT_CONFIGURATION,
+      "--no-replace-objects",
+      "hash-object",
+      "--no-filters",
+      "--",
+      path,
+    ],
+    { env: gitEnvironment() },
+  );
+}
+
+function fileMode(details) {
+  return (details.mode & 0o111) === 0 ? "100644" : "100755";
+}
+
+async function regularPath(root, path) {
+  let current = root;
+  const parts = path.split("/");
+  for (let index = 0; index < parts.length; index += 1) {
+    current = join(current, parts[index]);
+    let details;
+    try {
+      details = await lstat(current);
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    }
+    if (
+      details.isSymbolicLink() ||
+      (index === parts.length - 1 ? !details.isFile() : !details.isDirectory())
+    ) {
+      throw new WorkspaceError(
+        "The target pull request path has an unsupported type.",
+        "verification_delta_unavailable",
+      );
+    }
+  }
+  return current;
+}
+
+async function ensureParent(root, path) {
+  let current = root;
+  for (const part of path.split("/").slice(0, -1)) {
+    current = join(current, part);
+    try {
+      const details = await lstat(current);
+      if (details.isSymbolicLink() || !details.isDirectory()) {
+        throw new WorkspaceError(
+          "The target pull request path has an unsupported parent.",
+          "verification_delta_unavailable",
+        );
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      await mkdir(current, { mode: 0o700 });
+    }
+  }
+}
+
+async function removeEmptyParents(root, path) {
+  let current = dirname(join(root, ...path.split("/")));
+  while (current !== root && isInside(root, current)) {
+    try {
+      await rmdir(current);
+    } catch {
+      return;
+    }
+    current = dirname(current);
+  }
+}
+
+async function treeProofs(root, path = root, result = new Map()) {
+  const details = await lstat(path);
+  const name = relative(root, path).split(sep).join("/");
+  if (details.isDirectory()) {
+    for (const entry of (await readdir(path)).sort()) {
+      await treeProofs(root, join(path, entry), result);
+    }
+  } else if (details.isFile()) {
+    result.set(name, {
+      digest: await new Promise((resolveDigest, reject) => {
+        const hash = createHash("sha256");
+        const stream = createReadStream(path);
+        stream.on("data", (chunk) => hash.update(chunk));
+        stream.once("error", reject);
+        stream.once("end", () => resolveDigest(hash.digest("hex")));
+      }),
+      mode: details.mode & 0o7777,
+      type: "file",
+    });
+  } else if (details.isSymbolicLink()) {
+    result.set(name, {
+      mode: details.mode & 0o7777,
+      target: await readlink(path),
+      type: "link",
+    });
+  }
+  return result;
+}
+
+function changedProofPaths(before, after) {
+  const changed = [];
+  for (const path of new Set([...before.keys(), ...after.keys()])) {
+    if (JSON.stringify(before.get(path)) !== JSON.stringify(after.get(path))) {
+      changed.push(path);
+    }
+  }
+  return changed.sort();
+}
+
 export function createVerificationWorkspaceManager({
   roots = resolveWorkspaceOptions().roots,
   run = execFile,
@@ -1834,7 +2271,7 @@ export function createVerificationWorkspaceManager({
   remove = (path) => rm(path, { recursive: true, force: true }),
   temporaryRoot = join(homedir(), ".puller", "verification-workspaces"),
 } = {}) {
-  return Object.freeze({
+  const manager = {
     async prepare({ commitOid, repository, tag }) {
       const normalized = normalizeRepository(repository);
       if (!normalized || normalized !== repository.toLowerCase()) {
@@ -1976,6 +2413,7 @@ export function createVerificationWorkspaceManager({
       }
 
       const cwd = join(base, "snapshot");
+      const executionCwd = join(base, "execution");
       const archive = join(base, "snapshot.tar");
       const metadata = join(base, "repository.git");
       let protectedSnapshot = false;
@@ -2075,15 +2513,30 @@ export function createVerificationWorkspaceManager({
         await remove(archive);
         await remove(metadata);
         await removeEscapingLinks(cwd);
+        await cp(cwd, executionCwd, {
+          dereference: false,
+          errorOnExist: true,
+          recursive: true,
+        });
+        await setSnapshotPermissions(executionCwd, false);
         await setSnapshotPermissions(cwd, true);
         protectedSnapshot = true;
+        const digest = await snapshotDigest(cwd);
         return {
           cleanup,
           commitOid: expected,
           cwd,
+          executionCwd,
           headSha: expected,
           repository,
           tag,
+          verifyIntegrity: async () => {
+            try {
+              return (await snapshotDigest(cwd)) === digest;
+            } catch {
+              return false;
+            }
+          },
         };
       } catch (error) {
         await cleanup();
@@ -2094,5 +2547,444 @@ export function createVerificationWorkspaceManager({
         );
       }
     },
-  });
+  };
+  manager.preparePair = async ({
+    predecessorCommitOid,
+    predecessorTag,
+    releaseCommitOid,
+    repository,
+    tag,
+    targetDelta: rawTargetDelta,
+  }) => {
+    const normalized = normalizeRepository(repository);
+    const targetDelta = normalizeTargetDelta(rawTargetDelta, normalized);
+    if (
+      !normalized ||
+      normalized !== String(repository).toLowerCase() ||
+      !validateReleaseTag(tag) ||
+      !validateReleaseTag(predecessorTag) ||
+      typeof predecessorCommitOid !== "string" ||
+      !SHA.test(predecessorCommitOid) ||
+      typeof releaseCommitOid !== "string" ||
+      !SHA.test(releaseCommitOid) ||
+      targetDelta === null
+    ) {
+      throw new WorkspaceError(
+        "Complete exact-target verification evidence is required.",
+        "verification_delta_unavailable",
+      );
+    }
+    const predecessorOid = predecessorCommitOid.toLowerCase();
+    const releaseOid = releaseCommitOid.toLowerCase();
+    const required = [
+      predecessorOid,
+      releaseOid,
+      targetDelta.baseSha,
+      targetDelta.headSha,
+      targetDelta.mergeCommitSha,
+    ];
+    const canonical = await canonicalRoots(roots);
+    if (canonical.length === 0) {
+      throw new WorkspaceError("No trusted workspace roots are available.");
+    }
+    const paths = new Set();
+    for (const root of canonical) {
+      for (const candidate of await discoverRepositories(root))
+        paths.add(candidate);
+    }
+    const candidates = [];
+    for (const path of paths) {
+      const candidate = await archiveCandidate(run, canonical, path);
+      if (candidate?.repository === normalized) candidates.push(candidate.cwd);
+    }
+    candidates.sort();
+    let source = null;
+    for (const candidate of candidates) {
+      let complete = true;
+      for (const oid of required) {
+        try {
+          await verifiedCommand(run, [
+            ...SAFE_GIT_CONFIGURATION,
+            "--no-replace-objects",
+            "-C",
+            candidate,
+            "cat-file",
+            "-e",
+            `${oid}^{commit}`,
+          ]);
+        } catch {
+          complete = false;
+          break;
+        }
+      }
+      if (complete) {
+        source = candidate;
+        break;
+      }
+    }
+    if (source === null) {
+      throw new WorkspaceError(
+        "The exact pull request Git objects are unavailable locally.",
+        "verification_delta_unavailable",
+      );
+    }
+    const ancestry = async (ancestor, descendant) => {
+      try {
+        await run(
+          "git",
+          [
+            ...SAFE_GIT_CONFIGURATION,
+            "--no-replace-objects",
+            "-C",
+            source,
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+          ],
+          {
+            encoding: "utf8",
+            env: gitEnvironment(),
+            maxBuffer: 64 * 1024,
+            windowsHide: true,
+          },
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    if (
+      !(await ancestry(predecessorOid, releaseOid)) ||
+      !(await ancestry(targetDelta.mergeCommitSha, releaseOid))
+    ) {
+      throw new WorkspaceError(
+        "The live release does not contain the pinned pull request merge.",
+        "verification_delta_unavailable",
+      );
+    }
+    const parentLine = await verifiedCommand(run, [
+      ...SAFE_GIT_CONFIGURATION,
+      "--no-replace-objects",
+      "-C",
+      source,
+      "rev-list",
+      "--parents",
+      "-n",
+      "1",
+      targetDelta.mergeCommitSha,
+    ]);
+    const parents = parentLine.split(" ");
+    if (
+      parents[0] !== targetDelta.mergeCommitSha ||
+      ![2, 3].includes(parents.length) ||
+      !parents.slice(1).every((oid) => SHA.test(oid))
+    ) {
+      throw new WorkspaceError(
+        "The pull request merge topology is unsupported.",
+        "verification_delta_unavailable",
+      );
+    }
+    const firstParent = parents[1].toLowerCase();
+    if (
+      !(await ancestry(predecessorOid, firstParent)) ||
+      (parents.length === 3 && parents[2].toLowerCase() !== targetDelta.headSha)
+    ) {
+      throw new WorkspaceError(
+        "The pull request merge topology cannot prove an exact target delta.",
+        "verification_delta_unavailable",
+      );
+    }
+    const intendedBase = await verifiedCommand(run, [
+      ...SAFE_GIT_CONFIGURATION,
+      "--no-replace-objects",
+      "-C",
+      source,
+      "merge-base",
+      firstParent,
+      targetDelta.headSha,
+    ]);
+    if (
+      !SHA.test(intendedBase) ||
+      intendedBase.toLowerCase() !== targetDelta.baseSha
+    ) {
+      throw new WorkspaceError(
+        "The pull request merge base no longer matches GitHub.",
+        "verification_delta_unavailable",
+      );
+    }
+    const manifestBytes =
+      targetDelta.files.reduce(
+        (total, file) => total + Buffer.byteLength(file.path, "utf8") + 256,
+        64 * 1024,
+      ) * 2;
+    const [actual, intended] = await Promise.all([
+      localManifest(
+        run,
+        source,
+        firstParent,
+        targetDelta.mergeCommitSha,
+        manifestBytes,
+      ),
+      localManifest(
+        run,
+        source,
+        intendedBase,
+        targetDelta.headSha,
+        manifestBytes,
+      ),
+    ]);
+    let integrated = sameManifest(actual, intended);
+    if (parents.length === 3) {
+      const [mergedTree, recordedTree] = await Promise.all([
+        verifiedCommand(
+          run,
+          [
+            ...SAFE_GIT_CONFIGURATION,
+            "--no-replace-objects",
+            "-C",
+            source,
+            "merge-tree",
+            "--write-tree",
+            "--no-messages",
+            firstParent,
+            targetDelta.headSha,
+          ],
+          { env: gitEnvironment() },
+        ),
+        verifiedCommand(run, [
+          ...SAFE_GIT_CONFIGURATION,
+          "--no-replace-objects",
+          "-C",
+          source,
+          "rev-parse",
+          `${targetDelta.mergeCommitSha}^{tree}`,
+        ]),
+      ]);
+      integrated =
+        SHA.test(mergedTree) &&
+        SHA.test(recordedTree) &&
+        mergedTree.toLowerCase() === recordedTree.toLowerCase();
+    }
+    if (
+      actual.length === 0 ||
+      intended.length === 0 ||
+      !integrated ||
+      !(await corroborateDelta(
+        run,
+        source,
+        intendedBase,
+        targetDelta.headSha,
+        intended,
+        targetDelta,
+      ))
+    ) {
+      throw new WorkspaceError(
+        "GitHub and local Git cannot prove the exact target pull request delta.",
+        "verification_delta_unavailable",
+      );
+    }
+    const delta = intended;
+
+    const predecessor = await manager.prepare({
+      commitOid: predecessorOid,
+      repository,
+      tag: predecessorTag,
+    });
+    let trustedTemporaryRoot;
+    let base = null;
+    let protectedSnapshot = false;
+    let cleaned = false;
+    const cleanupCandidate = async () => {
+      if (cleaned) return;
+      cleaned = true;
+      if (protectedSnapshot && base !== null) {
+        await setSnapshotPermissions(join(base, "snapshot"), false).catch(
+          () => undefined,
+        );
+      }
+      if (base !== null) await remove(base).catch(() => undefined);
+    };
+    try {
+      await mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
+      trustedTemporaryRoot = await realpath(temporaryRoot);
+      const created = await makeTemporary(
+        join(trustedTemporaryRoot, "puller-target-"),
+      );
+      base = await realpath(created);
+      const location = relative(trustedTemporaryRoot, base);
+      if (
+        location === "" ||
+        location.includes(sep) ||
+        !location.startsWith("puller-target-") ||
+        !isInside(trustedTemporaryRoot, base)
+      ) {
+        throw new WorkspaceError(
+          "The verification target directory is invalid.",
+          "verification_delta_unavailable",
+        );
+      }
+      const snapshot = join(base, "snapshot");
+      const executionCwd = join(base, "execution");
+      const staging = join(base, "staging");
+      const archive = join(base, "target.tar");
+      const beforeProofs = await treeProofs(predecessor.cwd);
+      await cp(predecessor.cwd, snapshot, {
+        dereference: false,
+        errorOnExist: true,
+        recursive: true,
+      });
+      await setSnapshotPermissions(snapshot, false);
+      await mkdir(staging);
+      const afterPaths = delta
+        .filter((entry) => entry.status !== "D")
+        .map((entry) => entry.path);
+      if (afterPaths.length > 0) {
+        await verifiedCommand(
+          run,
+          [
+            ...SAFE_GIT_CONFIGURATION,
+            "--no-replace-objects",
+            "-C",
+            source,
+            "archive",
+            "--format=tar",
+            `--output=${archive}`,
+            targetDelta.headSha,
+            "--",
+            ...afterPaths,
+          ],
+          { env: gitEnvironment() },
+        );
+        await run(
+          "tar",
+          [
+            "-xf",
+            archive,
+            "-C",
+            staging,
+            "--no-same-owner",
+            "--no-same-permissions",
+          ],
+          {
+            encoding: "utf8",
+            env: { ...process.env, TAR_OPTIONS: "" },
+            maxBuffer: 4 * 1024 * 1024,
+            windowsHide: true,
+          },
+        );
+        await remove(archive);
+        await removeEscapingLinks(staging);
+        const staged = await treeProofs(staging);
+        if (
+          [...staged.keys()].sort().join("\0") !==
+          [...afterPaths].sort().join("\0")
+        ) {
+          throw new WorkspaceError(
+            "The exact target blob archive contained unexpected paths.",
+            "verification_delta_unavailable",
+          );
+        }
+      }
+      for (const entry of delta) {
+        const existing = await regularPath(snapshot, entry.path);
+        if (entry.status === "A") {
+          if (existing !== null) {
+            throw new WorkspaceError(
+              "The predecessor does not match the target delta preimage.",
+              "verification_delta_unavailable",
+            );
+          }
+        } else if (
+          existing === null ||
+          (await hashFileWithGit(run, existing)) !== entry.beforeOid ||
+          fileMode(await lstat(existing)) !== entry.beforeMode
+        ) {
+          throw new WorkspaceError(
+            "The predecessor does not match the target delta preimage.",
+            "verification_delta_unavailable",
+          );
+        }
+        if (entry.status === "D") {
+          await rm(existing);
+          await removeEmptyParents(snapshot, entry.path);
+          continue;
+        }
+        const staged = await regularPath(staging, entry.path);
+        if (
+          staged === null ||
+          (await hashFileWithGit(run, staged)) !== entry.afterOid ||
+          fileMode(await lstat(staged)) !== entry.afterMode
+        ) {
+          throw new WorkspaceError(
+            "The target pull request blob archive did not match its manifest.",
+            "verification_delta_unavailable",
+          );
+        }
+        await ensureParent(snapshot, entry.path);
+        if (existing !== null) await rm(existing);
+        const destination = join(snapshot, ...entry.path.split("/"));
+        await cp(staged, destination, {
+          dereference: false,
+          errorOnExist: true,
+        });
+        await chmod(destination, entry.afterMode === "100755" ? 0o700 : 0o600);
+      }
+      await setSnapshotPermissions(snapshot, true);
+      protectedSnapshot = true;
+      const afterProofs = await treeProofs(snapshot);
+      const changed = changedProofPaths(beforeProofs, afterProofs);
+      if (
+        changed.join("\0") !==
+        delta
+          .map((entry) => entry.path)
+          .sort()
+          .join("\0")
+      ) {
+        throw new WorkspaceError(
+          "The synthetic target changed files outside the exact pull request delta.",
+          "verification_delta_unavailable",
+        );
+      }
+      await cp(snapshot, executionCwd, {
+        dereference: false,
+        errorOnExist: true,
+        recursive: true,
+      });
+      await setSnapshotPermissions(executionCwd, false);
+      const digest = await snapshotDigest(snapshot);
+      const candidate = Object.freeze({
+        cleanup: cleanupCandidate,
+        cwd: snapshot,
+        deltaDigest: targetDelta.digest,
+        executionCwd,
+        headSha: targetDelta.headSha,
+        repository,
+        synthetic: true,
+        tag,
+        verifyIntegrity: async () => {
+          try {
+            return (await snapshotDigest(snapshot)) === digest;
+          } catch {
+            return false;
+          }
+        },
+      });
+      return Object.freeze({
+        candidate,
+        deltaDigest: targetDelta.digest,
+        predecessor,
+        releaseCommitOid: releaseOid,
+      });
+    } catch (error) {
+      await cleanupCandidate();
+      await predecessor.cleanup();
+      if (error instanceof WorkspaceError) throw error;
+      throw new WorkspaceError(
+        "The exact target pull request workspace could not be prepared.",
+        "verification_delta_unavailable",
+      );
+    }
+  };
+  return Object.freeze(manager);
 }

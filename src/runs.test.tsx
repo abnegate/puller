@@ -310,9 +310,7 @@ describe("usePullRuns", () => {
   it("snapshots the selected agent for active and historic runs while future runs follow a changed preference", async () => {
     const pull = pulls()[0];
     const first = createDeferred<void>();
-    fixes.stream.mockImplementation(async function* (
-      request: AgentRunRequest,
-    ) {
+    fixes.stream.mockImplementation(async function* (request: AgentRunRequest) {
       yield {
         agent: request.agent,
         number: request.number,
@@ -525,9 +523,7 @@ describe("usePullRuns", () => {
 
   it("uses the validated Auto agent override instead of the current selector", async () => {
     const [pull] = pulls();
-    fixes.stream.mockImplementation(async function* (
-      request: AgentRunRequest,
-    ) {
+    fixes.stream.mockImplementation(async function* (request: AgentRunRequest) {
       yield {
         agent: request.agent,
         number: request.number,
@@ -1278,10 +1274,6 @@ describe("usePullRuns", () => {
     ["workspace_running", "retryable", "workspace_running"],
     ["snapshot_incomplete", "retryable", "snapshot_incomplete"],
     ["snapshot_unavailable", "retryable", "snapshot_unavailable"],
-    ["head_changed", "rebaseline", "head_changed"],
-    ["pull_ready", "rebaseline", "pull_ready"],
-    ["auto_trigger_stale", "rebaseline", "auto_trigger_stale"],
-    ["auto_triggers_stale", "rebaseline", "auto_trigger_stale"],
     ["pull_missing", "prune", "pull_missing"],
     ["unexpected_code", "failed", "unexpected_code"],
   ] as const)(
@@ -1316,6 +1308,111 @@ describe("usePullRuns", () => {
       });
     },
   );
+
+  it.each([
+    ["head_changed", "head_changed"],
+    ["pull_ready", "pull_ready"],
+    ["auto_trigger_stale", "auto_trigger_stale"],
+    ["auto_triggers_stale", "auto_trigger_stale"],
+  ] as const)(
+    "classifies an automatic pre-acceptance %s response as %s without leaving a transient run row",
+    async (code, expectedCode) => {
+      const [pull] = pulls();
+      fixes.stream.mockImplementation(() => {
+        throw new ClaudeRunHttpError(409, code, `Service response: ${code}`);
+      });
+      const view = renderPullRuns([pull]);
+
+      let outcome!: RunStartOutcome;
+      await act(async () => {
+        outcome = await view.result.current.start(pull, {
+          agent: "claude",
+          parallelism: 2,
+          source: "auto",
+          triggers: [automaticTrigger(pull)],
+        });
+      });
+
+      expect(outcome).toEqual({
+        code: expectedCode,
+        kind: "rebaseline",
+        message: `Service response: ${code}`,
+        source: "auto",
+      });
+      expect(view.result.current.states.has(pull.url)).toBe(false);
+    },
+  );
+
+  it("restores an existing manual failure and draft after an automatic stale-head preflight", async () => {
+    const [pull] = pulls();
+    fixes.stream
+      .mockImplementationOnce(() => {
+        throw new ClaudeRunHttpError(
+          500,
+          "manual_rejected",
+          "Keep this manual failure visible.",
+        );
+      })
+      .mockImplementationOnce(() => {
+        throw new ClaudeRunHttpError(
+          409,
+          "head_changed",
+          "The pull request head changed.",
+        );
+      });
+    const view = renderPullRuns([pull]);
+
+    act(() => view.result.current.setMessage(pull.url, "Keep this draft."));
+    await act(async () => {
+      await view.result.current.start(pull);
+    });
+    const manual = view.result.current.states.get(pull.url);
+    expect(manual).toMatchObject({
+      message: "Keep this draft.",
+      output: "[error] Keep this manual failure visible.\n",
+      source: "manual",
+      status: "failed",
+    });
+
+    await act(async () => {
+      await view.result.current.start(pull, {
+        agent: "claude",
+        parallelism: 1,
+        source: "auto",
+        triggers: [automaticTrigger(pull)],
+      });
+    });
+
+    expect(view.result.current.states.get(pull.url)).toEqual(manual);
+  });
+
+  it("keeps a manual stale-head preflight visible", async () => {
+    const [pull] = pulls();
+    fixes.stream.mockImplementation(() => {
+      throw new ClaudeRunHttpError(
+        409,
+        "head_changed",
+        "Refresh before running this manual fix.",
+      );
+    });
+    const view = renderPullRuns([pull]);
+
+    let outcome!: RunStartOutcome;
+    await act(async () => {
+      outcome = await view.result.current.start(pull);
+    });
+
+    expect(outcome).toMatchObject({
+      code: "head_changed",
+      kind: "rebaseline",
+      source: "manual",
+    });
+    expect(view.result.current.states.get(pull.url)).toMatchObject({
+      output: "[error] Refresh before running this manual fix.\n",
+      source: "manual",
+      status: "failed",
+    });
+  });
 
   it("classifies transport failure before acceptance as retryable", async () => {
     const [pull] = pulls();

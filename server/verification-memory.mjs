@@ -281,7 +281,7 @@ export function parseVerificationMemoryMarker(content, options = {}) {
     !isRecord(value) ||
     !exactKeys(value, ["outcome", "recipes", "version"]) ||
     value.version !== VERSION ||
-    (value.outcome !== "verified" && value.outcome !== "not_verified")
+    !["not_verified", "unavailable", "verified"].includes(value.outcome)
   ) {
     return null;
   }
@@ -530,10 +530,22 @@ async function revalidateRecipes(recipes, snapshotRoot, limits) {
   return checked.filter(({ valid }) => valid).map(({ recipe }) => recipe);
 }
 
+export async function revalidateVerificationRecipes(
+  recipes,
+  snapshotRoot,
+  options = {},
+) {
+  const limits = configuredLimits(options);
+  const parsed = recipesFrom(recipes, limits);
+  if (!parsed) return [];
+  return revalidateRecipes(parsed, snapshotRoot, limits);
+}
+
 function validEntry(value, limits) {
   if (
     !isRecord(value) ||
     !exactKeys(value, [
+      "deltaDigest",
       "headSha",
       "pullNumber",
       "recordedAt",
@@ -541,6 +553,9 @@ function validEntry(value, limits) {
       "releaseId",
       "tag",
     ]) ||
+    (value.deltaDigest !== null &&
+      (typeof value.deltaDigest !== "string" ||
+        !/^[a-f0-9]{64}$/.test(value.deltaDigest))) ||
     typeof value.headSha !== "string" ||
     !SHA.test(value.headSha) ||
     !Number.isSafeInteger(value.pullNumber) ||
@@ -558,6 +573,7 @@ function validEntry(value, limits) {
   const recipes = recipesFrom(value.recipes, limits);
   if (!recipes) return null;
   return {
+    deltaDigest: value.deltaDigest,
     headSha: value.headSha.toLowerCase(),
     pullNumber: value.pullNumber,
     recordedAt: value.recordedAt,
@@ -1231,8 +1247,12 @@ export function createVerificationMemory({
     return JSON.stringify(["repository", normalizedRoot, repository]);
   }
 
-  function load({ repository: value, snapshotRoot }) {
+  function load({ deltaDigest = null, repository: value, snapshotRoot }) {
     const repository = normalizeRepository(value, limits.fieldBytes);
+    const boundDigest =
+      typeof deltaDigest === "string" && /^[a-f0-9]{64}$/.test(deltaDigest)
+        ? deltaDigest
+        : null;
     return enqueueModule(repositoryKey(repository), async () => {
       try {
         await ensureRoot(normalizedRoot, storageBase, uid);
@@ -1245,6 +1265,8 @@ export function createVerificationMemory({
         if (!document) return null;
         const entries = [];
         for (const entry of document.entries) {
+          if (boundDigest !== null && entry.deltaDigest !== boundDigest)
+            continue;
           const recipes = await revalidateRecipes(
             entry.recipes,
             snapshotRoot,
@@ -1265,6 +1287,11 @@ export function createVerificationMemory({
       input?.repository,
       limits.fieldBytes,
     );
+    const deltaDigest =
+      typeof input?.deltaDigest === "string" &&
+      /^[a-f0-9]{64}$/.test(input.deltaDigest)
+        ? input.deltaDigest
+        : null;
     if (
       !Number.isSafeInteger(input?.pullNumber) ||
       input.pullNumber < 1 ||
@@ -1325,6 +1352,7 @@ export function createVerificationMemory({
             );
           }
           entries.push({
+            deltaDigest,
             headSha: input.headSha.toLowerCase(),
             pullNumber: input.pullNumber,
             recordedAt,

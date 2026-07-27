@@ -218,6 +218,59 @@ describe("Codex invocation", () => {
     await invocation.cleanup();
   });
 
+  it("refuses additional writable paths for every agent purpose", async () => {
+    const value = await fixture();
+    await expect(
+      createCodexInvocation({
+        environment: value.environment,
+        executable: value.binary,
+        prompt: "Fix the pull request.",
+        purpose: "fix",
+        run: value.run,
+        stateRoot: value.state,
+        target: value.target,
+        writablePaths: [dirname(value.target)],
+      }),
+    ).rejects.toThrow("cannot receive additional writable paths");
+  });
+
+  it("uses the read-only verification profile while denying unrelated snapshots", async () => {
+    const value = await fixture();
+    const snapshot = join(dirname(value.target), "snapshot");
+    const predecessor = join(dirname(value.target), "predecessor");
+    await Promise.all([mkdir(snapshot), mkdir(predecessor)]);
+    const invocation = await createCodexInvocation({
+      deniedPaths: [snapshot],
+      environment: value.environment,
+      executable: value.binary,
+      prompt: "Exercise the released behavior.",
+      purpose: "verification",
+      run: value.run,
+      stateRoot: value.state,
+      target: value.target,
+    });
+    const configuration = invocation.args.join(" ");
+    expect(configuration).toContain('default_permissions="puller-read"');
+    expect(configuration).toContain("--disable shell_tool");
+    expect(configuration).toContain("--disable unified_exec");
+    expect(configuration).toContain("--disable code_mode_host");
+    expect(configuration).toContain(
+      `${JSON.stringify(invocation.target)}="read"`,
+    );
+    expect(configuration).toContain(`${JSON.stringify(snapshot)}="deny"`);
+    expect(configuration).not.toContain(
+      `${JSON.stringify(predecessor)}="write"`,
+    );
+    expect(configuration).toContain("network={enabled=false}");
+    if (process.platform === "darwin") {
+      expect(configuration).toContain('"/System/Library/OpenSSL"="read"');
+    }
+    expect(invocation.prompt).toContain("immutable release snapshot");
+    expect(invocation.prompt).toContain("no command or filesystem tools");
+    expect(invocation.prompt).toContain("<puller-verification-memory>");
+    await invocation.cleanup();
+  });
+
   it("refuses to clean a replaced runtime directory", async () => {
     const value = await fixture();
     const invocation = await createCodexInvocation({

@@ -8,10 +8,11 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import { useState } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   IDLE_RUN_STATE,
@@ -20,6 +21,11 @@ import {
   type RunState,
   type RunTerminalStatus,
 } from "../runs";
+import {
+  highlightFile,
+  type HighlightedFile,
+  type SyntaxToken,
+} from "../syntax";
 import { createPullsResponse } from "../test/fixtures";
 import type {
   Agent,
@@ -28,6 +34,11 @@ import type {
   PullDiffFile,
   PullReadiness,
 } from "../types";
+
+vi.mock("../syntax", () => ({
+  highlightFile: vi.fn(() => Promise.resolve(null)),
+}));
+
 import PullDiff, {
   createPullDiffPersistence,
   normalizePullDiffPersistence,
@@ -160,6 +171,63 @@ const deferred = <Value,>() => {
   return { promise, resolve };
 };
 
+const bounds = (top: number, bottom: number, left = 0, right = 800): DOMRect =>
+  ({
+    bottom,
+    height: bottom - top,
+    left,
+    right,
+    toJSON: () => ({}),
+    top,
+    width: right - left,
+    x: left,
+    y: top,
+  }) as DOMRect;
+
+const syntaxFile = (content: string, path = "src/highlight.ts"): PullDiffFile =>
+  file({
+    additions: 1,
+    changes: 1,
+    deletions: 0,
+    hunks: [
+      {
+        header: "@@ -0,0 +1 @@",
+        lines: [
+          {
+            content,
+            kind: "addition",
+            newLine: 1,
+            oldLine: null,
+          },
+        ],
+        newLines: 1,
+        newStart: 1,
+        oldLines: 0,
+        oldStart: 0,
+      },
+    ],
+    path,
+  });
+
+const syntaxToken = (
+  content: string,
+  change: Partial<SyntaxToken> = {},
+): SyntaxToken => ({
+  content,
+  darkFontStyle: "normal",
+  darkFontWeight: 400,
+  darkForeground: "#79c0ff",
+  lightFontStyle: "normal",
+  lightFontWeight: 400,
+  lightForeground: "#0550ae",
+  ...change,
+});
+
+const syntaxHighlight = (tokens: readonly SyntaxToken[]): HighlightedFile => ({
+  hunks: [{ lines: [tokens] }],
+  language: "typescript",
+});
+
 function ControlledPullDiff({
   agent = "claude",
   clearReviewRetry = defaultClearReviewRetry,
@@ -254,6 +322,11 @@ const expectAriaControlsToResolve = (container: HTMLElement): void => {
   }
 };
 
+beforeEach(() => {
+  vi.mocked(highlightFile).mockReset();
+  vi.mocked(highlightFile).mockResolvedValue(null);
+});
+
 afterEach(() => {
   cleanup();
   defaultStartRun.mockClear();
@@ -263,6 +336,291 @@ afterEach(() => {
 });
 
 describe("PullDiff", () => {
+  it("renders plain text first, then replaces only line content with themed syntax tokens", async () => {
+    const source = "const answer = 42;";
+    const changed = syntaxFile(source);
+    const pending = deferred<HighlightedFile | null>();
+    vi.mocked(highlightFile).mockReturnValueOnce(pending.promise);
+    const { container } = renderPullDiff(diff({ files: [changed] }));
+    const row = container.querySelector<HTMLElement>(
+      '[data-line-kind="addition"]',
+    )!;
+    const code = row.querySelector("code")!;
+    const rowClasses = row.className;
+
+    expect(code).toHaveTextContent(`+${source}`);
+    expect(code.firstElementChild).toHaveAttribute("aria-hidden", "true");
+    expect(container.querySelector("[data-syntax-token]")).toBeNull();
+
+    await act(async () => {
+      pending.resolve(
+        syntaxHighlight([
+          syntaxToken("const", {
+            darkFontWeight: 700,
+            lightFontWeight: 700,
+          }),
+          syntaxToken(" answer = 42;", {
+            darkForeground: "#ffa657",
+            darkFontStyle: "italic",
+            lightFontStyle: "italic",
+            lightForeground: "#953800",
+          }),
+        ]),
+      );
+      await pending.promise;
+    });
+
+    const tokens = [
+      ...container.querySelectorAll<HTMLElement>("[data-syntax-token]"),
+    ];
+    expect(tokens).toHaveLength(2);
+    expect(tokens.map((token) => token.textContent).join("")).toBe(source);
+    expect(code).toHaveTextContent(`+${source}`);
+    expect(row).toHaveClass(...rowClasses.split(" "));
+    expect(code.firstElementChild).toHaveAttribute("aria-hidden", "true");
+    expect(tokens[0]).toHaveAttribute(
+      "data-syntax-light-foreground",
+      "#0550ae",
+    );
+    expect(tokens[0]).toHaveAttribute("data-syntax-dark-foreground", "#79c0ff");
+    expect(tokens[0]).toHaveAttribute("data-syntax-dark-font-weight", "700");
+    expect(tokens[0]).toHaveAttribute("data-syntax-light-font-weight", "700");
+    expect(tokens[1]).toHaveAttribute("data-syntax-dark-font-style", "italic");
+    expect(tokens[1]).toHaveAttribute("data-syntax-light-font-style", "italic");
+    expect(tokens[1]).toHaveStyle({
+      "--syntax-dark-font-style": "italic",
+      "--syntax-dark-font-weight": "400",
+      "--syntax-dark-foreground": "#ffa657",
+      "--syntax-light-font-style": "italic",
+      "--syntax-light-font-weight": "400",
+      "--syntax-light-foreground": "#953800",
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Give Claude feedback on new line 1",
+      }),
+    );
+    expect(
+      screen.getByRole("textbox", {
+        name: "Claude feedback on new line 1",
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("ignores a stale async result when the same path receives a new file object", async () => {
+    const first = syntaxFile("const version = 'old';");
+    const second = syntaxFile("const version = 'new';");
+    const firstPending = deferred<HighlightedFile | null>();
+    const secondPending = deferred<HighlightedFile | null>();
+    vi.mocked(highlightFile)
+      .mockReturnValueOnce(firstPending.promise)
+      .mockReturnValueOnce(secondPending.promise);
+
+    const view = render(<ControlledPullDiff data={diff({ files: [first] })} />);
+    expect(
+      view.container.querySelector('[data-line-kind="addition"] code'),
+    ).toHaveTextContent("+const version = 'old';");
+
+    view.rerender(<ControlledPullDiff data={diff({ files: [second] })} />);
+    expect(
+      view.container.querySelector('[data-line-kind="addition"] code'),
+    ).toHaveTextContent("+const version = 'new';");
+    expect(view.container.querySelector("[data-syntax-token]")).toBeNull();
+
+    await act(async () => {
+      secondPending.resolve(
+        syntaxHighlight([syntaxToken("const version = 'new';")]),
+      );
+      await secondPending.promise;
+    });
+    expect(
+      view.container.querySelector("[data-syntax-token]"),
+    ).toHaveTextContent("const version = 'new';");
+
+    await act(async () => {
+      firstPending.resolve(
+        syntaxHighlight([syntaxToken("const version = 'old';")]),
+      );
+      await firstPending.promise;
+    });
+    expect(
+      view.container.querySelector('[data-line-kind="addition"] code'),
+    ).toHaveTextContent("+const version = 'new';");
+    expect(
+      view.container.querySelector("[data-syntax-token]"),
+    ).toHaveTextContent("const version = 'new';");
+  });
+
+  it("schedules only near-viewport files and cancels work that leaves the margin", async () => {
+    type Observation = {
+      callback: IntersectionObserverCallback;
+      element: Element | null;
+      observer: IntersectionObserver;
+      rootMargin: string;
+    };
+    const observations: Observation[] = [];
+
+    class TestIntersectionObserver {
+      readonly root = null;
+      readonly rootMargin: string;
+      readonly thresholds = [0];
+      readonly observation: Observation;
+
+      constructor(
+        callback: IntersectionObserverCallback,
+        options?: IntersectionObserverInit,
+      ) {
+        this.rootMargin = options?.rootMargin ?? "0px";
+        this.observation = {
+          callback,
+          element: null,
+          observer: this as unknown as IntersectionObserver,
+          rootMargin: this.rootMargin,
+        };
+        observations.push(this.observation);
+      }
+
+      disconnect(): void {}
+
+      observe(element: Element): void {
+        this.observation.element = element;
+      }
+
+      takeRecords(): IntersectionObserverEntry[] {
+        return [];
+      }
+
+      unobserve(): void {}
+    }
+
+    const intersect = (
+      observation: Observation,
+      isIntersecting: boolean,
+    ): void => {
+      observation.callback(
+        [
+          {
+            isIntersecting,
+            target: observation.element!,
+          } as IntersectionObserverEntry,
+        ],
+        observation.observer,
+      );
+    };
+
+    vi.stubGlobal("IntersectionObserver", TestIntersectionObserver);
+    vi.mocked(highlightFile).mockReturnValue(
+      new Promise<HighlightedFile | null>(() => undefined),
+    );
+    const files = Array.from({ length: 20 }, (_, index) =>
+      syntaxFile(`const value${index} = ${index};`, `src/file-${index}.ts`),
+    );
+    renderPullDiff(diff({ files }));
+
+    expect(observations).toHaveLength(20);
+    expect(
+      observations.every(({ rootMargin }) => rootMargin === "800px 0px"),
+    ).toBe(true);
+    expect(highlightFile).not.toHaveBeenCalled();
+
+    act(() => intersect(observations[0]!, true));
+    await waitFor(() => expect(highlightFile).toHaveBeenCalledTimes(1));
+    const firstSignal = vi.mocked(highlightFile).mock.calls[0]?.[1];
+    expect(firstSignal).toBeInstanceOf(AbortSignal);
+    expect(firstSignal?.aborted).toBe(false);
+
+    act(() => intersect(observations[0]!, false));
+    await waitFor(() => expect(firstSignal?.aborted).toBe(true));
+
+    act(() => intersect(observations[1]!, true));
+    await waitFor(() => expect(highlightFile).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(highlightFile).mock.calls[1]?.[1]?.aborted).toBe(false);
+  });
+
+  it("keeps unsupported files as exact plain text without token wrappers", async () => {
+    const changed = syntaxFile("opaque \t content", "fixtures/readiness.data");
+    renderPullDiff(diff({ files: [changed] }));
+
+    await waitFor(() =>
+      expect(highlightFile).toHaveBeenCalledWith(
+        changed,
+        expect.any(AbortSignal),
+      ),
+    );
+    const content = document.querySelector("[data-syntax-content]")!;
+    expect(content).toHaveAttribute("data-syntax-content", "");
+    expect(content.querySelector("[data-syntax-token]")).toBeNull();
+    expect(content.textContent).toBe("opaque \t content");
+  });
+
+  it("preserves the non-breaking-space placeholder for an empty diff line", async () => {
+    const changed = syntaxFile("");
+    vi.mocked(highlightFile).mockResolvedValueOnce(syntaxHighlight([]));
+    const { container } = renderPullDiff(diff({ files: [changed] }));
+
+    await waitFor(() =>
+      expect(highlightFile).toHaveBeenCalledWith(
+        changed,
+        expect.any(AbortSignal),
+      ),
+    );
+    const content = container.querySelector("[data-syntax-content]")!;
+    expect(content.textContent).toBe("\u00a0");
+    expect(
+      container.querySelector('[data-line-kind="addition"] code')
+        ?.firstElementChild,
+    ).toHaveTextContent("+");
+  });
+
+  it("switches syntax themes through CSS state without tokenizing again", async () => {
+    const changed = syntaxFile("return true;");
+    vi.mocked(highlightFile).mockResolvedValueOnce(
+      syntaxHighlight([syntaxToken("return true;")]),
+    );
+    const data = diff({ files: [changed] });
+    const view = render(<ControlledPullDiff data={data} />);
+
+    await waitFor(() =>
+      expect(
+        view.container.querySelector("[data-syntax-token]"),
+      ).toBeInTheDocument(),
+    );
+    expect(highlightFile).toHaveBeenCalledTimes(1);
+    document.documentElement.classList.add("dark");
+    view.rerender(<ControlledPullDiff data={data} />);
+    expect(highlightFile).toHaveBeenCalledTimes(1);
+    expect(view.container.querySelector("[data-syntax-token]")).toHaveStyle({
+      "--syntax-dark-foreground": "#79c0ff",
+      "--syntax-light-foreground": "#0550ae",
+    });
+    document.documentElement.classList.remove("dark");
+  });
+
+  it("highlights selected commit diffs through the shared renderer", async () => {
+    const changed = syntaxFile("let committed = true;");
+    vi.mocked(highlightFile).mockResolvedValueOnce(
+      syntaxHighlight([
+        syntaxToken("let", {
+          darkFontWeight: 700,
+          lightFontWeight: 700,
+        }),
+        syntaxToken(" committed = true;"),
+      ]),
+    );
+    const { container } = renderPullDiff(commitDiff({ files: [changed] }));
+
+    await waitFor(() =>
+      expect(container.querySelectorAll("[data-syntax-token]")).toHaveLength(2),
+    );
+    expect(container.querySelector("[data-diff-revision]")).toHaveTextContent(
+      COMMIT.slice(0, 7),
+    );
+    expect(
+      container.querySelector('[data-line-kind="addition"] code'),
+    ).toHaveTextContent("+let committed = true;");
+  });
+
   it("renders a compact GitHub-like unified patch with file navigation and gutters", () => {
     const { container } = renderPullDiff();
 
@@ -556,6 +914,282 @@ describe("PullDiff", () => {
     expect(document.getElementById(firstBodyId)).toBeInTheDocument();
     expect(document.getElementById(firstBodyId)).not.toBe(firstBody);
     expect(document.getElementById(firstBodyId)).toHaveTextContent("after()");
+  });
+
+  it("anchors the next file beneath sticky headers after collapsing a viewed file", () => {
+    const current = file({ path: "a/current.ts" });
+    const next = file({ path: "b/next.ts" });
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: scrollIntoView,
+    });
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      function (this: HTMLElement) {
+        if (this.hasAttribute("data-scroll-owner")) return bounds(100, 500);
+        if (this.hasAttribute("data-test-sticky")) return bounds(100, 144);
+        if (this.hasAttribute("data-test-other-sticky")) {
+          return bounds(100, 300, 900, 1_200);
+        }
+        const path = this.querySelector<HTMLElement>(
+          "[data-diff-file-name]",
+        )?.textContent;
+        if (path === current.path) return bounds(180, 220);
+        if (path === next.path) return bounds(260, 400);
+        return bounds(0, 0);
+      },
+    );
+
+    const view = render(
+      <div data-scroll-owner="" style={{ height: 400, overflowY: "auto" }}>
+        <div
+          className="sticky"
+          data-test-sticky=""
+          style={{ position: "sticky", top: 0 }}
+        />
+        <div
+          className="sticky"
+          data-test-other-sticky=""
+          style={{ position: "sticky", top: 0 }}
+        />
+        <ControlledPullDiff data={diff({ files: [next, current] })} />
+      </div>,
+    );
+    const owner = view.container.querySelector<HTMLElement>(
+      "[data-scroll-owner]",
+    )!;
+    Object.defineProperties(owner, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 1_200 },
+    });
+    owner.scrollLeft = 53;
+    owner.scrollTop = 400;
+    const navigation = screen.getByRole("navigation", {
+      name: "Changed files",
+    });
+    navigation.scrollLeft = 81;
+    const nextSection = screen
+      .getByRole("checkbox", { name: `Viewed ${next.path}` })
+      .closest<HTMLElement>("[data-diff-file]")!;
+    const nextHeader = nextSection.querySelector<HTMLElement>(
+      "[data-diff-file-header]",
+    )!;
+    const nextPatch = nextSection.querySelector<HTMLElement>(
+      "[data-diff-file-patch]",
+    )!;
+    nextPatch.scrollLeft = 117;
+    const viewed = screen.getByRole("checkbox", {
+      name: `Viewed ${current.path}`,
+    });
+    viewed.focus();
+
+    fireEvent.click(viewed);
+
+    expect(owner.scrollTop).toBe(516);
+    expect(owner.scrollLeft).toBe(53);
+    expect(navigation.scrollLeft).toBe(81);
+    expect(nextPatch.scrollLeft).toBe(117);
+    expect(nextHeader).toHaveAttribute("tabindex", "-1");
+    expect(nextHeader).toHaveClass(
+      "outline-none",
+      "focus-visible:ring-3",
+      "focus-visible:ring-ring/50",
+    );
+    expect(nextHeader).toHaveFocus();
+    expect(scrollIntoView).not.toHaveBeenCalled();
+  });
+
+  it("materializes a virtualized next file before anchoring it", () => {
+    const files = Array.from({ length: 21 }, (_, index) =>
+      file({ path: `src/file-${String(index + 1).padStart(2, "0")}.ts` }),
+    );
+    const target = files[20]!;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      function (this: HTMLElement) {
+        if (this.hasAttribute("data-scroll-owner")) return bounds(50, 450);
+        const path = this.querySelector<HTMLElement>(
+          "[data-diff-file-name]",
+        )?.textContent;
+        return path === target.path ? bounds(310, 410) : bounds(0, 0);
+      },
+    );
+
+    const view = render(
+      <div data-scroll-owner="" style={{ height: 400, overflowY: "auto" }}>
+        <ControlledPullDiff data={diff({ files })} />
+      </div>,
+    );
+    const owner = view.container.querySelector<HTMLElement>(
+      "[data-scroll-owner]",
+    )!;
+    Object.defineProperties(owner, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 2_000 },
+    });
+    owner.scrollTop = 200;
+    expect(
+      screen.queryByRole("checkbox", { name: `Viewed ${target.path}` }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: `Viewed ${files[19]!.path}`,
+      }),
+    );
+
+    expect(
+      screen.getByRole("checkbox", { name: `Viewed ${target.path}` }),
+    ).toBeInTheDocument();
+    expect(owner.scrollTop).toBe(460);
+    expect(
+      screen
+        .getByRole("checkbox", { name: `Viewed ${target.path}` })
+        .closest("[data-diff-file]")
+        ?.querySelector("[data-diff-file-header]"),
+    ).toHaveFocus();
+  });
+
+  it("anchors the collapsed current header for the last file and never scrolls when unchecking", () => {
+    const only = file({ path: "src/only.ts" });
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      function (this: HTMLElement) {
+        if (this.hasAttribute("data-scroll-owner")) return bounds(100, 500);
+        if (this.hasAttribute("data-test-sticky")) return bounds(100, 145);
+        if (this.hasAttribute("data-diff-file")) return bounds(215, 255);
+        return bounds(0, 0);
+      },
+    );
+
+    const view = render(
+      <div data-scroll-owner="" style={{ height: 400, overflowY: "auto" }}>
+        <div
+          className="sticky"
+          data-test-sticky=""
+          style={{ position: "sticky", top: 0 }}
+        />
+        <ControlledPullDiff data={diff({ files: [only] })} />
+      </div>,
+    );
+    const owner = view.container.querySelector<HTMLElement>(
+      "[data-scroll-owner]",
+    )!;
+    Object.defineProperties(owner, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 1_000 },
+    });
+    owner.scrollTop = 400;
+    const viewed = screen.getByRole("checkbox", {
+      name: `Viewed ${only.path}`,
+    });
+    const currentHeader = viewed
+      .closest("[data-diff-file]")
+      ?.querySelector("[data-diff-file-header]");
+
+    fireEvent.click(viewed);
+
+    expect(owner.scrollTop).toBe(470);
+    expect(currentHeader).toHaveFocus();
+
+    owner.scrollTop = 333;
+    fireEvent.click(viewed);
+
+    expect(owner.scrollTop).toBe(333);
+  });
+
+  it("anchors an already-viewed next file in a read-only commit diff without review mutations", () => {
+    const current = file({ path: "a/current.ts" });
+    const next = file({ path: "b/next.ts" });
+    const clearReviewRetry = vi.fn();
+    const startRun = vi.fn(async () => acceptedReviewRun());
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      function (this: HTMLElement) {
+        if (this.hasAttribute("data-scroll-owner")) return bounds(40, 440);
+        const path = this.querySelector<HTMLElement>(
+          "[data-diff-file-name]",
+        )?.textContent;
+        return path === next.path ? bounds(220, 260) : bounds(0, 0);
+      },
+    );
+
+    const data = commitDiff({ files: [next, current] });
+    const view = render(
+      <div data-scroll-owner="" style={{ height: 400, overflowY: "auto" }}>
+        <ControlledPullDiff
+          clearReviewRetry={clearReviewRetry}
+          data={data}
+          initialViewed={[next.path]}
+          readOnly
+          startRun={startRun}
+        />
+      </div>,
+    );
+    const owner = view.container.querySelector<HTMLElement>(
+      "[data-scroll-owner]",
+    )!;
+    Object.defineProperties(owner, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 1_000 },
+    });
+    owner.scrollTop = 100;
+
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: `Viewed ${current.path}` }),
+    );
+
+    expect(owner.scrollTop).toBe(280);
+    const nextViewed = screen.getByRole("checkbox", {
+      name: `Viewed ${next.path}`,
+    });
+    expect(nextViewed).toBeChecked();
+    expect(
+      nextViewed
+        .closest("[data-diff-file]")
+        ?.querySelector("[data-diff-file-header]"),
+    ).toHaveFocus();
+    expect(clearReviewRetry).not.toHaveBeenCalled();
+    expect(startRun).not.toHaveBeenCalled();
+  });
+
+  it("cancels a pending viewed anchor when the diff revision changes", () => {
+    const first = file({ path: "src/first.ts" });
+    const next = file({ path: "src/next.ts" });
+    const toggleViewed = vi.fn();
+    const data = diff({ files: [first, next] });
+    const view = render(
+      <PullDiff
+        clearReviewRetry={defaultClearReviewRetry}
+        diff={data}
+        pull={pullFor(data)}
+        run={IDLE_RUN_STATE}
+        startRun={defaultStartRun}
+        toggleViewed={toggleViewed}
+        viewed={new Set()}
+      />,
+    );
+    const scrolling = (document.scrollingElement ??
+      document.documentElement) as HTMLElement;
+    scrolling.scrollTop = 271;
+
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: `Viewed ${first.path}` }),
+    );
+    const replacement = diff({
+      files: [first, next],
+      headRefOid: "dddddddddddddddddddddddddddddddddddddddd",
+    });
+    view.rerender(
+      <PullDiff
+        clearReviewRetry={defaultClearReviewRetry}
+        diff={replacement}
+        pull={pullFor(replacement)}
+        run={IDLE_RUN_STATE}
+        startRun={defaultStartRun}
+        toggleViewed={toggleViewed}
+        viewed={new Set([first.path])}
+      />,
+    );
+
+    expect(scrolling.scrollTop).toBe(271);
   });
 
   it("does not recompute unaffected patches when selection or viewed state changes", () => {
@@ -1751,11 +2385,7 @@ describe("PullDiff", () => {
     const cardOrder = [
       ...container.querySelectorAll<HTMLElement>("[data-diff-file-name]"),
     ].map((name) => name.textContent);
-    expect(treeOrder).toEqual([
-      "docs/readme.md",
-      "src/core/a.ts",
-      "src/z.ts",
-    ]);
+    expect(treeOrder).toEqual(["docs/readme.md", "src/core/a.ts", "src/z.ts"]);
     expect(cardOrder).toEqual(treeOrder);
 
     fireEvent.click(screen.getByRole("button", { name: /^src$/ }));

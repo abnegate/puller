@@ -22,9 +22,14 @@ import {
   getRecentReleases,
   getReleaseOptions,
   getReleasePipelines,
+  getReleasePreview,
 } from "./api";
 import type { ClaudeRunEvent, ClaudeRunRequest } from "./fixes";
-import { RELEASE_PANEL_STORAGE_KEY } from "./release-panel";
+import {
+  RELEASE_PANEL_STORAGE_KEY,
+  serializeReleasePanelPreference,
+} from "./release-panel";
+import { RELEASE_PIPELINE_FOLLOWUP_INTERVAL } from "./release-pipelines";
 import { resetReleaseOptionsCacheForTests } from "./release-options";
 import { createMemoryRunTranscriptStore } from "./run-transcripts";
 import { IDLE_RUN_STATE, type RunState } from "./runs";
@@ -41,6 +46,7 @@ import type {
   RecentRelease,
   RecentReleasesResponse,
   ReleasePipelinesResponse,
+  ReleasePreview,
   Task,
   TaskEvent,
   VerificationRunEvent,
@@ -78,6 +84,7 @@ vi.mock("./api", async (importOriginal) => ({
   getRecentReleases: vi.fn(),
   getReleasePipelines: vi.fn(),
   getReleaseOptions: vi.fn(),
+  getReleasePreview: vi.fn(),
   getTaskOptions: taskActions.options,
   getTasks: taskActions.list,
   mergePull: actions.merge,
@@ -111,6 +118,7 @@ const getPullDiffMock = vi.mocked(getPullDiff);
 const getPullsMock = vi.mocked(getPulls);
 const getRecentReleasesMock = vi.mocked(getRecentReleases);
 const getReleasePipelinesMock = vi.mocked(getReleasePipelines);
+const getReleasePreviewMock = vi.mocked(getReleasePreview);
 const getReleaseOptionsMock = vi.mocked(getReleaseOptions);
 const originalVisibility = Object.getOwnPropertyDescriptor(
   document,
@@ -266,6 +274,26 @@ const releaseResponse = (
   partial,
   releases,
   warnings: partial ? ["Some releases were omitted."] : [],
+});
+
+const releasePreview = (
+  change: Partial<ReleasePreview> = {},
+): ReleasePreview => ({
+  baseTag: "v1.2.3",
+  body: "* Route dedicated database traffic through the pooler by @jake in https://github.com/appwrite/cloud/pull/927",
+  digest: "a".repeat(64),
+  name: "Generated v1.2.4",
+  pulls: [
+    {
+      number: 927,
+      title: "Route dedicated database traffic through the pooler",
+      url: "https://github.com/appwrite/cloud/pull/927",
+    },
+  ],
+  repository: "appwrite/cloud",
+  tag: "v1.2.4",
+  targetOid: "b".repeat(40),
+  ...change,
 });
 
 const createDeferred = <Value,>() => {
@@ -643,7 +671,7 @@ describe("App", () => {
       within(toolbar as HTMLElement).queryByText("Sort"),
     ).not.toBeInTheDocument();
     expect(
-      within(card as HTMLElement).getByRole("form", { name: "New task" }),
+      within(card as HTMLElement).getByRole("form", { name: "New PR" }),
     ).toBeInTheDocument();
     const autoGroup = within(toolbar as HTMLElement).getByRole("group", {
       name: "Auto fix controls",
@@ -827,6 +855,51 @@ describe("App", () => {
         name: `Claude auto fix output for ${ready.repository} pull request ${ready.number}`,
       }),
     ).toHaveTextContent("Fixing the new blocker.");
+
+    await act(async () => gate.resolve(undefined));
+  });
+
+  it("keeps pull refresh and Auto dispatch active while recent releases have full-width focus", async () => {
+    installWebLocks();
+    window.localStorage.setItem(
+      RELEASE_PANEL_STORAGE_KEY,
+      serializeReleasePanelPreference("releases"),
+    );
+    const ready = createPullsResponse().ready[0]!;
+    const changed = withNewComment(ready);
+    const gate = createDeferred<void>();
+    mockGatedRun(gate.promise, "release-focus-auto-run");
+    getPullsMock
+      .mockResolvedValueOnce(responseWith([ready], []))
+      .mockResolvedValueOnce(responseWith([changed], []));
+
+    const view = render(<App />);
+
+    await waitFor(() => expect(getPullsMock).toHaveBeenCalledTimes(1));
+    const pulls = view.container.querySelector<HTMLElement>(
+      "#pull-requests-panel",
+    )!;
+    expect(pulls).toHaveAttribute("inert");
+    expect(await within(pulls).findByText(ready.title)).toBeInTheDocument();
+    const auto = screen.getByRole("button", { name: "Auto" });
+    await waitFor(() => expect(auto).toBeEnabled());
+    fireEvent.click(auto);
+    await waitFor(() =>
+      expect(auto).toHaveAttribute("data-auto-status", "watching"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    await waitFor(() => expect(fixes.stream).toHaveBeenCalledOnce());
+    expect(fixes.stream.mock.calls[0]![0]).toMatchObject({
+      number: ready.number,
+      repository: ready.repository,
+      source: "auto",
+    });
+    expect(
+      view.container.querySelector("[data-dashboard-columns]"),
+    ).toHaveAttribute("data-dashboard-mode", "releases");
+    expect(pulls).toHaveAttribute("inert");
 
     await act(async () => gate.resolve(undefined));
   });
@@ -1447,36 +1520,55 @@ describe("App", () => {
       "grid",
       "lg:grid-cols-[minmax(0,1.7fr)_minmax(22rem,0.8fr)]",
     );
-    expect(columns).toHaveAttribute("data-release-panel-expanded", "true");
+    expect(columns).toHaveAttribute("data-dashboard-mode", "split");
     expect(columns).toContainElement(pulls);
     expect(columns).toContainElement(releases);
+    expect(pulls).toHaveAttribute("id", "pull-requests-panel");
+    expect(pulls).toHaveAttribute("aria-hidden", "false");
+    expect(pulls).not.toHaveAttribute("inert");
+    expect(pulls).toHaveAttribute("data-state", "visible");
     expect(releases).toHaveAttribute("id", "recent-releases-panel");
     expect(releases).toHaveAttribute("aria-hidden", "false");
     expect(releases).not.toHaveAttribute("inert");
-    expect(releases).toHaveAttribute("data-state", "expanded");
-    const toggle = screen.getByRole("button", {
+    expect(releases).toHaveAttribute("data-state", "visible");
+    const pullToggle = screen.getByRole("button", {
+      name: "Hide pull requests",
+    });
+    expect(pullToggle).toHaveAttribute("aria-controls", "pull-requests-panel");
+    expect(pullToggle).toHaveAttribute("aria-expanded", "true");
+    expect(pullToggle).toHaveAttribute("title", "Focus recent releases");
+    expect(pullToggle).toHaveAttribute("data-pull-panel-toggle");
+    const releaseToggle = screen.getByRole("button", {
       name: "Hide recent releases",
     });
-    expect(toggle).toHaveAttribute("aria-controls", "recent-releases-panel");
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
-    expect(toggle).toHaveAttribute("title", "Hide recent releases");
-    expect(toggle).toHaveAttribute("data-release-panel-toggle");
+    expect(releaseToggle).toHaveAttribute(
+      "aria-controls",
+      "recent-releases-panel",
+    );
+    expect(releaseToggle).toHaveAttribute("aria-expanded", "true");
+    expect(releaseToggle).toHaveAttribute("title", "Focus pull requests");
+    expect(releaseToggle).toHaveAttribute("data-release-panel-toggle");
     expect(
       screen
         .getByRole("button", { name: /^Theme:/ })
-        .compareDocumentPosition(toggle),
+        .compareDocumentPosition(pullToggle),
     ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(pullToggle.compareDocumentPosition(releaseToggle)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
     expect(
-      toggle.compareDocumentPosition(
+      releaseToggle.compareDocumentPosition(
         screen.getByRole("button", { name: "Refresh" }),
       ),
     ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
-    expect(
-      container.querySelector('[data-release-date="2026-07-21"]'),
-    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        container.querySelector('[data-release-date="2026-07-21"]'),
+      ).toBeInTheDocument(),
+    );
   });
 
-  it("collapses the mounted release rail and preserves its page, disclosure, and active verification", async () => {
+  it("focuses either mounted pane without losing release navigation, disclosure, or active verification", async () => {
     const releases = createReleaseHistory(21);
     const gate = createDeferred<void>();
     getPullsMock.mockResolvedValue(createPullsResponse());
@@ -1487,7 +1579,7 @@ describe("App", () => {
       yield { ...request, runId: "persistent-verification", type: "start" };
       yield { text: "Verification remains active.\n", type: "text" };
       await gate.promise;
-      yield { exitCode: 0, type: "complete" };
+      yield { exitCode: 0, outcome: "verified", type: "complete" };
     });
     const view = render(<App />);
 
@@ -1509,7 +1601,10 @@ describe("App", () => {
       }),
     ).toHaveTextContent("Verification remains active.");
 
-    const panel = view.container.querySelector<HTMLElement>(
+    const pulls = view.container.querySelector<HTMLElement>(
+      "#pull-requests-panel",
+    )!;
+    const releasesPanel = view.container.querySelector<HTMLElement>(
       "#recent-releases-panel",
     )!;
     fireEvent.click(
@@ -1521,12 +1616,14 @@ describe("App", () => {
     ).toHaveAttribute("aria-expanded", "false");
     expect(
       view.container.querySelector("[data-dashboard-columns]"),
-    ).toHaveAttribute("data-release-panel-expanded", "false");
-    expect(panel).toHaveAttribute("aria-hidden", "true");
-    expect(panel).toHaveAttribute("inert");
-    expect(panel).toHaveAttribute("data-state", "collapsed");
+    ).toHaveAttribute("data-dashboard-mode", "pulls");
+    expect(pulls).toHaveAttribute("aria-hidden", "false");
+    expect(pulls).not.toHaveAttribute("inert");
+    expect(releasesPanel).toHaveAttribute("aria-hidden", "true");
+    expect(releasesPanel).toHaveAttribute("inert");
+    expect(releasesPanel).toHaveAttribute("data-state", "hidden");
     expect(
-      within(panel).getByRole("log", {
+      within(releasesPanel).getByRole("log", {
         hidden: true,
         name: "Claude verification output for appwrite/cloud #21",
       }),
@@ -1537,7 +1634,12 @@ describe("App", () => {
       screen.getByRole("button", { name: "Show recent releases" }),
     );
 
-    expect(view.container.querySelector("#recent-releases-panel")).toBe(panel);
+    expect(view.container.querySelector("#recent-releases-panel")).toBe(
+      releasesPanel,
+    );
+    expect(
+      view.container.querySelector("[data-dashboard-columns]"),
+    ).toHaveAttribute("data-dashboard-mode", "split");
     expect(screen.getByText("Page 2 of 2")).toBeInTheDocument();
     expect(
       screen.getByRole("button", {
@@ -1554,13 +1656,40 @@ describe("App", () => {
     ).toBeDisabled();
     expect(getRecentReleasesMock).toHaveBeenCalledTimes(1);
 
+    fireEvent.click(screen.getByRole("button", { name: "Hide pull requests" }));
+
+    expect(
+      view.container.querySelector("[data-dashboard-columns]"),
+    ).toHaveAttribute("data-dashboard-mode", "releases");
+    expect(pulls).toHaveAttribute("aria-hidden", "true");
+    expect(pulls).toHaveAttribute("inert");
+    expect(pulls).toHaveAttribute("data-state", "hidden");
+    expect(releasesPanel).toHaveAttribute("aria-hidden", "false");
+    expect(releasesPanel).not.toHaveAttribute("inert");
+    expect(releasesPanel).toHaveAttribute("data-state", "visible");
+    expect(screen.getByText("Page 2 of 2")).toBeInTheDocument();
+    expect(
+      screen.getByRole("log", {
+        name: "Claude verification output for appwrite/cloud #21",
+      }),
+    ).toHaveTextContent("Verification remains active.");
+
+    fireEvent.click(screen.getByRole("button", { name: "Show pull requests" }));
+
+    expect(view.container.querySelector("#pull-requests-panel")).toBe(pulls);
+    expect(
+      view.container.querySelector("[data-dashboard-columns]"),
+    ).toHaveAttribute("data-dashboard-mode", "split");
+    expect(pulls).not.toHaveAttribute("inert");
+    expect(releasesPanel).not.toHaveAttribute("inert");
+
     await act(async () => gate.resolve(undefined));
   });
 
-  it("hydrates and cross-tab synchronizes the release rail preference", async () => {
+  it("persists, restores, and cross-tab synchronizes the dashboard focus mode", async () => {
     window.localStorage.setItem(
       RELEASE_PANEL_STORAGE_KEY,
-      JSON.stringify({ expanded: false, version: 1 }),
+      serializeReleasePanelPreference("releases"),
     );
     getPullsMock.mockResolvedValue(createPullsResponse());
     getRecentReleasesMock.mockResolvedValue(
@@ -1568,28 +1697,111 @@ describe("App", () => {
     );
     const view = render(<App />);
 
-    const collapsed = await screen.findByRole("button", {
-      name: "Show recent releases",
+    const showPulls = await screen.findByRole("button", {
+      name: "Show pull requests",
     });
-    expect(collapsed).toHaveAttribute("aria-expanded", "false");
+    expect(showPulls).toHaveAttribute("aria-expanded", "false");
+    expect(
+      view.container.querySelector("#pull-requests-panel"),
+    ).toHaveAttribute("inert");
     expect(
       view.container.querySelector("#recent-releases-panel"),
+    ).not.toHaveAttribute("inert");
+
+    fireEvent.click(showPulls);
+    expect(
+      view.container.querySelector("[data-dashboard-columns]"),
+    ).toHaveAttribute("data-dashboard-mode", "split");
+    expect(window.localStorage.getItem(RELEASE_PANEL_STORAGE_KEY)).toBe(
+      serializeReleasePanelPreference("split"),
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Hide recent releases" }),
+    );
+    expect(window.localStorage.getItem(RELEASE_PANEL_STORAGE_KEY)).toBe(
+      serializeReleasePanelPreference("pulls"),
+    );
+
+    view.unmount();
+    const restored = render(<App />);
+    expect(
+      await screen.findByRole("button", { name: "Show recent releases" }),
+    ).toHaveAttribute("aria-expanded", "false");
+    expect(
+      restored.container.querySelector("#recent-releases-panel"),
     ).toHaveAttribute("inert");
 
     fireEvent(
       window,
       new StorageEvent("storage", {
         key: RELEASE_PANEL_STORAGE_KEY,
-        newValue: JSON.stringify({ expanded: true, version: 1 }),
+        newValue: serializeReleasePanelPreference("releases"),
       }),
     );
 
     expect(
-      await screen.findByRole("button", { name: "Hide recent releases" }),
-    ).toHaveAttribute("aria-expanded", "true");
+      await screen.findByRole("button", { name: "Show pull requests" }),
+    ).toHaveAttribute("aria-expanded", "false");
+    expect(
+      restored.container.querySelector("#pull-requests-panel"),
+    ).toHaveAttribute("inert");
+    expect(
+      restored.container.querySelector("#recent-releases-panel"),
+    ).not.toHaveAttribute("inert");
+  });
+
+  it("polls deployment pipelines only while recent releases are visible", async () => {
+    window.localStorage.setItem(
+      RELEASE_PANEL_STORAGE_KEY,
+      serializeReleasePanelPreference("pulls"),
+    );
+    const item = {
+      ...createRecentRelease("one", [41]),
+      pipeline: {
+        checkedAt: new Date().toISOString(),
+        lookup: "pending" as const,
+        runs: [],
+      },
+      publishedAt: new Date().toISOString(),
+    };
+    getPullsMock.mockResolvedValue(createPullsResponse());
+    getRecentReleasesMock.mockResolvedValue(releaseResponse([item]));
+    getReleasePipelinesMock.mockResolvedValue({
+      generatedAt: new Date().toISOString(),
+      releases: [
+        {
+          id: item.id,
+          pipeline: item.pipeline,
+          publishedAt: item.publishedAt,
+          repository: item.repository,
+          tag: item.tag,
+        },
+      ],
+    });
+    const view = render(<App />);
+
+    await flushPromises();
+    expect(getRecentReleasesMock).toHaveBeenCalledOnce();
+    expect(getReleasePipelinesMock).not.toHaveBeenCalled();
     expect(
       view.container.querySelector("#recent-releases-panel"),
-    ).not.toHaveAttribute("inert");
+    ).toHaveAttribute("inert");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show recent releases" }),
+    );
+    await waitFor(() => expect(getReleasePipelinesMock).toHaveBeenCalledOnce());
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Hide recent releases" }),
+    );
+    expect(
+      view.container.querySelector("#recent-releases-panel"),
+    ).toHaveAttribute("inert");
+    act(() => window.dispatchEvent(new Event("focus")));
+    await flushPromises();
+    expect(getReleasePipelinesMock).toHaveBeenCalledOnce();
   });
 
   it("removes an exactly merged pull before the background refresh resolves", async () => {
@@ -3344,7 +3556,9 @@ describe("App", () => {
       await enrichment.promise;
     });
     await waitFor(() =>
-      expect(screen.queryByText("Waiting for pipeline")).not.toBeInTheDocument(),
+      expect(
+        screen.queryByText("Waiting for pipeline"),
+      ).not.toBeInTheDocument(),
     );
   });
 
@@ -3403,6 +3617,8 @@ describe("App", () => {
       tag: item.tag,
       url: item.url,
     });
+    const preview = releasePreview();
+    getReleasePreviewMock.mockResolvedValue(preview);
 
     render(<App />);
     await screen.findByText("Make readiness signals explicit");
@@ -3412,14 +3628,36 @@ describe("App", () => {
     await waitFor(() =>
       expect(screen.getByLabelText("Release tag")).toHaveValue("v1.2.4"),
     );
-    fireEvent.click(
-      screen.getByRole("button", { name: "Review release" }),
+    fireEvent.click(screen.getByRole("button", { name: "Review release" }));
+    await waitFor(() => expect(getReleasePreviewMock).toHaveBeenCalledTimes(1));
+    expect(
+      await screen.findByRole("link", {
+        name: /Route dedicated database traffic through the pooler/,
+      }),
+    ).toHaveAttribute("href", preview.pulls[0]!.url);
+    expect(getReleasePreviewMock).toHaveBeenCalledWith(
+      {
+        expectedLatestTag: "v1.2.3",
+        repository: "appwrite/cloud",
+        tag: "v1.2.4",
+      },
+      expect.any(AbortSignal),
     );
-    fireEvent.click(
-      screen.getByRole("button", { name: "Publish release" }),
-    );
+    const publish = screen.getByRole("button", { name: "Publish release" });
+    expect(publish).toBeEnabled();
+    fireEvent.click(publish);
 
     await waitFor(() => expect(createReleaseMock).toHaveBeenCalledTimes(1));
+    expect(createReleaseMock).toHaveBeenCalledWith(
+      {
+        expectedLatestTag: "v1.2.3",
+        prerelease: false,
+        preview,
+        repository: "appwrite/cloud",
+        tag: "v1.2.4",
+      },
+      expect.any(AbortSignal),
+    );
     await waitFor(() =>
       expect(getPullsMock).toHaveBeenNthCalledWith(
         2,
@@ -3478,7 +3716,9 @@ describe("App", () => {
     );
     expect(screen.queryByText("Release one")).not.toBeInTheDocument();
     expect(screen.getByText("Release two")).toBeInTheDocument();
-    expect(getReleasePipelinesMock).toHaveBeenCalledTimes(2);
+    expect(getReleasePipelinesMock).toHaveBeenCalledTimes(
+      2 + RELEASE_REFRESH_INTERVAL / RELEASE_PIPELINE_FOLLOWUP_INTERVAL,
+    );
   });
 
   it("keeps release cards and refresh controls visually idle during a background refresh", async () => {
@@ -3999,7 +4239,7 @@ describe("App", () => {
     render(<App />);
     await flushPromises();
 
-    const prompt = screen.getByPlaceholderText("New task…");
+    const prompt = screen.getByPlaceholderText("New PR…");
     fireEvent.change(prompt, {
       target: { value: "Keep this unsaved task prompt." },
     });

@@ -11,6 +11,11 @@ import type {
 } from "./types";
 
 export const RELEASE_PIPELINE_REFRESH_INTERVAL = 5_000;
+export const RELEASE_PIPELINE_FOLLOWUP_INTERVAL = 30_000;
+export const RELEASE_PIPELINE_DISCOVERY_WINDOW = 5 * 60 * 1_000;
+const RELEASE_PIPELINE_MAXIMUM_BACKOFF = 60_000;
+
+type PipelineRefreshMode = "discover" | "poll" | "refresh";
 
 type ReleaseIdentity = Pick<
   ReleasePipelineRelease,
@@ -20,8 +25,8 @@ type ReleaseIdentity = Pick<
 type PipelineRequest = {
   controller: AbortController;
   fingerprint: string;
-  force: boolean;
   generation: number;
+  mode: PipelineRefreshMode;
   promise: Promise<void>;
 };
 
@@ -47,13 +52,13 @@ export const releasePipelineIdentity = (release: ReleaseIdentity): string =>
 export const releasePipelineFingerprint = (
   releases: readonly ReleaseIdentity[],
 ): string =>
-  JSON.stringify(releases.map(releasePipelineIdentity).sort((left, right) =>
-    left.localeCompare(right),
-  ));
+  JSON.stringify(
+    releases
+      .map(releasePipelineIdentity)
+      .sort((left, right) => left.localeCompare(right)),
+  );
 
-export const isReleasePipelineActive = (
-  pipeline: ReleasePipeline,
-): boolean =>
+export const isReleasePipelineActive = (pipeline: ReleasePipeline): boolean =>
   pipeline.lookup === "pending" ||
   pipeline.runs.some(
     (run) => run.state === "queued" || run.state === "running",
@@ -63,6 +68,50 @@ export const hasActiveReleasePipelines = (
   releases: readonly Pick<RecentRelease, "pipeline">[],
 ): boolean =>
   releases.some((release) => isReleasePipelineActive(release.pipeline));
+
+export const hasYoungReleasePipelines = (
+  releases: readonly Pick<RecentRelease, "publishedAt">[],
+  clock = Date.now(),
+): boolean =>
+  releases.some(
+    (release) =>
+      clock - Date.parse(release.publishedAt) <
+      RELEASE_PIPELINE_DISCOVERY_WINDOW,
+  );
+
+const hasFastReleasePipelines = (
+  releases: readonly RecentRelease[],
+  clock = Date.now(),
+): boolean =>
+  releases.some(
+    (release) =>
+      release.pipeline.runs.some(
+        (run) => run.state === "queued" || run.state === "running",
+      ) ||
+      (release.pipeline.lookup === "pending" &&
+        clock - Date.parse(release.publishedAt) <
+          RELEASE_PIPELINE_DISCOVERY_WINDOW),
+  );
+
+const hasTargetedReleasePipelines = (
+  releases: readonly RecentRelease[],
+  clock = Date.now(),
+): boolean =>
+  releases.some(
+    (release) =>
+      release.pipeline.runs.length === 0 ||
+      release.pipeline.runs.some(
+        (run) => run.state === "queued" || run.state === "running",
+      ) ||
+      clock - Date.parse(release.publishedAt) <
+        RELEASE_PIPELINE_DISCOVERY_WINDOW,
+  );
+
+const refreshPriority: Record<PipelineRefreshMode, number> = {
+  poll: 0,
+  discover: 1,
+  refresh: 2,
+};
 
 const compareDecimal = (left: string, right: string): number => {
   const leftValue = BigInt(left);
@@ -84,7 +133,8 @@ const chooseWorkflowRun = (
     return updated > 0 ? candidate : current;
   }
 
-  const created = Date.parse(candidate.createdAt) - Date.parse(current.createdAt);
+  const created =
+    Date.parse(candidate.createdAt) - Date.parse(current.createdAt);
   if (created !== 0) return created > 0 ? candidate : current;
   return compareDecimal(candidate.id, current.id) > 0 ? candidate : current;
 };
@@ -234,9 +284,9 @@ export const useReleasePipelinePolling = ({
     () => releasePipelineFingerprint(releases),
     [releases],
   );
-  const active = hasActiveReleasePipelines(releases);
   const confirmationsRef = useRef(new Map<string, string>());
   const enabledRef = useRef(enabled);
+  const failuresRef = useRef(0);
   const fingerprintRef = useRef(fingerprint);
   const generationRef = useRef(0);
   const mountedRef = useRef(true);
@@ -244,7 +294,7 @@ export const useReleasePipelinePolling = ({
   const releasesRef = useRef(releases);
   const requestRef = useRef<PipelineRequest | null>(null);
   const timerRef = useRef<number | null>(null);
-  const refreshRef = useRef<(force?: boolean) => Promise<void>>(
+  const refreshRef = useRef<(mode?: PipelineRefreshMode) => Promise<void>>(
     async () => undefined,
   );
   const configurationRef = useRef({
@@ -270,28 +320,39 @@ export const useReleasePipelinePolling = ({
     requestRef.current?.controller.abort();
     requestRef.current = null;
     confirmationsRef.current.clear();
+    failuresRef.current = 0;
   }, [clearTimer]);
 
   const schedule = useCallback(() => {
     clearTimer();
+    const baseInterval =
+      hasFastReleasePipelines(releasesRef.current) ||
+      confirmationsRef.current.size > 0
+        ? RELEASE_PIPELINE_REFRESH_INTERVAL
+        : releasesRef.current.length > 0
+          ? RELEASE_PIPELINE_FOLLOWUP_INTERVAL
+          : null;
     if (
       !mountedRef.current ||
       !enabledRef.current ||
       !pageIsVisible() ||
-      (!hasActiveReleasePipelines(releasesRef.current) &&
-        confirmationsRef.current.size === 0)
+      baseInterval === null
     ) {
       return;
     }
 
+    const interval = Math.min(
+      baseInterval * 2 ** failuresRef.current,
+      RELEASE_PIPELINE_MAXIMUM_BACKOFF,
+    );
     timerRef.current = window.setTimeout(() => {
       timerRef.current = null;
-      void refreshRef.current(false);
-    }, RELEASE_PIPELINE_REFRESH_INTERVAL);
+      void refreshRef.current("poll");
+    }, interval);
   }, [clearTimer]);
 
   const refresh = useCallback(
-    async (force = true): Promise<void> => {
+    async (mode: PipelineRefreshMode = "refresh"): Promise<void> => {
       if (
         !mountedRef.current ||
         !enabledRef.current ||
@@ -303,9 +364,11 @@ export const useReleasePipelinePolling = ({
 
       const activeRequest = requestRef.current;
       if (activeRequest) {
-        if (!force || activeRequest.force) return activeRequest.promise;
+        if (refreshPriority[mode] <= refreshPriority[activeRequest.mode]) {
+          return activeRequest.promise;
+        }
         await activeRequest.promise;
-        return refreshRef.current(true);
+        return refreshRef.current(mode);
       }
 
       clearTimer();
@@ -322,14 +385,20 @@ export const useReleasePipelinePolling = ({
       const request: PipelineRequest = {
         controller,
         fingerprint: requestFingerprint,
-        force,
         generation,
+        mode,
         promise: Promise.resolve(),
       };
 
       request.promise = (async () => {
         try {
-          const snapshot = await getReleasePipelines(controller.signal, force);
+          const snapshot =
+            mode === "discover"
+              ? await getReleasePipelines(controller.signal, false, true)
+              : await getReleasePipelines(
+                  controller.signal,
+                  mode === "refresh",
+                );
           if (
             !mountedRef.current ||
             !enabledRef.current ||
@@ -377,10 +446,12 @@ export const useReleasePipelinePolling = ({
             }
           }
           releasesRef.current = next;
+          failuresRef.current = 0;
           onSnapshotRef.current(snapshot);
         } catch {
           // Pipeline refreshes are opportunistic and never replace the release
           // membership error surface.
+          failuresRef.current += 1;
         } finally {
           if (requestRef.current !== request) return;
           requestRef.current = null;
@@ -412,17 +483,22 @@ export const useReleasePipelinePolling = ({
         return;
       }
 
-      if (enabledRef.current && releasesRef.current.length > 0) {
-        void refreshRef.current(false);
+      if (
+        enabledRef.current &&
+        (hasTargetedReleasePipelines(releasesRef.current) ||
+          confirmationsRef.current.size > 0)
+      ) {
+        void refreshRef.current("discover");
       }
     };
     const handleFocus = () => {
       if (
         pageIsVisible() &&
         enabledRef.current &&
-        releasesRef.current.length > 0
+        (hasTargetedReleasePipelines(releasesRef.current) ||
+          confirmationsRef.current.size > 0)
       ) {
-        void refreshRef.current(false);
+        void refreshRef.current("discover");
       }
     };
 
@@ -448,32 +524,22 @@ export const useReleasePipelinePolling = ({
     if (!enabled || releases.length === 0 || !pageIsVisible()) return;
 
     if (identityChanged || expanded || revisionChanged) {
-      void refreshRef.current(revisionChanged);
+      void refreshRef.current(revisionChanged ? "refresh" : "discover");
     }
-  }, [
-    enabled,
-    fingerprint,
-    invalidate,
-    refreshRevision,
-    releases.length,
-  ]);
+  }, [enabled, fingerprint, invalidate, refreshRevision, releases.length]);
 
   useEffect(() => {
-    if (
-      !enabled ||
-      (!active && confirmationsRef.current.size === 0) ||
-      !pageIsVisible()
-    ) {
+    if (!enabled || releases.length === 0 || !pageIsVisible()) {
       clearTimer();
       return;
     }
 
     if (!requestRef.current && timerRef.current === null) schedule();
-  }, [active, clearTimer, enabled, fingerprint, schedule]);
+  }, [clearTimer, enabled, fingerprint, releases, schedule]);
 
   return useMemo(
     () => ({
-      refresh: () => refresh(true),
+      refresh: () => refresh("refresh"),
     }),
     [refresh],
   );

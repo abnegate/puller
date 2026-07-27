@@ -22,6 +22,7 @@ import {
   createVerificationMemoryCapture,
   escapeVerificationMemory,
   parseVerificationMemoryMarker,
+  revalidateVerificationRecipes,
 } from "../verification-memory.mjs";
 
 const SHA = "abcdef0123456789abcdef0123456789abcdef01";
@@ -110,7 +111,7 @@ afterEach(async () => {
 });
 
 describe("verification-memory marker", () => {
-  it("accepts one strict final marker with only typed recipes and either outcome", () => {
+  it("accepts one strict final marker with only typed recipes and a protocol outcome", () => {
     expect(
       parseVerificationMemoryMarker(
         `Evidence.\n${marker({ outcome: "verified", recipes: recipes(), version: 1 })}`,
@@ -121,6 +122,11 @@ describe("verification-memory marker", () => {
         marker({ outcome: "not_verified", recipes: [], version: 1 }),
       ),
     ).toEqual({ outcome: "not_verified", recipes: [], version: 1 });
+    expect(
+      parseVerificationMemoryMarker(
+        marker({ outcome: "unavailable", recipes: [], version: 1 }),
+      ),
+    ).toEqual({ outcome: "unavailable", recipes: [], version: 1 });
   });
 
   it.each([
@@ -524,6 +530,16 @@ describe("verification-memory store", () => {
       snapshotRoot: snapshot,
     });
     expect(loaded.entries[0].recipes).toEqual(recipes());
+    await expect(
+      revalidateVerificationRecipes(
+        [
+          ...recipes(),
+          { kind: "file", path: "src/missing.js", role: "implementation" },
+        ],
+        snapshot,
+        { sourceBytes: 64 },
+      ),
+    ).resolves.toEqual(recipes());
   });
 
   it.each([

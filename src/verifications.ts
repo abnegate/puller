@@ -17,6 +17,7 @@ import type {
   RecentReleasesResponse,
   ReleaseVerificationEvent,
   ReleasedPull,
+  VerificationOutcome,
   VerificationRunEvent,
   VerificationRunRequest,
 } from "./types";
@@ -47,9 +48,12 @@ export type ReleaseVerificationBatchState = {
   error: string | null;
   errors: number;
   existing: number;
+  notVerified: number;
   settled: number;
   status: ReleaseVerificationBatchStatus;
   total: number;
+  unavailable: number;
+  verified: number;
 };
 
 export type ReleaseVerificationBatches = {
@@ -62,6 +66,7 @@ export type ReleaseVerificationBatches = {
 export type VerificationRunState = {
   agent: Agent;
   cancelling: boolean;
+  outcome: VerificationOutcome | null;
   output: string;
   runId: string | null;
   status: VerificationStatus;
@@ -93,6 +98,7 @@ type BatchRuntime = {
 export const IDLE_VERIFICATION_STATE: VerificationRunState = Object.freeze({
   agent: "claude",
   cancelling: false,
+  outcome: null,
   output: "",
   runId: null,
   status: "idle",
@@ -106,9 +112,12 @@ export const IDLE_RELEASE_VERIFICATION_STATE: ReleaseVerificationBatchState =
     error: null,
     errors: 0,
     existing: 0,
+    notVerified: 0,
     settled: 0,
     status: "idle",
     total: 0,
+    unavailable: 0,
+    verified: 0,
   });
 
 export const verificationKey = (
@@ -447,6 +456,7 @@ export function useVerificationRuns(
         agent: runtime.agent,
         cancelling: false,
         output: "",
+        outcome: null,
         runId: null,
         status: "starting",
       }));
@@ -482,7 +492,8 @@ export function useVerificationRuns(
             update(key, runtime, (existing) => ({
               ...existing,
               cancelling: false,
-              status: event.exitCode === 0 ? "completed" : "failed",
+              outcome: event.outcome,
+              status: "completed",
             }));
           } else if (event.type === "error") {
             ended = true;
@@ -666,18 +677,19 @@ const batchOutput = (
   current: string,
   event: Extract<ReleaseVerificationEvent, { type: "verification" }>,
 ): string => {
+  let output = current;
   if (event.message) {
-    return append(
-      current,
+    output = append(
+      output,
       `${event.state === "error" ? "[error]" : "[diagnostic]"} ${event.message}`,
     );
   }
-  if (!event.event) return current;
+  if (!event.event) return output;
 
   const formatted = formatEvent(event.event);
   return formatted === null
-    ? current
-    : append(current, formatted, event.event.type !== "text");
+    ? output
+    : append(output, formatted, event.event.type !== "text");
 };
 
 const settleActiveBatchPulls = (
@@ -717,11 +729,36 @@ const countBatchErrors = (
     return status === "failed" || status === "limited";
   }).length;
 
+const countBatchExisting = (
+  states: ReadonlyMap<string, VerificationRunState>,
+  members: Iterable<string>,
+): number =>
+  [...members].filter((key) => states.get(key)?.status === "existing").length;
+
+const countBatchOutcomes = (
+  states: ReadonlyMap<string, VerificationRunState>,
+  members: Iterable<string>,
+): Pick<
+  ReleaseVerificationBatchState,
+  "notVerified" | "unavailable" | "verified"
+> => {
+  let notVerified = 0;
+  let unavailable = 0;
+  let verified = 0;
+
+  for (const key of members) {
+    const state = states.get(key);
+    if (state?.status !== "completed") continue;
+    if (state.outcome === "verified") verified += 1;
+    else if (state.outcome === "not_verified") notVerified += 1;
+    else if (state.outcome === "unavailable") unavailable += 1;
+  }
+
+  return { notVerified, unavailable, verified };
+};
+
 const MEMBERSHIP_CHANGED_MESSAGE =
   "Release membership changed on GitHub; this pull request is no longer included in this release.";
-
-const preserveVerificationResult = (status: VerificationStatus): boolean =>
-  status === "completed" || status === "existing";
 
 export function useReleaseVerificationBatches(
   releases: readonly RecentRelease[],
@@ -849,10 +886,6 @@ export function useReleaseVerificationBatches(
         const next = new Map(existing);
         for (const pull of release.pulls) {
           const pullKey = verificationKey(release, pull);
-          const previous = existing.get(pullKey);
-          if (previous && preserveVerificationResult(previous.status)) {
-            continue;
-          }
           next.set(pullKey, {
             ...IDLE_VERIFICATION_STATE,
             agent: runtime.agent,
@@ -911,11 +944,7 @@ export function useReleaseVerificationBatches(
 
               for (const pullKey of members) {
                 const previous = existing.get(pullKey);
-                if (
-                  previous &&
-                  (isVerificationActive(previous) ||
-                    preserveVerificationResult(previous.status))
-                ) {
+                if (previous && isVerificationActive(previous)) {
                   continue;
                 }
                 next.set(pullKey, {
@@ -949,6 +978,10 @@ export function useReleaseVerificationBatches(
                 ...previous,
                 cancelling: false,
                 output: batchOutput(previous.output, event),
+                outcome:
+                  event.event?.type === "complete"
+                    ? event.event.outcome
+                    : previous.outcome,
                 runId:
                   event.event?.type === "start"
                     ? event.event.runId
@@ -961,8 +994,21 @@ export function useReleaseVerificationBatches(
               event.state,
             );
             if (terminal) {
+              const outcomes = countBatchOutcomes(
+                pullStatesRef.current,
+                runtime.members,
+              );
               updateState(key, runtime, (state) => ({
                 ...state,
+                ...outcomes,
+                errors: countBatchErrors(
+                  pullStatesRef.current,
+                  runtime.members,
+                ),
+                existing: countBatchExisting(
+                  pullStatesRef.current,
+                  runtime.members,
+                ),
                 settled: Math.min(state.total, state.settled + 1),
               }));
             }
@@ -970,8 +1016,13 @@ export function useReleaseVerificationBatches(
           }
 
           if (event.type === "complete") {
+            const outcomes = countBatchOutcomes(
+              pullStatesRef.current,
+              runtime.members,
+            );
             updateState(key, runtime, (state) => ({
               ...state,
+              ...outcomes,
               cancelling: false,
               errors: event.totals.error,
               existing: event.totals.existing,
@@ -1013,8 +1064,13 @@ export function useReleaseVerificationBatches(
               `Release verification failed: ${message}`,
             ),
           );
+          const outcomes = countBatchOutcomes(
+            pullStatesRef.current,
+            runtime.members,
+          );
           updateState(key, runtime, (state) => ({
             ...state,
+            ...outcomes,
             cancelling: false,
             error: message,
             errors: countBatchErrors(pullStatesRef.current, runtime.members),

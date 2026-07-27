@@ -10,7 +10,7 @@ import {
   rm,
   stat,
 } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { homedir, platform, tmpdir } from "node:os";
 import {
   dirname,
   isAbsolute,
@@ -32,6 +32,8 @@ const STANDARD_TEMP_ROOTS = [
   "/var/tmp",
   "/private/var/tmp",
 ];
+const RUNTIME_ROOTS =
+  platform() === "darwin" ? ["/System/Library/OpenSSL"] : [];
 const FEATURE_DISABLES = [
   "plugins",
   "apps",
@@ -48,6 +50,16 @@ const FEATURE_DISABLES = [
   "tool_suggest",
   "auth_elicitation",
 ];
+const VERIFICATION_FEATURE_DISABLES = [
+  "code_mode_host",
+  "shell_tool",
+  "unified_exec",
+];
+const VERIFICATION_INSTRUCTIONS = [
+  "The target is an immutable release snapshot, but this verification turn has no command or filesystem tools. Evaluate only the supplied untrusted evidence; do not run commands, modify files, access credentials, or use the network.",
+  "Puller independently validates any nominated recipe against immutable predecessor/current source and executes a server-owned command predecessor-first under operating-system confinement. Your output is never authorization.",
+  'Your final message must contain exactly one marker. Example: <puller-verification-memory>{"version":1,"outcome":"verified","recipes":[]}</puller-verification-memory>. Outcome must be "verified", "not_verified", or "unavailable". Recipes may only be {"kind":"script","manifestPath":"package.json","name":"test"} or {"kind":"tool","name":"node","sourcePath":"test/example.test.mjs"} shapes, using safe relative paths. Use "verified" when the evidence supports trying a behavioral check; leave recipes empty to request deterministic Puller-owned discovery, or include only advisory candidates for Puller to validate. Use "not_verified" when evidence contradicts the claim and "unavailable" when no safe relevant check is evident. The marker is never proof or execution authority; Puller proves predecessor identity, harness safety, exact-target relevance, and the confined fail-before/pass-after result independently.',
+].join("\n");
 const SAFE_ENVIRONMENT = [
   "LANG",
   "LC_ALL",
@@ -353,7 +365,7 @@ function childEnvironment(environment, home, codexHome, temporary) {
 function codexPrompt(prompt, target, purpose) {
   const instruction =
     purpose === "verification"
-      ? "The target is read-only. Inspect and verify it without modifying any file."
+      ? VERIFICATION_INSTRUCTIONS
       : purpose === "conflict"
         ? "Only the regular files already present in the disposable target mirror may be changed."
         : "Work only inside the trusted target. Do not modify Git metadata or publish remote state; Puller owns Git.";
@@ -391,6 +403,7 @@ export async function createCodexInvocation({
   run = execFile,
   stateRoot: configuredStateRoot,
   target,
+  writablePaths = [],
 } = {}) {
   if (!PURPOSES.has(purpose)) {
     throw new TypeError("purpose must identify a supported Codex run.");
@@ -400,6 +413,11 @@ export async function createCodexInvocation({
   }
   if (!Array.isArray(deniedPaths)) {
     throw new TypeError("deniedPaths must be an array.");
+  }
+  if (!Array.isArray(writablePaths) || writablePaths.length > 0) {
+    throw new TypeError(
+      "Verification agents cannot receive additional writable paths.",
+    );
   }
   const canonicalTarget = await canonicalComponents(target);
   if (
@@ -473,6 +491,13 @@ export async function createCodexInvocation({
       [await canonical(temporary)]: "write",
       [canonicalTarget]: purpose === "verification" ? "read" : "write",
     };
+    for (const path of RUNTIME_ROOTS) {
+      try {
+        filesystem[await canonical(path)] = "read";
+      } catch {
+        // Optional system runtime configuration may not exist on every host.
+      }
+    }
     for (const denied of deniedPaths) {
       filesystem[await canonicalComponents(denied)] = "deny";
     }
@@ -490,7 +515,10 @@ export async function createCodexInvocation({
       "--strict-config",
       "--color",
       "never",
-      ...FEATURE_DISABLES.flatMap((feature) => ["--disable", feature]),
+      ...[
+        ...FEATURE_DISABLES,
+        ...(purpose === "verification" ? VERIFICATION_FEATURE_DISABLES : []),
+      ].flatMap((feature) => ["--disable", feature]),
       "-c",
       'web_search="disabled"',
       "-c",

@@ -820,10 +820,10 @@ export function usePullRuns(
       options: StartRunOptions = {},
     ): Promise<RunStartOutcome> => {
       const key = pull.url;
-      const state = statesRef.current.get(key) ?? IDLE_RUN_STATE;
+      const previousState = statesRef.current.get(key);
+      const state = previousState ?? IDLE_RUN_STATE;
       const source = options.source ?? "manual";
-      const selectedAgent =
-        options.source === "auto" ? options.agent : agent;
+      const selectedAgent = options.source === "auto" ? options.agent : agent;
       if (!isAgent(selectedAgent)) {
         return {
           code: "agent_invalid",
@@ -932,6 +932,41 @@ export function usePullRuns(
         if (completionSettled) return;
         completionSettled = true;
         resolveCompletion(status);
+      };
+      const restoreAutoPreflight = (): void => {
+        if (source !== "auto" || runtime.accepted || !current(key, runtime)) {
+          return;
+        }
+
+        publish((existing) => {
+          if (!current(key, runtime)) {
+            return existing as Map<string, RunState>;
+          }
+
+          const active = existing.get(key) ?? IDLE_RUN_STATE;
+          const retained = {
+            history: active.history,
+            message: active.message,
+            reviewAttemptToken: active.reviewAttemptToken,
+            reviewRetry: active.reviewRetry,
+          };
+          const next = new Map(existing);
+          if (
+            previousState === undefined &&
+            retained.history.length === 0 &&
+            retained.message === "" &&
+            retained.reviewAttemptToken === null &&
+            retained.reviewRetry === null
+          ) {
+            next.delete(key);
+          } else {
+            next.set(key, {
+              ...(previousState ?? IDLE_RUN_STATE),
+              ...retained,
+            });
+          }
+          return next;
+        });
       };
 
       runtime.finalize = (status, output): boolean => {
@@ -1215,17 +1250,22 @@ export function usePullRuns(
               settleCompletion("cancelled");
             }
           } else if (current(key, runtime) && !isAbortError(error)) {
-            update(key, runtime, (existing) => ({
-              ...existing,
-              cancelling: false,
-              output: append(
-                existing.output,
-                `[error] ${error instanceof Error ? error.message : `${label} could not be reached.`}`,
-                true,
-              ),
-              status: "failed",
-            }));
-            settleAcceptance(startFailure(error, source, runtime.agent));
+            const outcome = startFailure(error, source, runtime.agent);
+            if (source === "auto" && outcome.kind === "rebaseline") {
+              restoreAutoPreflight();
+            } else {
+              update(key, runtime, (existing) => ({
+                ...existing,
+                cancelling: false,
+                output: append(
+                  existing.output,
+                  `[error] ${error instanceof Error ? error.message : `${label} could not be reached.`}`,
+                  true,
+                ),
+                status: "failed",
+              }));
+            }
+            settleAcceptance(outcome);
           } else {
             settleAcceptance(startFailure(error, source, runtime.agent));
           }
@@ -1258,7 +1298,7 @@ export function usePullRuns(
       void execute();
       return acceptance;
     },
-    [agent, current, deleteTranscripts, transcriptStore, update],
+    [agent, current, deleteTranscripts, publish, transcriptStore, update],
   );
 
   const observeRepair = useCallback(

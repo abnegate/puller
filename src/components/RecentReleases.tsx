@@ -1,6 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
 import {
-  Check,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -34,6 +33,7 @@ import {
   useReleaseVerificationBatches,
   useVerificationRuns,
   verificationKey,
+  type ReleaseVerificationBatchState,
   type VerificationRunState,
   type VerificationStatus,
 } from "@/verifications";
@@ -79,6 +79,48 @@ const statusLabels: Record<VerificationStatus, string> = {
   running: "Running",
   starting: "Starting",
   existing: "Already running",
+};
+
+const verificationStatusLabel = (state: VerificationRunState): string => {
+  if (state.status !== "completed") return statusLabels[state.status];
+  if (state.outcome === "verified") return "Verified";
+  if (state.outcome === "unavailable") return "Unavailable";
+  return "Not verified";
+};
+
+const verificationTerminalText = (
+  state: VerificationRunState,
+  label: string,
+): string => {
+  if (state.output) return state.output;
+
+  if (state.status === "starting") {
+    return `Starting ${label} verification…`;
+  }
+  if (state.status === "running") return "Waiting for output…";
+  if (state.status === "completed") {
+    if (state.outcome === "verified") {
+      return "Behavioral verification passed for this released change.";
+    }
+    if (state.outcome === "not_verified") {
+      return "Behavioral verification did not verify this released change.";
+    }
+    return "Behavioral verification could not exercise this released change safely.";
+  }
+  if (state.status === "failed") {
+    return `${label} verification failed before it could complete.`;
+  }
+  if (state.status === "limited") {
+    return `${label} verification exceeded a technical limit.`;
+  }
+  if (state.status === "cancelled") return "Verification was cancelled.";
+  if (state.status === "existing") {
+    return "Another verification is already running for this pull request.";
+  }
+  if (state.status === "membership-changed") {
+    return "This pull request is no longer included in the release.";
+  }
+  return "";
 };
 
 const HIDDEN_HISTORY_WARNINGS = new Set([
@@ -347,7 +389,7 @@ function VerificationTerminal({
     <div className="mt-2 overflow-hidden rounded-lg border bg-zinc-950 text-zinc-100 dark:bg-black">
       <div className="flex items-center justify-between gap-3 border-b border-white/10 px-2.5 py-1.5 text-[11px] text-zinc-400">
         <span>{label} verification</span>
-        <span aria-live="polite">{statusLabels[state.status]}</span>
+        <span aria-live="polite">{verificationStatusLabel(state)}</span>
       </div>
       <pre
         aria-label={`${label} verification output for ${pull.repository} #${pull.number}`}
@@ -357,14 +399,43 @@ function VerificationTerminal({
         role="log"
         tabIndex={0}
       >
-        {state.output ||
-          (state.status === "starting"
-            ? `Starting ${label} verification…`
-            : "Waiting for output…")}
+        {verificationTerminalText(state, label)}
       </pre>
     </div>
   );
 }
+
+const batchStatusLabel = (batch: ReleaseVerificationBatchState): string => {
+  if (batch.status === "starting") return "Starting release verification";
+  if (batch.status === "running") return "Verifying release";
+  if (batch.status === "cancelled") return "Release verification cancelled";
+  if (batch.status === "failed") return "Release verification failed";
+  if (batch.status === "completed" && batch.errors > 0) {
+    return "Release verification finished with errors";
+  }
+  if (
+    batch.status === "completed" &&
+    batch.total > 0 &&
+    batch.verified === batch.total
+  ) {
+    return "Release verified";
+  }
+  return "Release verification finished";
+};
+
+const batchTotalsLabel = (batch: ReleaseVerificationBatchState): string => {
+  const counts = [
+    `${batch.settled}/${batch.total} settled`,
+    `${batch.verified} verified`,
+    `${batch.notVerified} not verified`,
+    `${batch.unavailable} unavailable`,
+    `${batch.errors} failed`,
+  ];
+  if (batch.existing > 0) {
+    counts.push(`${batch.existing} already running`);
+  }
+  return counts.join(" · ");
+};
 
 function provenance(release: RecentRelease): {
   description: string;
@@ -477,8 +548,14 @@ function ReleasedPullRow({
         <div className="flex shrink-0 items-center gap-1.5">
           {run.status === "completed" && (
             <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
-              <Check aria-hidden="true" className="size-3.5" />
-              Completed
+              {run.outcome === "verified" ? (
+                <CircleCheck aria-hidden="true" className="size-3.5" />
+              ) : run.outcome === "unavailable" ? (
+                <CircleDashed aria-hidden="true" className="size-3.5" />
+              ) : (
+                <CircleX aria-hidden="true" className="size-3.5" />
+              )}
+              {verificationStatusLabel(run)}
             </span>
           )}
           <Button
@@ -681,22 +758,8 @@ function ReleaseGroup({
             className="flex flex-wrap items-center justify-between gap-2 border-t bg-muted/20 px-3 py-1.5 text-xs text-muted-foreground"
             role="status"
           >
-            <span>
-              {batch.status === "starting"
-                ? "Starting release verification"
-                : batch.status === "running"
-                  ? "Verifying release"
-                  : batch.status === "cancelled"
-                    ? "Release verification cancelled"
-                    : batch.status === "failed"
-                      ? "Release verification failed"
-                      : "Release verification complete"}
-            </span>
-            <span className="tabular-nums">
-              {batch.settled}/{batch.total}
-              {batch.errors > 0 ? ` · ${batch.errors} failed` : ""}
-              {batch.existing > 0 ? ` · ${batch.existing} already running` : ""}
-            </span>
+            <span>{batchStatusLabel(batch)}</span>
+            <span className="tabular-nums">{batchTotalsLabel(batch)}</span>
             {batch.error && (
               <span className="basis-full text-destructive">{batch.error}</span>
             )}

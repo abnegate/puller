@@ -1,9 +1,11 @@
 import { execFile as executeFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   access,
   chmod,
   mkdtemp,
   mkdir,
+  readFile,
   readdir,
   realpath,
   rename,
@@ -55,6 +57,141 @@ async function directory(name = "root") {
   const path = join(base, name);
   await mkdir(path, { recursive: true });
   return { base: await realpath(base), path: await realpath(path) };
+}
+
+async function git(cwd, ...args) {
+  const result = await execFile("git", ["-C", cwd, ...args]);
+  return result.stdout.trim();
+}
+
+function hunk(output) {
+  const marker = output.indexOf("\n@@ ");
+  return output.slice(marker + 1).replace(/\n$/, "");
+}
+
+function counts(patch) {
+  return {
+    additions: patch.split("\n").filter((line) => line.startsWith("+")).length,
+    deletions: patch.split("\n").filter((line) => line.startsWith("-")).length,
+  };
+}
+
+async function deltaEvidence(
+  repository,
+  source,
+  { base, files, head, merge, pullNumber = 7 },
+) {
+  const evidence = [];
+  for (const { path, status } of files) {
+    const patch = hunk(
+      await git(
+        source,
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--unified=3",
+        "--no-color",
+        `${merge}^1`,
+        merge,
+        "--",
+        path,
+      ),
+    );
+    const value = counts(patch);
+    evidence.push({
+      additions: value.additions,
+      changes: value.additions + value.deletions,
+      deletions: value.deletions,
+      path,
+      patch,
+      sha: await git(
+        source,
+        "rev-parse",
+        `${status === "removed" ? `${merge}^1` : merge}:${path}`,
+      ),
+      status,
+    });
+  }
+  evidence.sort((left, right) => left.path.localeCompare(right.path));
+  const canonical = {
+    baseSha: base,
+    changedFiles: evidence.length,
+    files: evidence,
+    headSha: head,
+    mergeCommitSha: merge,
+    mergedAt: "2026-07-19T00:00:00.000Z",
+    pullNumber,
+    repository,
+    version: 1,
+  };
+  return {
+    ...canonical,
+    digest: createHash("sha256")
+      .update(JSON.stringify(canonical))
+      .digest("hex"),
+  };
+}
+
+async function branchDeltaEvidence(
+  repository,
+  source,
+  { base, files, head, merge, pullNumber = 7 },
+) {
+  const evidence = [];
+  for (const { path, status } of files) {
+    const patch = hunk(
+      await git(
+        source,
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--unified=3",
+        "--inter-hunk-context=1",
+        "--no-color",
+        base,
+        head,
+        "--",
+        path,
+      ),
+    ).replace(
+      /^(@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@)(?:.*)$/gm,
+      "$1 GitHub context",
+    );
+    const value = counts(patch);
+    evidence.push({
+      additions: value.additions,
+      changes: value.additions + value.deletions,
+      deletions: value.deletions,
+      path,
+      patch,
+      sha: await git(
+        source,
+        "rev-parse",
+        `${status === "removed" ? base : head}:${path}`,
+      ),
+      status,
+    });
+  }
+  evidence.sort((left, right) => left.path.localeCompare(right.path));
+  const canonical = {
+    baseSha: base,
+    changedFiles: evidence.length,
+    files: evidence,
+    headSha: head,
+    mergeCommitSha: merge,
+    mergedAt: "2026-07-19T00:00:00.000Z",
+    pullNumber,
+    repository,
+    version: 1,
+  };
+  return {
+    ...canonical,
+    digest: createHash("sha256")
+      .update(JSON.stringify(canonical))
+      .digest("hex"),
+  };
 }
 
 function gitRunner(states) {
@@ -1125,6 +1262,128 @@ describe("workspace resolution", () => {
       }),
     ).rejects.toMatchObject({ code: "workspace_head_mismatch" });
   });
+
+  it("isolates a clean sequential merge from the predecessor using GitHub-style patch evidence", async () => {
+    const { base, path: source } = await directory("repo");
+    const temporaryRoot = join(base, "verification");
+    await execFile("git", ["init", "-b", "main", source]);
+    await git(source, "config", "user.email", "puller@example.test");
+    await git(source, "config", "user.name", "Puller Test");
+    await git(
+      source,
+      "config",
+      "remote.origin.url",
+      "https://github.com/owner/repo.git",
+    );
+    await mkdir(join(source, "src"));
+    const original = Array.from(
+      { length: 25 },
+      (_, index) => `line ${index + 1}`,
+    );
+    await writeFile(
+      join(source, "src", "behavior.txt"),
+      `${original.join("\n")}\n`,
+    );
+    await git(source, "add", ".");
+    await git(source, "commit", "-m", "predecessor");
+    const predecessor = await git(source, "rev-parse", "HEAD");
+
+    await git(source, "checkout", "-b", "earlier");
+    const earlierLines = [...original];
+    earlierLines[19] = "earlier release behavior";
+    await writeFile(
+      join(source, "src", "behavior.txt"),
+      `${earlierLines.join("\n")}\n`,
+    );
+    await git(source, "add", ".");
+    await git(source, "commit", "-m", "earlier release pull");
+    await git(source, "checkout", "main");
+    await git(source, "merge", "--no-ff", "earlier", "-m", "merge earlier");
+    const firstParent = await git(source, "rev-parse", "HEAD");
+
+    await git(source, "checkout", "-b", "target", predecessor);
+    const targetLines = [...original];
+    targetLines[1] = "target behavior one";
+    targetLines[9] = "target behavior two";
+    await writeFile(
+      join(source, "src", "behavior.txt"),
+      `${targetLines.join("\n")}\n`,
+    );
+    await git(source, "add", ".");
+    await git(source, "commit", "-m", "target pull");
+    const head = await git(source, "rev-parse", "HEAD");
+    await git(source, "checkout", "main");
+    await git(source, "merge", "--no-ff", "target", "-m", "merge target");
+    const merge = await git(source, "rev-parse", "HEAD");
+    const targetDelta = await branchDeltaEvidence("owner/repo", source, {
+      base: predecessor,
+      files: [{ path: "src/behavior.txt", status: "modified" }],
+      head,
+      merge,
+    });
+    const manager = createVerificationWorkspaceManager({
+      roots: [base],
+      discoverRepositories: async () => [source],
+      temporaryRoot,
+    });
+
+    const pair = await manager.preparePair({
+      predecessorCommitOid: predecessor,
+      predecessorTag: "v1.2.3",
+      releaseCommitOid: merge,
+      repository: "owner/repo",
+      tag: "v1.2.4",
+      targetDelta,
+    });
+    try {
+      const candidate = await readFile(
+        join(pair.candidate.cwd, "src", "behavior.txt"),
+        "utf8",
+      );
+      expect(candidate).toContain("target behavior one");
+      expect(candidate).toContain("target behavior two");
+      expect(candidate).toContain("line 20");
+      expect(candidate).not.toContain("earlier release behavior");
+    } finally {
+      await pair.candidate.cleanup();
+      await pair.predecessor.cleanup();
+    }
+
+    await git(source, "reset", "--hard", firstParent);
+    await git(source, "merge", "--no-commit", "--no-ff", "target");
+    const forged = [...earlierLines];
+    forged[1] = "target behavior one";
+    forged[9] = "target behavior two";
+    forged[24] = "unreviewed merge-only behavior";
+    await writeFile(
+      join(source, "src", "behavior.txt"),
+      `${forged.join("\n")}\n`,
+    );
+    await git(source, "add", ".");
+    await git(source, "commit", "-m", "merge target with an extra change");
+    const forgedMerge = await git(source, "rev-parse", "HEAD");
+    const forgedDelta = await branchDeltaEvidence("owner/repo", source, {
+      base: predecessor,
+      files: [{ path: "src/behavior.txt", status: "modified" }],
+      head,
+      merge: forgedMerge,
+    });
+
+    await expect(
+      manager.preparePair({
+        predecessorCommitOid: predecessor,
+        predecessorTag: "v1.2.3",
+        releaseCommitOid: forgedMerge,
+        repository: "owner/repo",
+        tag: "v1.2.4",
+        targetDelta: forgedDelta,
+      }),
+    ).rejects.toMatchObject({
+      code: "verification_delta_unavailable",
+      message:
+        "GitHub and local Git cannot prove the exact target pull request delta.",
+    });
+  });
 });
 
 describe("owned review workspaces", () => {
@@ -1797,6 +2056,7 @@ describe("release verification workspaces", () => {
     const temporaryRoot = join(base, "temporary-root");
     const temporaryBase = join(temporaryRoot, "puller-verify-test");
     const snapshot = join(temporaryBase, "snapshot");
+    const execution = join(temporaryBase, "execution");
     const archive = join(temporaryBase, "snapshot.tar");
     await mkdir(temporaryRoot);
     const tagSha = "1234567890abcdef1234567890abcdef12345678";
@@ -1851,6 +2111,7 @@ describe("release verification workspaces", () => {
     expect(prepared).toMatchObject({
       commitOid: tagSha,
       cwd: snapshot,
+      executionCwd: execution,
       headSha: tagSha,
       tag: "v1.2.4",
     });
@@ -1890,6 +2151,15 @@ describe("release verification workspaces", () => {
     expect(gitTokens).not.toContain("fetch");
     expect(gitTokens).not.toContain("status");
     expect((await stat(join(snapshot, "source.js"))).mode & 0o777).toBe(0o444);
+    expect((await stat(join(execution, "source.js"))).mode & 0o777).toBe(0o600);
+    await writeFile(join(execution, "source.js"), "behavioral side effect\n");
+    expect(await readFile(join(snapshot, "source.js"), "utf8")).toBe(
+      "export const safe = true\n",
+    );
+    await expect(prepared.verifyIntegrity()).resolves.toBe(true);
+    await chmod(join(snapshot, "source.js"), 0o644);
+    await writeFile(join(snapshot, "source.js"), "mutated snapshot\n");
+    await expect(prepared.verifyIntegrity()).resolves.toBe(false);
     await prepared.cleanup();
     await prepared.cleanup();
     expect(remove).toHaveBeenCalledWith(temporaryBase);
@@ -2052,5 +2322,177 @@ describe("release verification workspaces", () => {
     expect(tokens).not.toContain("fetch");
     expect(tokens).not.toContain("checkout");
     expect(tokens).not.toContain("worktree");
+  });
+
+  it("builds only predecessor plus the exact target delta while excluding later aggregate release behavior", async () => {
+    const { base, path: source } = await directory("repo");
+    const temporaryRoot = join(base, "verification");
+    await execFile("git", ["init", "-b", "main", source]);
+    await git(source, "config", "user.email", "puller@example.test");
+    await git(source, "config", "user.name", "Puller Test");
+    await git(
+      source,
+      "config",
+      "remote.origin.url",
+      "https://github.com/owner/repo.git",
+    );
+    await mkdir(join(source, "src"));
+    await writeFile(
+      join(source, "src", "behavior.mjs"),
+      'export const behavior = false;\nexport const note = "earlier";\n',
+    );
+    await writeFile(join(source, "obsolete.txt"), "remove me\n");
+    await git(source, "add", ".");
+    await git(source, "commit", "-m", "earlier release");
+    const earlier = await git(source, "rev-parse", "HEAD");
+    await writeFile(
+      join(source, "src", "behavior.mjs"),
+      'export const behavior = false;\nexport const note = "before";\n',
+    );
+    await git(source, "add", "src/behavior.mjs");
+    await git(source, "commit", "-m", "predecessor");
+    const predecessor = await git(source, "rev-parse", "HEAD");
+
+    await git(source, "checkout", "-b", "target");
+    await writeFile(
+      join(source, "src", "behavior.mjs"),
+      'export const behavior = false;\nexport const note = "target";\n',
+    );
+    await rm(join(source, "obsolete.txt"));
+    await mkdir(join(source, "bin"));
+    await writeFile(
+      join(source, "bin", "probe.mjs"),
+      "export const probe = true;\n",
+    );
+    await chmod(join(source, "bin", "probe.mjs"), 0o755);
+    await git(source, "add", "-A");
+    await git(source, "commit", "-m", "target");
+    const head = await git(source, "rev-parse", "HEAD");
+
+    await git(source, "checkout", "main");
+    await git(source, "merge", "--no-ff", "target", "-m", "merge target");
+    const merge = await git(source, "rev-parse", "HEAD");
+    const targetDelta = await deltaEvidence("owner/repo", source, {
+      base: predecessor,
+      files: [
+        { path: "bin/probe.mjs", status: "added" },
+        { path: "obsolete.txt", status: "removed" },
+        { path: "src/behavior.mjs", status: "modified" },
+      ],
+      head,
+      merge,
+    });
+
+    await writeFile(
+      join(source, "src", "behavior.mjs"),
+      'export const behavior = true;\nexport const note = "target";\n',
+    );
+    await git(source, "add", "src/behavior.mjs");
+    await git(source, "commit", "-m", "unrelated later release change");
+    const release = await git(source, "rev-parse", "HEAD");
+    const manager = createVerificationWorkspaceManager({
+      roots: [base],
+      discoverRepositories: async () => [source],
+      temporaryRoot,
+    });
+
+    const pair = await manager.preparePair({
+      predecessorCommitOid: predecessor,
+      predecessorTag: "v1.2.3",
+      releaseCommitOid: release,
+      repository: "owner/repo",
+      tag: "v1.2.4",
+      targetDelta,
+    });
+    try {
+      expect(
+        await readFile(join(pair.candidate.cwd, "src", "behavior.mjs"), "utf8"),
+      ).toBe('export const behavior = false;\nexport const note = "target";\n');
+      expect(
+        await git(source, "show", `${release}:src/behavior.mjs`),
+      ).toContain("behavior = true");
+      await expect(
+        access(join(pair.candidate.cwd, "obsolete.txt")),
+      ).rejects.toThrow();
+      expect(
+        await readFile(join(pair.candidate.cwd, "bin", "probe.mjs"), "utf8"),
+      ).toBe("export const probe = true;\n");
+      expect(
+        (await stat(join(pair.candidate.cwd, "bin", "probe.mjs"))).mode & 0o111,
+      ).not.toBe(0);
+      await expect(pair.candidate.verifyIntegrity()).resolves.toBe(true);
+      await expect(pair.predecessor.verifyIntegrity()).resolves.toBe(true);
+    } finally {
+      await pair.candidate.cleanup();
+      await pair.predecessor.cleanup();
+    }
+    await expect(
+      manager.preparePair({
+        predecessorCommitOid: earlier,
+        predecessorTag: "v1.2.2",
+        releaseCommitOid: release,
+        repository: "owner/repo",
+        tag: "v1.2.4",
+        targetDelta,
+      }),
+    ).rejects.toMatchObject({
+      code: "verification_delta_unavailable",
+      message: "The predecessor does not match the target delta preimage.",
+    });
+
+    const wrongCanonical = {
+      ...targetDelta,
+      files: targetDelta.files.map((file) =>
+        file.path === "src/behavior.mjs"
+          ? { ...file, patch: file.patch.replace('"target"', '"forged"') }
+          : file,
+      ),
+    };
+    delete wrongCanonical.digest;
+    const wrongDelta = {
+      ...wrongCanonical,
+      digest: createHash("sha256")
+        .update(JSON.stringify(wrongCanonical))
+        .digest("hex"),
+    };
+    await expect(
+      manager.preparePair({
+        predecessorCommitOid: predecessor,
+        predecessorTag: "v1.2.3",
+        releaseCommitOid: release,
+        repository: "owner/repo",
+        tag: "v1.2.4",
+        targetDelta: wrongDelta,
+      }),
+    ).rejects.toMatchObject({
+      code: "verification_delta_unavailable",
+      message:
+        "GitHub and local Git cannot prove the exact target pull request delta.",
+    });
+
+    const missingBaseCanonical = {
+      ...targetDelta,
+      baseSha: "b".repeat(40),
+    };
+    delete missingBaseCanonical.digest;
+    const missingBaseDelta = {
+      ...missingBaseCanonical,
+      digest: createHash("sha256")
+        .update(JSON.stringify(missingBaseCanonical))
+        .digest("hex"),
+    };
+    await expect(
+      manager.preparePair({
+        predecessorCommitOid: predecessor,
+        predecessorTag: "v1.2.3",
+        releaseCommitOid: release,
+        repository: "owner/repo",
+        tag: "v1.2.4",
+        targetDelta: missingBaseDelta,
+      }),
+    ).rejects.toMatchObject({
+      code: "verification_delta_unavailable",
+      message: "The exact pull request Git objects are unavailable locally.",
+    });
   });
 });

@@ -43,6 +43,11 @@ import {
   type RunState,
   type RunTerminalStatus,
 } from "../runs";
+import {
+  highlightFile,
+  type HighlightedFile,
+  type SyntaxToken,
+} from "../syntax";
 import type {
   Agent,
   DiffLineKind,
@@ -125,6 +130,77 @@ const splitLayoutActive = (): boolean =>
   typeof window.matchMedia !== "function" ||
   window.matchMedia(SPLIT_LAYOUT_QUERY).matches;
 
+type ViewedScroll = {
+  diff: PullDiffData;
+  owner: HTMLElement;
+  sourcePath: string;
+  targetPath: string | null;
+};
+
+const verticalScrollOwner = (node: HTMLElement): HTMLElement => {
+  let ancestor = node.parentElement;
+  while (ancestor !== null) {
+    const overflow = window.getComputedStyle(ancestor).overflowY;
+    if (
+      /^(auto|overlay|scroll)$/.test(overflow) &&
+      ancestor.scrollHeight > ancestor.clientHeight
+    ) {
+      return ancestor;
+    }
+    ancestor = ancestor.parentElement;
+  }
+
+  return (document.scrollingElement ?? document.documentElement) as HTMLElement;
+};
+
+const scrollViewportTop = (owner: HTMLElement): number =>
+  owner === document.scrollingElement || owner === document.documentElement
+    ? 0
+    : owner.getBoundingClientRect().top + owner.clientTop;
+
+const stickyInset = (
+  owner: HTMLElement,
+  diffRoot: HTMLElement | null,
+  anchor: DOMRect,
+): number => {
+  const top = scrollViewportTop(owner);
+  const bottom =
+    owner === document.scrollingElement || owner === document.documentElement
+      ? window.innerHeight
+      : owner.getBoundingClientRect().bottom - owner.clientTop;
+  let inset = 0;
+
+  for (const candidate of document.querySelectorAll<HTMLElement>(
+    ".fixed, .sticky, [data-sticky]",
+  )) {
+    if (diffRoot?.contains(candidate)) continue;
+    const position = window.getComputedStyle(candidate).position;
+    if (
+      position !== "fixed" &&
+      position !== "sticky" &&
+      !candidate.classList.contains("fixed") &&
+      !candidate.classList.contains("sticky")
+    ) {
+      continue;
+    }
+
+    const bounds = candidate.getBoundingClientRect();
+    if (
+      bounds.height <= 0 ||
+      bounds.top > top + 1 ||
+      bounds.bottom <= top ||
+      bounds.top >= bottom ||
+      bounds.right <= anchor.left ||
+      bounds.left >= anchor.right
+    ) {
+      continue;
+    }
+    inset = Math.max(inset, Math.min(bottom, bounds.bottom) - top);
+  }
+
+  return inset;
+};
+
 type CommentAnchor = PullDiffCommentAnchor;
 type CommentSelection = PullDiffCommentSelection;
 
@@ -170,6 +246,56 @@ const lineMarker = (kind: DiffLineKind): string => {
   if (kind === "deletion") return "-";
   return " ";
 };
+
+type SyntaxTokenStyle = CSSProperties & {
+  "--syntax-dark-font-style": SyntaxToken["darkFontStyle"];
+  "--syntax-dark-font-weight": SyntaxToken["darkFontWeight"];
+  "--syntax-dark-foreground": string;
+  "--syntax-light-font-style": SyntaxToken["lightFontStyle"];
+  "--syntax-light-font-weight": SyntaxToken["lightFontWeight"];
+  "--syntax-light-foreground": string;
+};
+
+const syntaxTokenStyle = (token: SyntaxToken): SyntaxTokenStyle => ({
+  "--syntax-dark-font-style": token.darkFontStyle,
+  "--syntax-dark-font-weight": token.darkFontWeight,
+  "--syntax-dark-foreground": token.darkForeground,
+  "--syntax-light-font-style": token.lightFontStyle,
+  "--syntax-light-font-weight": token.lightFontWeight,
+  "--syntax-light-foreground": token.lightForeground,
+});
+
+function SyntaxContent({
+  content,
+  tokens,
+}: {
+  content: string;
+  tokens: readonly SyntaxToken[] | null;
+}) {
+  if (tokens === null || tokens.length === 0) {
+    return <span data-syntax-content="">{content || "\u00a0"}</span>;
+  }
+
+  return (
+    <span data-syntax-content="">
+      {tokens.map((token, index) => (
+        <span
+          data-syntax-dark-font-style={token.darkFontStyle}
+          data-syntax-dark-font-weight={token.darkFontWeight}
+          data-syntax-dark-foreground={token.darkForeground}
+          data-syntax-light-font-style={token.lightFontStyle}
+          data-syntax-light-font-weight={token.lightFontWeight}
+          data-syntax-light-foreground={token.lightForeground}
+          data-syntax-token=""
+          key={`${index}:${token.content}`}
+          style={syntaxTokenStyle(token)}
+        >
+          {token.content}
+        </span>
+      ))}
+    </span>
+  );
+}
 
 const anchorFor = (
   file: PullDiffFile,
@@ -358,9 +484,7 @@ const createFileTree = (files: PullDiffFile[]): FileTreeDirectory => {
   return root;
 };
 
-const treeDirectories = (
-  directory: FileTreeDirectory,
-): FileTreeDirectory[] =>
+const treeDirectories = (directory: FileTreeDirectory): FileTreeDirectory[] =>
   [...directory.directories.values()].sort((left, right) =>
     left.name.localeCompare(right.name),
   );
@@ -902,7 +1026,53 @@ const FilePatch = memo(function FilePatch({
   selection: CommentSelection | null;
 }) {
   const patch = useRef<HTMLDivElement>(null);
+  const syntaxRequest = useRef(0);
+  const [nearViewport, setNearViewport] = useState(
+    () => typeof IntersectionObserver === "undefined",
+  );
+  const [syntax, setSyntax] = useState<{
+    file: PullDiffFile;
+    highlighted: HighlightedFile | null;
+  } | null>(null);
   const [viewportWidth, setViewportWidth] = useState<number | null>(null);
+  const highlighted = syntax?.file === file ? syntax.highlighted : null;
+
+  useEffect(() => {
+    const node = patch.current;
+    if (node === null || typeof IntersectionObserver === "undefined") {
+      setNearViewport(true);
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      ([entry]) => setNearViewport(entry?.isIntersecting ?? false),
+      { rootMargin: "800px 0px" },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!nearViewport) return;
+    const request = ++syntaxRequest.current;
+    const controller = new AbortController();
+
+    void highlightFile(file, controller.signal).then(
+      (result) => {
+        if (syntaxRequest.current !== request) return;
+        setSyntax({ file, highlighted: result });
+      },
+      () => {
+        if (syntaxRequest.current !== request) return;
+        setSyntax({ file, highlighted: null });
+      },
+    );
+
+    return () => {
+      controller.abort();
+      if (syntaxRequest.current === request) syntaxRequest.current += 1;
+    };
+  }, [file, nearViewport]);
 
   useLayoutEffect(() => {
     if (patch.current && patch.current.scrollLeft !== scrollLeft) {
@@ -995,7 +1165,13 @@ const FilePatch = memo(function FilePatch({
                       <span aria-hidden="true" className="mr-2 select-none">
                         {lineMarker(line.kind)}
                       </span>
-                      {line.content || "\u00a0"}
+                      <SyntaxContent
+                        content={line.content}
+                        tokens={
+                          highlighted?.hunks[hunkIndex]?.lines[lineIndex] ??
+                          null
+                        }
+                      />
                     </code>
                   </div>
                   {composer !== null &&
@@ -1057,7 +1233,7 @@ const DiffFile = memo(function DiffFile({
   run: RunState;
   selection: CommentSelection | null;
   startRun: PullRuns["start"];
-  toggleViewed: (path: string) => void;
+  toggleViewed: (path: string, viewed: boolean) => void;
   viewed: boolean;
 }) {
   const bodyId = `${id}-body`;
@@ -1067,7 +1243,8 @@ const DiffFile = memo(function DiffFile({
     [file.path, register],
   );
   const handleViewedChange = useCallback(
-    () => toggleViewed(file.path),
+    (checked: boolean | "indeterminate") =>
+      toggleViewed(file.path, checked === true),
     [file.path, toggleViewed],
   );
   const handlePatchScrollLeftChange = useCallback(
@@ -1102,10 +1279,11 @@ const DiffFile = memo(function DiffFile({
       tabIndex={-1}
     >
       <header
-        className={`sticky top-0 z-50 -mx-px w-[calc(100%+2px)] min-w-0 border-x border-b bg-card ${
+        className={`sticky top-0 z-50 -mx-px w-[calc(100%+2px)] min-w-0 border-x border-b bg-card outline-none focus-visible:ring-3 focus-visible:ring-ring/50 ${
           viewed ? "rounded-lg" : "rounded-t-lg"
         }`}
         data-diff-file-header=""
+        tabIndex={-1}
       >
         <div className="flex min-h-10 w-full min-w-0 flex-wrap items-center gap-2 overflow-clip rounded-[inherit] bg-muted/35 px-3 py-2">
           <FileCode2
@@ -1465,6 +1643,7 @@ function PullDiff({
   const visibleCount = currentPersistence.visibleCount;
   const [selectionAnnouncement, setSelectionAnnouncement] = useState("");
   const pendingSelection = useRef<string | null>(null);
+  const pendingViewedScroll = useRef<ViewedScroll | null>(null);
   const observedAttempt = useRef<string | null>(
     readOnly ? null : run.reviewAttemptToken,
   );
@@ -1605,23 +1784,91 @@ function PullDiff({
     else files.current.delete(path);
   }, []);
   const handleToggleViewed = useCallback(
-    (path: string) => {
-      if (readOnly) {
-        toggleViewedRef.current(path);
-        return;
+    (path: string, nextViewed: boolean) => {
+      if (!nextViewed) {
+        if (pendingViewedScroll.current?.sourcePath === path) {
+          pendingViewedScroll.current = null;
+        }
+      } else {
+        const source = files.current.get(path);
+        const index = orderedFiles.findIndex((file) => file.path === path);
+        if (source !== undefined && index >= 0) {
+          const targetPath = orderedFiles[index + 1]?.path ?? null;
+          pendingViewedScroll.current = {
+            diff,
+            owner: verticalScrollOwner(source),
+            sourcePath: path,
+            targetPath,
+          };
+          if (
+            targetPath !== null &&
+            index + 1 >= persistenceRef.current.visibleCount
+          ) {
+            updatePersistence((current) => ({
+              ...current,
+              visibleCount: Math.max(current.visibleCount, index + 2),
+            }));
+          }
+        }
       }
-      const retry = run.reviewRetry;
-      if (retry?.feedback.path === path) {
-        clearReviewRetry(pull.url, retry.attemptToken);
+
+      if (!readOnly) {
+        const retry = run.reviewRetry;
+        if (retry?.feedback.path === path) {
+          clearReviewRetry(pull.url, retry.attemptToken);
+        }
+        updatePersistence((current) =>
+          current.selection?.start.path === path
+            ? { ...current, draft: "", selection: null }
+            : current,
+        );
       }
-      updatePersistence((current) =>
-        current.selection?.start.path === path
-          ? { ...current, draft: "", selection: null }
-          : current,
-      );
       toggleViewedRef.current(path);
     },
-    [clearReviewRetry, pull.url, readOnly, run.reviewRetry, updatePersistence],
+    [
+      clearReviewRetry,
+      diff,
+      orderedFiles,
+      pull.url,
+      readOnly,
+      run.reviewRetry,
+      updatePersistence,
+    ],
+  );
+  useLayoutEffect(() => {
+    const pending = pendingViewedScroll.current;
+    if (
+      pending === null ||
+      pending.diff !== diff ||
+      !viewed.has(pending.sourcePath)
+    ) {
+      return;
+    }
+
+    const anchor =
+      pending.targetPath === null
+        ? files.current.get(pending.sourcePath)
+        : files.current.get(pending.targetPath);
+    if (anchor === undefined) return;
+
+    const root =
+      layout.current?.closest<HTMLElement>("[data-pull-diff]") ?? null;
+    const anchorBounds = anchor.getBoundingClientRect();
+    const top =
+      scrollViewportTop(pending.owner) +
+      stickyInset(pending.owner, root, anchorBounds);
+    const delta = anchorBounds.top - top;
+    pending.owner.scrollTop = Math.max(0, pending.owner.scrollTop + delta);
+    (
+      anchor.querySelector<HTMLElement>("[data-diff-file-header]") ?? anchor
+    ).focus({ preventScroll: true });
+    pendingViewedScroll.current = null;
+  }, [diff, currentPersistence.visibleCount, viewed]);
+  useEffect(
+    () => () => {
+      pendingViewedScroll.current = null;
+    },
+    [diff],
   );
   const cancelComment = useCallback(() => {
     if (readOnly) return;

@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyReleasePipelineSnapshot,
   reconcileRecentReleasePipeline,
+  RELEASE_PIPELINE_FOLLOWUP_INTERVAL,
   RELEASE_PIPELINE_REFRESH_INTERVAL,
   releasePipelineFingerprint,
   useReleasePipelinePolling,
@@ -124,6 +125,8 @@ afterEach(() => {
 });
 
 beforeEach(() => {
+  vi.useFakeTimers();
+  vi.setSystemTime("2026-07-24T00:34:00.000Z");
   setVisibility("visible");
 });
 
@@ -144,9 +147,7 @@ describe("release pipeline reconciliation", () => {
       ]),
     );
     expect(releasePipelineFingerprint([item])).not.toBe(
-      releasePipelineFingerprint([
-        { ...item, repository: "Appwrite/cloud" },
-      ]),
+      releasePipelineFingerprint([{ ...item, repository: "Appwrite/cloud" }]),
     );
   });
 
@@ -179,12 +180,12 @@ describe("release pipeline reconciliation", () => {
       publishedAt: "2026-07-24T00:31:00.000Z",
     };
 
-    expect(
-      reconcileRecentReleasePipeline(current, differentIdentity),
-    ).toBe(differentIdentity);
-    expect(
-      reconcileRecentReleasePipeline(current, stale).pipeline,
-    ).toBe(current.pipeline);
+    expect(reconcileRecentReleasePipeline(current, differentIdentity)).toBe(
+      differentIdentity,
+    );
+    expect(reconcileRecentReleasePipeline(current, stale).pipeline).toBe(
+      current.pipeline,
+    );
   });
 
   it("retains exact prior runs when a newer lookup is unavailable", () => {
@@ -194,11 +195,7 @@ describe("release pipeline reconciliation", () => {
     );
     const incoming = {
       ...previous,
-      pipeline: pipeline(
-        "unavailable",
-        [],
-        "2026-07-24T01:05:00.000Z",
-      ),
+      pipeline: pipeline("unavailable", [], "2026-07-24T01:05:00.000Z"),
     };
 
     const reconciled = reconcileRecentReleasePipeline(previous, incoming);
@@ -216,20 +213,16 @@ describe("release pipeline reconciliation", () => {
     );
     const incoming = {
       ...previous,
-      pipeline: pipeline(
-        "unavailable",
-        [],
-        "2026-07-24T01:05:00.000Z",
-      ),
+      pipeline: pipeline("unavailable", [], "2026-07-24T01:05:00.000Z"),
     };
 
-    expect(
-      reconcileRecentReleasePipeline(previous, incoming).pipeline,
-    ).toEqual({
-      checkedAt: "2026-07-24T01:05:00.000Z",
-      lookup: "pending",
-      runs: [],
-    });
+    expect(reconcileRecentReleasePipeline(previous, incoming).pipeline).toEqual(
+      {
+        checkedAt: "2026-07-24T01:05:00.000Z",
+        lookup: "pending",
+        runs: [],
+      },
+    );
   });
 
   it("does not regress a deployed attempt two to a later-checked attempt one", () => {
@@ -239,11 +232,7 @@ describe("release pipeline reconciliation", () => {
     });
     const previous = release(
       "1",
-      pipeline(
-        "complete",
-        [deployed],
-        "2026-07-24T01:05:00.000Z",
-      ),
+      pipeline("complete", [deployed], "2026-07-24T01:05:00.000Z"),
     );
     const incoming = {
       ...previous,
@@ -312,11 +301,7 @@ describe("release pipeline reconciliation", () => {
     });
     const incoming = {
       ...previous,
-      pipeline: pipeline(
-        "complete",
-        [completed],
-        "2026-07-24T01:09:00.000Z",
-      ),
+      pipeline: pipeline("complete", [completed], "2026-07-24T01:09:00.000Z"),
     };
 
     expect(
@@ -339,19 +324,11 @@ describe("release pipeline reconciliation", () => {
     });
     const previous = release(
       "1",
-      pipeline(
-        "complete",
-        [production, images],
-        "2026-07-24T01:03:00.000Z",
-      ),
+      pipeline("complete", [production, images], "2026-07-24T01:03:00.000Z"),
     );
     const incoming = {
       ...previous,
-      pipeline: pipeline(
-        "complete",
-        [production],
-        "2026-07-24T01:04:00.000Z",
-      ),
+      pipeline: pipeline("complete", [production], "2026-07-24T01:04:00.000Z"),
     };
 
     expect(
@@ -374,11 +351,7 @@ describe("release pipeline reconciliation", () => {
     });
     const incoming = {
       ...previous,
-      pipeline: pipeline(
-        "complete",
-        [attempt],
-        "2026-07-24T01:05:00.000Z",
-      ),
+      pipeline: pipeline("complete", [attempt], "2026-07-24T01:05:00.000Z"),
     };
 
     expect(
@@ -393,11 +366,7 @@ describe("release pipeline reconciliation", () => {
     });
     const previous = release(
       "1",
-      pipeline(
-        "complete",
-        [previousRun],
-        "2026-07-24T01:03:00.000Z",
-      ),
+      pipeline("complete", [previousRun], "2026-07-24T01:03:00.000Z"),
     );
     const rerun = run("running", {
       createdAt: "2026-07-24T01:04:00.000Z",
@@ -407,11 +376,7 @@ describe("release pipeline reconciliation", () => {
     });
     const incoming = {
       ...previous,
-      pipeline: pipeline(
-        "complete",
-        [rerun],
-        "2026-07-24T01:06:00.000Z",
-      ),
+      pipeline: pipeline("complete", [rerun], "2026-07-24T01:06:00.000Z"),
     };
 
     expect(
@@ -458,11 +423,7 @@ describe("release pipeline reconciliation", () => {
     });
     const incoming = {
       ...previous,
-      pipeline: pipeline(
-        "complete",
-        [newer],
-        "2026-07-24T01:06:00.000Z",
-      ),
+      pipeline: pipeline("complete", [newer], "2026-07-24T01:06:00.000Z"),
     };
 
     expect(
@@ -474,28 +435,20 @@ describe("release pipeline reconciliation", () => {
     const confirmed = run("succeeded");
     const previous = release(
       "1",
-      pipeline(
-        "complete",
-        [confirmed],
-        "2026-07-24T01:03:00.000Z",
-      ),
+      pipeline("complete", [confirmed], "2026-07-24T01:03:00.000Z"),
     );
     const incoming = {
       ...previous,
-      pipeline: pipeline(
-        "pending",
-        [],
-        "2026-07-24T01:04:00.000Z",
-      ),
+      pipeline: pipeline("pending", [], "2026-07-24T01:04:00.000Z"),
     };
 
-    expect(
-      reconcileRecentReleasePipeline(previous, incoming).pipeline,
-    ).toEqual({
-      checkedAt: incoming.pipeline.checkedAt,
-      lookup: "complete",
-      runs: [confirmed],
-    });
+    expect(reconcileRecentReleasePipeline(previous, incoming).pipeline).toEqual(
+      {
+        checkedAt: incoming.pipeline.checkedAt,
+        lookup: "complete",
+        runs: [confirmed],
+      },
+    );
   });
 });
 
@@ -517,9 +470,7 @@ describe("useReleasePipelinePolling", () => {
     );
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(
-        RELEASE_PIPELINE_REFRESH_INTERVAL - 1,
-      );
+      await vi.advanceTimersByTimeAsync(RELEASE_PIPELINE_REFRESH_INTERVAL - 1);
     });
     expect(api.getReleasePipelines).not.toHaveBeenCalled();
 
@@ -540,6 +491,39 @@ describe("useReleasePipelinePolling", () => {
     expect(api.getReleasePipelines).toHaveBeenCalledTimes(2);
   });
 
+  it("discovers delayed and follow-up workflows every thirty seconds after terminal", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime("2026-07-24T01:04:00.000Z");
+    const item = release("1", pipeline("complete", [run("succeeded")]), {
+      publishedAt: "2026-07-24T01:03:00.000Z",
+    });
+    api.getReleasePipelines.mockResolvedValue(
+      snapshot(item, pipeline("complete", [run("succeeded")])),
+    );
+    renderHook(() =>
+      useReleasePipelinePolling({
+        enabled: true,
+        onSnapshot: () => undefined,
+        refreshRevision: 0,
+        releases: [item],
+      }),
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RELEASE_PIPELINE_FOLLOWUP_INTERVAL - 1);
+    });
+    expect(api.getReleasePipelines).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(api.getReleasePipelines).toHaveBeenCalledOnce();
+    expect(api.getReleasePipelines).toHaveBeenCalledWith(
+      expect.any(AbortSignal),
+      false,
+    );
+  });
+
   it("confirms an active-to-terminal transition once before stopping", async () => {
     vi.useFakeTimers();
     const item = release("1", pipeline("pending"));
@@ -547,21 +531,13 @@ describe("useReleasePipelinePolling", () => {
       .mockResolvedValueOnce(
         snapshot(
           item,
-          pipeline(
-            "complete",
-            [run("succeeded")],
-            "2026-07-24T01:04:00.000Z",
-          ),
+          pipeline("complete", [run("succeeded")], "2026-07-24T01:04:00.000Z"),
         ),
       )
       .mockResolvedValue(
         snapshot(
           item,
-          pipeline(
-            "complete",
-            [run("succeeded")],
-            "2026-07-24T01:04:00.000Z",
-          ),
+          pipeline("complete", [run("succeeded")], "2026-07-24T01:04:00.000Z"),
         ),
       );
     const view = renderHook(
@@ -582,19 +558,13 @@ describe("useReleasePipelinePolling", () => {
       releases: [
         release(
           "1",
-          pipeline(
-            "complete",
-            [run("succeeded")],
-            "2026-07-24T01:04:00.000Z",
-          ),
+          pipeline("complete", [run("succeeded")], "2026-07-24T01:04:00.000Z"),
         ),
       ],
     });
     await act(async () => {
       await vi.advanceTimersByTimeAsync(RELEASE_PIPELINE_REFRESH_INTERVAL);
-      await vi.advanceTimersByTimeAsync(
-        RELEASE_PIPELINE_REFRESH_INTERVAL * 3,
-      );
+      await vi.advanceTimersByTimeAsync(RELEASE_PIPELINE_REFRESH_INTERVAL * 3);
     });
 
     expect(api.getReleasePipelines).toHaveBeenCalledTimes(2);
@@ -657,20 +627,49 @@ describe("useReleasePipelinePolling", () => {
     );
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(
-        RELEASE_PIPELINE_REFRESH_INTERVAL * 4,
-      );
+      await vi.advanceTimersByTimeAsync(RELEASE_PIPELINE_REFRESH_INTERVAL * 4);
     });
     expect(api.getReleasePipelines).toHaveBeenCalledTimes(1);
 
     await act(async () => {
       first.resolve(snapshot(item, pipeline("pending")));
       await first.promise;
-      await vi.advanceTimersByTimeAsync(
-        RELEASE_PIPELINE_REFRESH_INTERVAL - 1,
-      );
+      await vi.advanceTimersByTimeAsync(RELEASE_PIPELINE_REFRESH_INTERVAL - 1);
     });
     expect(api.getReleasePipelines).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(api.getReleasePipelines).toHaveBeenCalledTimes(2);
+  });
+
+  it("backs off exponentially after pipeline refresh failures", async () => {
+    vi.useFakeTimers();
+    const item = release("1", pipeline("pending"));
+    api.getReleasePipelines
+      .mockRejectedValueOnce(new Error("rate limited"))
+      .mockResolvedValue(snapshot(item, pipeline("pending")));
+    renderHook(() =>
+      useReleasePipelinePolling({
+        enabled: true,
+        onSnapshot: () => undefined,
+        refreshRevision: 0,
+        releases: [item],
+      }),
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RELEASE_PIPELINE_REFRESH_INTERVAL);
+    });
+    expect(api.getReleasePipelines).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(
+        RELEASE_PIPELINE_REFRESH_INTERVAL * 2 - 1,
+      );
+    });
+    expect(api.getReleasePipelines).toHaveBeenCalledOnce();
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1);
@@ -704,14 +703,18 @@ describe("useReleasePipelinePolling", () => {
     expect(firstSignal?.aborted).toBe(true);
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(
-        RELEASE_PIPELINE_REFRESH_INTERVAL * 2,
-      );
+      await vi.advanceTimersByTimeAsync(RELEASE_PIPELINE_REFRESH_INTERVAL * 2);
     });
     expect(api.getReleasePipelines).toHaveBeenCalledTimes(1);
 
     view.rerender({ enabled: true });
     expect(api.getReleasePipelines).toHaveBeenCalledTimes(2);
+    expect(api.getReleasePipelines).toHaveBeenNthCalledWith(
+      2,
+      expect.any(AbortSignal),
+      false,
+      true,
+    );
   });
 
   it("aborts identity-stale work and ignores its late response", async () => {
@@ -835,7 +838,10 @@ describe("useReleasePipelinePolling", () => {
 
   it("pauses while hidden and refreshes terminal snapshots on resume", async () => {
     vi.useFakeTimers();
-    const item = release("1", pipeline("complete"));
+    vi.setSystemTime("2026-07-24T01:04:00.000Z");
+    const item = release("1", pipeline("complete"), {
+      publishedAt: "2026-07-24T01:03:00.000Z",
+    });
     api.getReleasePipelines.mockResolvedValue(
       snapshot(item, pipeline("complete")),
     );
@@ -853,9 +859,7 @@ describe("useReleasePipelinePolling", () => {
       document.dispatchEvent(new Event("visibilitychange"));
     });
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(
-        RELEASE_PIPELINE_REFRESH_INTERVAL * 2,
-      );
+      await vi.advanceTimersByTimeAsync(RELEASE_PIPELINE_REFRESH_INTERVAL * 2);
     });
     expect(api.getReleasePipelines).not.toHaveBeenCalled();
 
@@ -867,7 +871,11 @@ describe("useReleasePipelinePolling", () => {
   });
 
   it("refreshes terminal snapshots on focus without overlapping work", async () => {
-    const item = release("1", pipeline("complete", [run("succeeded")]));
+    vi.useFakeTimers();
+    vi.setSystemTime("2026-07-24T01:04:00.000Z");
+    const item = release("1", pipeline("complete", [run("succeeded")]), {
+      publishedAt: "2026-07-24T01:03:00.000Z",
+    });
     const pending = createDeferred<ReleasePipelinesResponse>();
     api.getReleasePipelines.mockReturnValue(pending.promise);
     renderHook(() =>
@@ -885,10 +893,95 @@ describe("useReleasePipelinePolling", () => {
     });
 
     expect(api.getReleasePipelines).toHaveBeenCalledTimes(1);
+    expect(api.getReleasePipelines).toHaveBeenCalledWith(
+      expect.any(AbortSignal),
+      false,
+      true,
+    );
     await act(async () => {
       pending.resolve(snapshot(item, pipeline("complete", [run("succeeded")])));
       await pending.promise;
     });
+  });
+
+  it("does not sweep old terminal releases on focus", () => {
+    const item = release("1", pipeline("complete", [run("succeeded")]), {
+      publishedAt: "2026-07-23T01:03:00.000Z",
+    });
+    renderHook(() =>
+      useReleasePipelinePolling({
+        enabled: true,
+        onSnapshot: () => undefined,
+        refreshRevision: 0,
+        releases: [item],
+      }),
+    );
+
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    expect(api.getReleasePipelines).not.toHaveBeenCalled();
+  });
+
+  it("targets releases without workflow evidence on focus after five minutes", () => {
+    const item = release("1", pipeline("complete"), {
+      publishedAt: "2026-07-23T01:03:00.000Z",
+    });
+    api.getReleasePipelines.mockResolvedValue(
+      snapshot(item, pipeline("complete")),
+    );
+    renderHook(() =>
+      useReleasePipelinePolling({
+        enabled: true,
+        onSnapshot: () => undefined,
+        refreshRevision: 0,
+        releases: [item],
+      }),
+    );
+
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    expect(api.getReleasePipelines).toHaveBeenCalledWith(
+      expect.any(AbortSignal),
+      false,
+      true,
+    );
+  });
+
+  it("continues low-frequency discovery after the fast discovery window", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime("2026-07-24T02:00:00.000Z");
+    const item = release("1", pipeline("pending"), {
+      publishedAt: "2026-07-24T01:00:00.000Z",
+    });
+    api.getReleasePipelines.mockResolvedValue(
+      snapshot(item, pipeline("complete")),
+    );
+    renderHook(() =>
+      useReleasePipelinePolling({
+        enabled: true,
+        onSnapshot: () => undefined,
+        refreshRevision: 0,
+        releases: [item],
+      }),
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RELEASE_PIPELINE_FOLLOWUP_INTERVAL - 1);
+    });
+    expect(api.getReleasePipelines).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(api.getReleasePipelines).toHaveBeenCalledOnce();
+    expect(api.getReleasePipelines).toHaveBeenCalledWith(
+      expect.any(AbortSignal),
+      false,
+    );
   });
 
   it("aborts active work on visibility loss and restarts on resume", async () => {
@@ -951,7 +1044,7 @@ describe("useReleasePipelinePolling", () => {
     });
     expect(api.getReleasePipelines).toHaveBeenCalledTimes(1);
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(RELEASE_PIPELINE_REFRESH_INTERVAL);
+      await vi.advanceTimersByTimeAsync(RELEASE_PIPELINE_REFRESH_INTERVAL * 2);
     });
     expect(api.getReleasePipelines).toHaveBeenCalledTimes(2);
 

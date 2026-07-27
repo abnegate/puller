@@ -8,10 +8,11 @@ import {
 } from "react";
 import { ExternalLink, LoaderCircle, Rocket } from "lucide-react";
 
-import { createRelease } from "@/api";
+import { createRelease, getReleasePreview } from "@/api";
 import type {
   CreateReleaseResponse,
   ReleaseOptions,
+  ReleasePreview,
   ReleaseRepository,
 } from "@/types";
 import {
@@ -102,6 +103,9 @@ function ReleaseDialogContent({ onCreated, viewerLogin }: ReleaseDialogProps) {
   const [repository, setRepository] = useState("");
   const [tag, setTag] = useState("");
   const [prerelease, setPrerelease] = useState(false);
+  const [preview, setPreview] = useState<ReleasePreview | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewing, setPreviewing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [created, setCreated] = useState<CreateReleaseResponse | null>(null);
@@ -116,6 +120,8 @@ function ReleaseDialogContent({ onCreated, viewerLogin }: ReleaseDialogProps) {
     refreshing,
   } = useReleaseOptions(viewerLogin, open);
   const prereleaseDescriptionId = useId();
+  const previewController = useRef<AbortController | null>(null);
+  const previewRevision = useRef(0);
   const tagDescriptionId = useId();
   const tagErrorId = useId();
   const repositoryRef = useRef(repository);
@@ -164,6 +170,8 @@ function ReleaseDialogContent({ onCreated, viewerLogin }: ReleaseDialogProps) {
 
   useEffect(() => {
     return () => {
+      previewController.current?.abort();
+      previewController.current = null;
       submitController.current?.abort();
       submitController.current = null;
     };
@@ -183,6 +191,21 @@ function ReleaseDialogContent({ onCreated, viewerLogin }: ReleaseDialogProps) {
   const normalizedTag = tag.trim();
   const tagExists = selected?.previousTags.includes(normalizedTag) ?? false;
   const valid = selected !== null && normalizedTag.length > 0 && !tagExists;
+  const previewMatches =
+    preview !== null &&
+    selected !== null &&
+    preview.repository === selected.repository &&
+    preview.tag === normalizedTag &&
+    preview.baseTag === selected.latestTag;
+
+  useEffect(() => {
+    previewRevision.current += 1;
+    previewController.current?.abort();
+    previewController.current = null;
+    setPreview(null);
+    setPreviewError(null);
+    setPreviewing(false);
+  }, [normalizedTag, selected?.latestTag, selected?.repository]);
 
   const handleOpenChange = (next: boolean) => {
     if (!next && submitting) return;
@@ -192,7 +215,10 @@ function ReleaseDialogContent({ onCreated, viewerLogin }: ReleaseDialogProps) {
       setCreatedPrerelease(null);
       setSubmitError(null);
     } else {
+      previewController.current?.abort();
+      previewController.current = null;
       setConfirmOpen(false);
+      setPreviewing(false);
     }
   };
 
@@ -211,8 +237,68 @@ function ReleaseDialogContent({ onCreated, viewerLogin }: ReleaseDialogProps) {
     void forceRefreshOptions();
   };
 
+  const loadPreview = async () => {
+    if (!selected || !valid) return;
+
+    previewController.current?.abort();
+    const controller = new AbortController();
+    previewController.current = controller;
+    const revision = ++previewRevision.current;
+    const expected = {
+      baseTag: selected.latestTag,
+      repository: selected.repository,
+      tag: normalizedTag,
+    };
+    setPreview(null);
+    setPreviewError(null);
+    setPreviewing(true);
+    try {
+      const result = await getReleasePreview(
+        {
+          expectedLatestTag: expected.baseTag,
+          repository: expected.repository,
+          tag: expected.tag,
+        },
+        controller.signal,
+      );
+      if (
+        previewController.current !== controller ||
+        previewRevision.current !== revision ||
+        result.baseTag !== expected.baseTag ||
+        result.repository !== expected.repository ||
+        result.tag !== expected.tag
+      ) {
+        return;
+      }
+      setPreview(result);
+    } catch (error) {
+      if (
+        previewController.current === controller &&
+        previewRevision.current === revision &&
+        !(error instanceof DOMException && error.name === "AbortError")
+      ) {
+        setPreviewError(errorText(error));
+      }
+    } finally {
+      if (
+        previewController.current === controller &&
+        previewRevision.current === revision
+      ) {
+        previewController.current = null;
+        setPreviewing(false);
+      }
+    }
+  };
+
   const submit = async () => {
-    if (!selected || !valid || submitting || submitPending.current) return;
+    if (
+      !selected ||
+      !valid ||
+      !previewMatches ||
+      submitting ||
+      submitPending.current
+    )
+      return;
 
     submitPending.current = true;
     submitController.current?.abort();
@@ -227,6 +313,7 @@ function ReleaseDialogContent({ onCreated, viewerLogin }: ReleaseDialogProps) {
         {
           expectedLatestTag: selected.latestTag,
           prerelease: submittedPrerelease,
+          preview,
           repository: selected.repository,
           tag: normalizedTag,
         },
@@ -246,6 +333,8 @@ function ReleaseDialogContent({ onCreated, viewerLogin }: ReleaseDialogProps) {
         !(error instanceof DOMException && error.name === "AbortError")
       ) {
         setSubmitError(errorText(error));
+        setPreview(null);
+        setPreviewError(null);
       }
     } finally {
       if (submitController.current === controller) {
@@ -296,7 +385,10 @@ function ReleaseDialogContent({ onCreated, viewerLogin }: ReleaseDialogProps) {
               className="grid gap-4"
               onSubmit={(event) => {
                 event.preventDefault();
-                if (valid) setConfirmOpen(true);
+                if (valid) {
+                  setConfirmOpen(true);
+                  void loadPreview();
+                }
               }}
             >
               <div className="grid gap-2">
@@ -459,11 +551,16 @@ function ReleaseDialogContent({ onCreated, viewerLogin }: ReleaseDialogProps) {
       <AlertDialog
         onOpenChange={(next) => {
           if (!next && submitting) return;
+          if (!next) {
+            previewController.current?.abort();
+            previewController.current = null;
+            setPreviewing(false);
+          }
           setConfirmOpen(next);
         }}
         open={confirmOpen}
       >
-        <AlertDialogContent>
+        <AlertDialogContent className="sm:max-w-lg">
           <AlertDialogHeader>
             <AlertDialogTitle>
               {prerelease
@@ -477,6 +574,81 @@ function ReleaseDialogContent({ onCreated, viewerLogin }: ReleaseDialogProps) {
               release notes. GitHub will reject a release with no new commits.
             </AlertDialogDescription>
           </AlertDialogHeader>
+
+          <section
+            aria-busy={previewing}
+            aria-label="Included pull requests"
+            className="overflow-hidden rounded-lg border bg-muted/20"
+          >
+            <div className="flex items-center justify-between gap-3 border-b px-3 py-2">
+              <h3 className="text-sm font-medium">Included pull requests</h3>
+              {preview && (
+                <span className="rounded-full bg-muted px-2 py-0.5 text-xs tabular-nums text-muted-foreground">
+                  {preview.pulls.length}
+                </span>
+              )}
+            </div>
+            {previewing ? (
+              <div
+                className="flex items-center gap-2 px-3 py-4 text-sm text-muted-foreground"
+                role="status"
+              >
+                <LoaderCircle
+                  aria-hidden="true"
+                  className="size-4 animate-spin"
+                />
+                Generating release notes…
+              </div>
+            ) : previewError ? (
+              <div className="space-y-2 px-3 py-3" role="alert">
+                <p className="text-sm text-destructive">{previewError}</p>
+                <Button
+                  onClick={() => void loadPreview()}
+                  size="sm"
+                  type="button"
+                  variant="outline"
+                >
+                  Try again
+                </Button>
+              </div>
+            ) : preview?.pulls.length === 0 ? (
+              <p className="px-3 py-4 text-sm text-muted-foreground">
+                No pull requests are included in these generated notes.
+              </p>
+            ) : preview ? (
+              <ol className="max-h-52 divide-y overflow-y-auto">
+                {preview.pulls.map((pull) => (
+                  <li className="px-3 py-2" key={pull.number}>
+                    <a
+                      className="flex min-w-0 items-baseline gap-2 text-sm hover:underline"
+                      href={pull.url}
+                      rel="noreferrer"
+                      target="_blank"
+                    >
+                      <span className="shrink-0 text-muted-foreground">
+                        #{pull.number}
+                      </span>
+                      <span className="truncate">{pull.title}</span>
+                    </a>
+                  </li>
+                ))}
+              </ol>
+            ) : (
+              <div className="space-y-2 px-3 py-3">
+                <p className="text-sm text-muted-foreground">
+                  Review the current release contents before publishing.
+                </p>
+                <Button
+                  onClick={() => void loadPreview()}
+                  size="sm"
+                  type="button"
+                  variant="outline"
+                >
+                  Review again
+                </Button>
+              </div>
+            )}
+          </section>
 
           {submitError && (
             <div className="space-y-2" role="alert">
@@ -502,7 +674,7 @@ function ReleaseDialogContent({ onCreated, viewerLogin }: ReleaseDialogProps) {
               </Button>
             )}
             <AlertDialogAction
-              disabled={submitting}
+              disabled={submitting || !previewMatches}
               onClick={(event) => {
                 event.preventDefault();
                 void submit();

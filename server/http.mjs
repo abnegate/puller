@@ -248,6 +248,20 @@ function refreshQuery(url) {
   throw new ActionError(400, "invalid_query", "The refresh query is invalid.");
 }
 
+function pipelineQuery(url) {
+  const entries = [...url.searchParams.entries()];
+  if (entries.length === 0) return { discover: false, refresh: false };
+  if (entries.length === 1 && entries[0][1] === "1") {
+    if (entries[0][0] === "discover") return { discover: true, refresh: false };
+    if (entries[0][0] === "refresh") return { discover: false, refresh: true };
+  }
+  throw new ActionError(
+    400,
+    "invalid_query",
+    "The release pipeline query is invalid.",
+  );
+}
+
 function decodeSegment(value) {
   let decoded;
   try {
@@ -1222,7 +1236,10 @@ export function createApiHandler({
 
     if (url.pathname === "/api/releases/pipelines") {
       if (!methodAllowed(request, response, "GET")) return true;
-      if (!releaseService || typeof releaseService.getPipelines !== "function") {
+      if (
+        !releaseService ||
+        typeof releaseService.getPipelines !== "function"
+      ) {
         sendJson(response, 503, {
           error: "Release pipelines are unavailable.",
           code: "release_service_unavailable",
@@ -1233,13 +1250,43 @@ export function createApiHandler({
         sendJson(
           response,
           200,
-          await releaseService.getPipelines({ refresh: refreshQuery(url) }),
+          await releaseService.getPipelines(pipelineQuery(url)),
         );
       } catch (error) {
         sendServiceError(response, error, {
           code: "release_pipelines_unavailable",
           message: "Release pipelines could not be loaded.",
           status: 503,
+        });
+      }
+      return true;
+    }
+
+    if (url.pathname === "/api/releases/preview") {
+      if (!methodAllowed(request, response, "POST")) return true;
+      if (
+        !actionAllowed(request, response, {
+          actionToken,
+          executionEnabled,
+          manager: releaseService,
+          trustedOrigin,
+        })
+      )
+        return true;
+      try {
+        const body = await readJson(request);
+        if (!exactKeys(body, ["expectedLatestTag", "repository", "tag"])) {
+          throw new ActionError(
+            400,
+            "invalid_request",
+            "The release preview request is invalid.",
+          );
+        }
+        sendJson(response, 200, await releaseService.preview(body));
+      } catch (error) {
+        sendServiceError(response, error, {
+          code: "release_preview_failed",
+          message: "The release preview could not be loaded.",
         });
       }
       return true;
@@ -1262,6 +1309,7 @@ export function createApiHandler({
           !exactKeys(body, [
             "expectedLatestTag",
             "prerelease",
+            "preview",
             "repository",
             "tag",
           ])

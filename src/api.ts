@@ -37,6 +37,8 @@ import type {
   ReleaseVerificationRequest,
   ReleaseVerificationState,
   ReleaseOptions,
+  ReleasePreview,
+  ReleasePreviewRequest,
   ReleaseRepository,
   ReleasedPull,
   ReviewComment,
@@ -1322,6 +1324,54 @@ export const isReleaseOptions = (value: unknown): value is ReleaseOptions =>
   Array.isArray(value.warnings) &&
   value.warnings.every(isNonEmptyString);
 
+export const isReleasePreview = (value: unknown): value is ReleasePreview => {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, [
+      "baseTag",
+      "body",
+      "digest",
+      "name",
+      "pulls",
+      "repository",
+      "tag",
+      "targetOid",
+    ]) ||
+    !(value.baseTag === null || isNonEmptyString(value.baseTag)) ||
+    typeof value.body !== "string" ||
+    typeof value.digest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(value.digest) ||
+    typeof value.name !== "string" ||
+    !Array.isArray(value.pulls) ||
+    !isRepository(value.repository) ||
+    !isNonEmptyString(value.tag) ||
+    !isSha(value.targetOid)
+  ) {
+    return false;
+  }
+
+  const pulls = value.pulls;
+  const repository = value.repository;
+  return pulls.every((pull, index) => {
+    if (
+      !isRecord(pull) ||
+      !hasOnlyKeys(pull, ["number", "title", "url"]) ||
+      !isInteger(pull.number, 1) ||
+      !isNonEmptyString(pull.title) ||
+      pull.url !== `https://github.com/${repository}/pull/${pull.number}`
+    ) {
+      return false;
+    }
+    const previous = pulls[index - 1];
+    return (
+      index === 0 ||
+      (isRecord(previous) &&
+        isInteger(previous.number, 1) &&
+        previous.number < pull.number)
+    );
+  });
+};
+
 const isReleasedPull = (value: unknown): value is ReleasedPull =>
   isRecord(value) &&
   hasOnlyKeys(value, [
@@ -1371,9 +1421,7 @@ const isReleasePipelineRun = (
     !isNonEmptyString(value.name) ||
     !isNonEmptyString(value.path) ||
     !(value.startedAt === null || isValidDate(value.startedAt)) ||
-    !RELEASE_PIPELINE_RUN_STATES.has(
-      value.state as ReleasePipelineRunState,
-    ) ||
+    !RELEASE_PIPELINE_RUN_STATES.has(value.state as ReleasePipelineRunState) ||
     !isValidDate(value.updatedAt) ||
     !isCanonicalActionsRunUrl(value.url, repository, value.id) ||
     !isNonEmptyString(value.workflowId) ||
@@ -1407,8 +1455,7 @@ const isReleasePipeline = (
   const runIds = new Set(value.runs.map((run) => run.id));
   const workflowIds = new Set(value.runs.map((run) => run.workflowId));
   return (
-    runIds.size === value.runs.length &&
-    workflowIds.size === value.runs.length
+    runIds.size === value.runs.length && workflowIds.size === value.runs.length
   );
 };
 
@@ -1507,8 +1554,7 @@ export const isRecentReleasesResponse = (
   typeof value.partial === "boolean" &&
   Array.isArray(value.releases) &&
   value.releases.every(isRecentRelease) &&
-  new Set(value.releases.map(releaseIdentity)).size ===
-    value.releases.length &&
+  new Set(value.releases.map(releaseIdentity)).size === value.releases.length &&
   Array.isArray(value.warnings) &&
   value.warnings.every(isNonEmptyString);
 
@@ -2192,15 +2238,14 @@ export const getRecentReleases = async (
 export const getReleasePipelines = async (
   signal?: AbortSignal,
   force = true,
+  discover = false,
 ): Promise<ReleasePipelinesResponse> => {
-  const response = await fetch(
-    force ? "/api/releases/pipelines?refresh=1" : "/api/releases/pipelines",
-    {
-      cache: "no-store",
-      headers: { Accept: "application/json" },
-      signal,
-    },
-  );
+  const query = force ? "?refresh=1" : discover ? "?discover=1" : "";
+  const response = await fetch(`/api/releases/pipelines${query}`, {
+    cache: "no-store",
+    headers: { Accept: "application/json" },
+    signal,
+  });
   const payload = await readJson(response);
 
   if (!response.ok) {
@@ -2396,16 +2441,48 @@ export const mergePull = async (
   return response;
 };
 
+const validReleasePreviewRequest = (request: ReleasePreviewRequest): boolean =>
+  isRepository(request.repository) &&
+  isNonEmptyString(request.tag) &&
+  (request.expectedLatestTag === null ||
+    isNonEmptyString(request.expectedLatestTag));
+
+export const getReleasePreview = async (
+  request: ReleasePreviewRequest,
+  signal?: AbortSignal,
+): Promise<ReleasePreview> => {
+  if (!validReleasePreviewRequest(request)) {
+    throw new Error("The release preview request is invalid.");
+  }
+
+  const response = await postJsonAction(
+    "/api/releases/preview",
+    request,
+    isReleasePreview,
+    "The release preview could not be loaded",
+    signal,
+  );
+  if (
+    response.repository !== request.repository ||
+    response.tag !== request.tag ||
+    response.baseTag !== request.expectedLatestTag
+  ) {
+    throw new Error("The release preview returned an unexpected response.");
+  }
+  return response;
+};
+
 export const createRelease = async (
   request: CreateReleaseRequest,
   signal?: AbortSignal,
 ): Promise<CreateReleaseResponse> => {
   if (
-    !isRepository(request.repository) ||
-    !isNonEmptyString(request.tag) ||
+    !validReleasePreviewRequest(request) ||
     typeof request.prerelease !== "boolean" ||
-    (request.expectedLatestTag !== null &&
-      !isNonEmptyString(request.expectedLatestTag))
+    !isReleasePreview(request.preview) ||
+    request.preview.repository !== request.repository ||
+    request.preview.tag !== request.tag ||
+    request.preview.baseTag !== request.expectedLatestTag
   ) {
     throw new Error("The release request is invalid.");
   }
@@ -2415,6 +2492,7 @@ export const createRelease = async (
     {
       expectedLatestTag: request.expectedLatestTag,
       prerelease: request.prerelease,
+      preview: request.preview,
       repository: request.repository,
       tag: request.tag,
     },
@@ -2860,10 +2938,17 @@ const parseVerificationEvent = (
       break;
     case "complete":
       if (
-        hasOnlyKeys(value, ["exitCode", "type"]) &&
-        isInteger(value.exitCode)
+        hasOnlyKeys(value, ["exitCode", "outcome", "type"]) &&
+        isInteger(value.exitCode) &&
+        ["not_verified", "unavailable", "verified"].includes(
+          String(value.outcome),
+        )
       ) {
-        return { exitCode: value.exitCode, type: "complete" };
+        return {
+          exitCode: value.exitCode,
+          outcome: value.outcome as "not_verified" | "unavailable" | "verified",
+          type: "complete",
+        };
       }
       break;
     case "error":

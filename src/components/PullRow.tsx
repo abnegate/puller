@@ -311,7 +311,16 @@ const getReadyEvidence = (pull: PullReadiness): string =>
     pull.ci.state === "none" ? "No CI checks reported" : "CI passed"
   }`;
 
-const getCIProgress = (pull: PullReadiness): string => {
+const getCIOverview = (
+  pull: PullReadiness,
+): {
+  failed: number;
+  inProgress: number;
+  queued: number;
+  successful: number;
+  total: number;
+  unknown: number;
+} => {
   const checks = pull.ci.checks ?? [];
   const count = (...states: string[]): number =>
     checks.filter((check) => states.includes(check.state)).length;
@@ -325,19 +334,49 @@ const getCIProgress = (pull: PullReadiness): string => {
   const total =
     pull.ci.total ?? inProgress + queued + successful + failed + unknown;
 
-  if (total === 0) return "No CI checks reported";
-
-  const overview = [
-    `${inProgress} in progress`,
-    `${queued} queued`,
-    `${successful} successful`,
-    `${failed} failed`,
-  ];
-  if (unknown > 0 || pull.ci.complete === false) {
-    overview.push(`${unknown} unknown`);
-  }
-  return overview.join(" · ");
+  return { failed, inProgress, queued, successful, total, unknown };
 };
+
+function CIProgress({ pull }: { pull: PullReadiness }) {
+  const overview = getCIOverview(pull);
+  if (overview.total === 0) return "No CI checks reported";
+
+  const segments = [
+    {
+      key: "in-progress",
+      label: `${overview.inProgress} in progress`,
+    },
+    {
+      key: "queued",
+      label: `${overview.queued} queued`,
+    },
+    {
+      key: "successful",
+      label: `${overview.successful} successful`,
+    },
+    {
+      key: "failed",
+      label: `${overview.failed} failed`,
+    },
+  ];
+  if (overview.unknown > 0 || pull.ci.complete === false) {
+    segments.push({
+      key: "unknown",
+      label: `${overview.unknown} unknown`,
+    });
+  }
+
+  return segments.map((segment, index) => (
+    <span data-ci-count={segment.key} key={segment.key}>
+      {index > 0 && (
+        <span aria-hidden="true" className="text-muted-foreground">
+          {" · "}
+        </span>
+      )}
+      {segment.label}
+    </span>
+  ));
+}
 
 const stopControlClick = (event: MouseEvent<HTMLElement>) => {
   event.stopPropagation();
@@ -1886,14 +1925,10 @@ function PullRow({
         {variant !== "ready" && (
           <>
             <p
-              className={
-                variant === "progress"
-                  ? "mt-1 text-xs text-amber-800 dark:text-amber-300"
-                  : "mt-1 text-xs text-muted-foreground"
-              }
+              className="mt-1 text-xs text-muted-foreground"
               data-ci-progress=""
             >
-              {getCIProgress(pull)}
+              <CIProgress pull={pull} />
               {variant === "progress" && active && (
                 <>
                   <span aria-hidden="true"> · </span>

@@ -678,9 +678,11 @@ describe("PullRow ready presentation", () => {
           name: `Files changed for ${pull.repository} pull request ${pull.number}`,
         }),
       ).toHaveTextContent(selected.sha.slice(0, 7));
-      expect(
-        screen.getByRole("list", { name: "Pull request commits" }),
-      ).toBeVisible();
+      await waitFor(() =>
+        expect(
+          screen.getByRole("list", { name: "Pull request commits" }),
+        ).toBeVisible(),
+      );
       expect(
         screen.queryByRole("button", { name: /^(Hide|Show) commits$/ }),
       ).not.toBeInTheDocument();
@@ -1700,7 +1702,7 @@ describe("PullRow progress and blocker presentation", () => {
     expect(getPullDiff).toHaveBeenCalledTimes(2);
   });
 
-  it("shows a centered spinning yellow progress icon and exact CI counts", () => {
+  it("shows a centered spinning yellow progress icon and muted CI counts", () => {
     const pull = createPendingPull();
     const { container } = renderRow(pull, "progress");
 
@@ -1714,9 +1716,17 @@ describe("PullRow progress and blocker presentation", () => {
     );
     expect(icon).toHaveAttribute("data-status-active", "false");
     expect(screen.getByText("CI running")).toBeInTheDocument();
+    const overview = container.querySelector("[data-ci-progress]");
+    expect(overview).toHaveTextContent(
+      "0 in progress · 1 queued · 1 successful · 0 failed",
+    );
+    expect(overview).toHaveClass("text-muted-foreground");
     expect(
-      screen.getByText("0 in progress · 1 queued · 1 successful · 0 failed"),
-    ).toBeInTheDocument();
+      overview?.querySelector('[data-ci-count="successful"]'),
+    ).not.toHaveAttribute("class");
+    expect(
+      overview?.querySelector('[data-ci-count="failed"]'),
+    ).not.toHaveAttribute("class");
     const blockerList = screen.getByRole("list", { name: "Blockers" });
     expect(blockerList.querySelector("svg")).toHaveClass("text-amber-600");
     expect(
@@ -1737,9 +1747,7 @@ describe("PullRow progress and blocker presentation", () => {
     );
 
     expect(screen.getAllByText("Claude running").length).toBeGreaterThan(0);
-    expect(
-      screen.getByText(/0 in progress · 1 queued · 1 successful · 0 failed/),
-    ).toHaveTextContent(
+    expect(container.querySelector("[data-ci-progress]")).toHaveTextContent(
       "0 in progress · 1 queued · 1 successful · 0 failed · Claude running",
     );
     expect(screen.getByRole("log")).toHaveTextContent("Still working.");
@@ -1774,20 +1782,19 @@ describe("PullRow progress and blocker presentation", () => {
         unknown: 2,
       },
     };
-    renderRow(pull, "progress");
+    const { container } = renderRow(pull, "progress");
 
-    expect(
-      screen.getByText(
-        "2 in progress · 3 queued · 4 successful · 1 failed · 2 unknown",
-      ),
-    ).toBeInTheDocument();
+    expect(container.querySelector("[data-ci-progress]")).toHaveTextContent(
+      "2 in progress · 3 queued · 4 successful · 1 failed · 2 unknown",
+    );
   });
 
   it("shows subdued CI counts including failures on blocked rows", () => {
     const pull = getBlockedPull();
     const { container } = renderRow(pull, "blocked");
 
-    const overview = screen.getByText(
+    const overview = container.querySelector("[data-ci-progress]");
+    expect(overview).toHaveTextContent(
       "0 in progress · 0 queued · 1 successful · 1 failed",
     );
     expect(overview).toHaveClass("text-muted-foreground");
@@ -1796,7 +1803,12 @@ describe("PullRow progress and blocker presentation", () => {
       "dark:text-amber-300",
       "text-destructive",
     );
-    expect(container.querySelector("[data-ci-progress]")).toBe(overview);
+    expect(
+      overview?.querySelector('[data-ci-count="successful"]'),
+    ).not.toHaveAttribute("class");
+    expect(
+      overview?.querySelector('[data-ci-count="failed"]'),
+    ).not.toHaveAttribute("class");
     expect(screen.getByRole("list", { name: "Blockers" })).toHaveTextContent(
       "CI checks failed",
     );
@@ -1817,13 +1829,13 @@ describe("PullRow progress and blocker presentation", () => {
         unknown: 2,
       },
     };
-    renderRow(pull, "blocked");
+    const { container } = renderRow(pull, "blocked");
 
-    expect(
-      screen.getByText(
-        "2 in progress · 3 queued · 4 successful · 1 failed · 2 unknown",
-      ),
-    ).toHaveClass("text-muted-foreground");
+    const overview = container.querySelector("[data-ci-progress]");
+    expect(overview).toHaveTextContent(
+      "2 in progress · 3 queued · 4 successful · 1 failed · 2 unknown",
+    );
+    expect(overview).toHaveClass("text-muted-foreground");
   });
 
   it("shows the no-checks message on blocked rows", () => {
@@ -1859,11 +1871,10 @@ describe("PullRow progress and blocker presentation", () => {
     const progress = renderRow(createPendingPull(), "progress", run);
 
     expect(progress.container.querySelector("[data-ci-progress]")).toHaveClass(
-      "text-amber-800",
-      "dark:text-amber-300",
+      "text-muted-foreground",
     );
     expect(
-      screen.getByText(/0 in progress · 1 queued · 1 successful · 0 failed/),
+      progress.container.querySelector("[data-ci-progress]"),
     ).toHaveTextContent(
       "0 in progress · 1 queued · 1 successful · 0 failed · Claude running",
     );

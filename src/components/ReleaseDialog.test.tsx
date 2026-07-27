@@ -15,18 +15,20 @@ import {
   getReleaseOptionsStorageKey,
   resetReleaseOptionsCacheForTests,
 } from "@/release-options";
-import type { ReleaseOptions } from "@/types";
+import type { ReleaseOptions, ReleasePreview } from "@/types";
 
 import ReleaseDialog from "./ReleaseDialog";
 
 const api = vi.hoisted(() => ({
   create: vi.fn(),
   options: vi.fn(),
+  preview: vi.fn(),
 }));
 
 vi.mock("@/api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/api")>()),
   createRelease: api.create,
+  getReleasePreview: api.preview,
   getReleaseOptions: api.options,
 }));
 
@@ -50,6 +52,26 @@ const releaseOptions = (
   ...overrides,
 });
 
+const releasePreview = (
+  overrides: Partial<ReleasePreview> = {},
+): ReleasePreview => ({
+  baseTag: "v1.2.3",
+  body: "* Fix release behavior by @jake in https://github.com/appwrite/cloud/pull/927",
+  digest: "a".repeat(64),
+  name: "Generated v1.2.4",
+  pulls: [
+    {
+      number: 927,
+      title: "Fix release behavior",
+      url: "https://github.com/appwrite/cloud/pull/927",
+    },
+  ],
+  repository: "appwrite/cloud",
+  tag: "v1.2.4",
+  targetOid: "cccccccccccccccccccccccccccccccccccccccc",
+  ...overrides,
+});
+
 const originalLocalStorage = Object.getOwnPropertyDescriptor(
   window,
   "localStorage",
@@ -57,6 +79,25 @@ const originalLocalStorage = Object.getOwnPropertyDescriptor(
 
 beforeEach(() => {
   resetReleaseOptionsCacheForTests();
+  api.preview.mockImplementation(
+    async (request: {
+      expectedLatestTag: string | null;
+      repository: string;
+      tag: string;
+    }) =>
+      releasePreview({
+        baseTag: request.expectedLatestTag,
+        pulls: [
+          {
+            number: 927,
+            title: "Fix release behavior",
+            url: `https://github.com/${request.repository}/pull/927`,
+          },
+        ],
+        repository: request.repository,
+        tag: request.tag,
+      }),
+  );
   vi.stubGlobal(
     "ResizeObserver",
     class {
@@ -484,13 +525,28 @@ describe("ReleaseDialog", () => {
     expect(
       screen.getByRole("button", { name: "Publish release" }),
     ).toBeInTheDocument();
+    await waitFor(() => expect(api.preview).toHaveBeenCalledTimes(1));
+    expect(
+      await screen.findByRole("link", { name: /Fix release behavior/ }),
+    ).toHaveAttribute("href", "https://github.com/appwrite/cloud/pull/927");
+    expect(api.preview).toHaveBeenCalledWith(
+      {
+        expectedLatestTag: "v1.2.3",
+        repository: "appwrite/cloud",
+        tag: "v1.2.4",
+      },
+      expect.any(AbortSignal),
+    );
 
-    fireEvent.click(screen.getByRole("button", { name: "Publish release" }));
+    const publish = screen.getByRole("button", { name: "Publish release" });
+    await waitFor(() => expect(publish).toBeEnabled());
+    fireEvent.click(publish);
 
     expect(api.create).toHaveBeenCalledWith(
       {
         expectedLatestTag: "v1.2.3",
         prerelease: false,
+        preview: releasePreview(),
         repository: "appwrite/cloud",
         tag: "v1.2.4",
       },
@@ -507,6 +563,84 @@ describe("ReleaseDialog", () => {
       url: "https://github.com/appwrite/cloud/releases/tag/v1.2.4",
     });
     await screen.findByText("v1.2.4 is published.");
+  });
+
+  it("shows every included pull request and permits an empty generated-notes range", async () => {
+    api.options.mockResolvedValue(releaseOptions());
+    api.preview
+      .mockResolvedValueOnce(
+        releasePreview({
+          pulls: [
+            {
+              number: 927,
+              title: "Fix release behavior",
+              url: "https://github.com/appwrite/cloud/pull/927",
+            },
+            {
+              number: 931,
+              title: "Harden the deployment",
+              url: "https://github.com/appwrite/cloud/pull/931",
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(releasePreview({ pulls: [] }));
+    render(<ReleaseDialog onCreated={vi.fn()} viewerLogin="jake" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Release" }));
+    await waitFor(() =>
+      expect(screen.getByLabelText("Release tag")).toHaveValue("v1.2.4"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Review release" }));
+
+    expect(
+      await screen.findByRole("link", { name: /Fix release behavior/ }),
+    ).toHaveAttribute("href", "https://github.com/appwrite/cloud/pull/927");
+    expect(
+      screen.getByRole("link", { name: /Harden the deployment/ }),
+    ).toHaveAttribute("href", "https://github.com/appwrite/cloud/pull/931");
+    expect(
+      screen.getByRole("region", { name: "Included pull requests" }),
+    ).toHaveTextContent("2");
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review release" }));
+
+    expect(
+      await screen.findByText(
+        "No pull requests are included in these generated notes.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Publish release" }),
+    ).toBeEnabled();
+  });
+
+  it("keeps publishing disabled until a failed preview is retried", async () => {
+    api.options.mockResolvedValue(releaseOptions());
+    api.preview
+      .mockRejectedValueOnce(new Error("GitHub could not generate notes."))
+      .mockResolvedValueOnce(releasePreview());
+    render(<ReleaseDialog onCreated={vi.fn()} viewerLogin="jake" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Release" }));
+    await waitFor(() =>
+      expect(screen.getByLabelText("Release tag")).toHaveValue("v1.2.4"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Review release" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "GitHub could not generate notes.",
+    );
+    const publish = screen.getByRole("button", { name: "Publish release" });
+    expect(publish).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+
+    expect(
+      await screen.findByRole("link", { name: /Fix release behavior/ }),
+    ).toBeInTheDocument();
+    expect(publish).toBeEnabled();
   });
 
   it("preserves a pre-release through confirmation cancellation and conflict retry", async () => {
@@ -559,6 +693,11 @@ describe("ReleaseDialog", () => {
     expect(prerelease).toBeChecked();
 
     fireEvent.click(screen.getByRole("button", { name: "Review release" }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Publish pre-release" }),
+      ).toBeEnabled(),
+    );
     fireEvent.click(
       screen.getByRole("button", { name: "Publish pre-release" }),
     );
@@ -571,6 +710,7 @@ describe("ReleaseDialog", () => {
       {
         expectedLatestTag: "v1.2.3",
         prerelease: true,
+        preview: releasePreview(),
         repository: "appwrite/cloud",
         tag: "v1.2.4",
       },
@@ -582,6 +722,12 @@ describe("ReleaseDialog", () => {
       expect(screen.getByLabelText("Release tag")).toHaveValue("v1.2.5"),
     );
     expect(prerelease).toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "Review again" }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Publish pre-release" }),
+      ).toBeEnabled(),
+    );
     fireEvent.click(
       screen.getByRole("button", { name: "Publish pre-release" }),
     );
@@ -591,6 +737,10 @@ describe("ReleaseDialog", () => {
       {
         expectedLatestTag: "v1.2.4",
         prerelease: true,
+        preview: releasePreview({
+          baseTag: "v1.2.4",
+          tag: "v1.2.5",
+        }),
         repository: "appwrite/cloud",
         tag: "v1.2.5",
       },
@@ -902,7 +1052,9 @@ describe("ReleaseDialog", () => {
     fireEvent.change(tag, { target: { value: "v2.0.0-rc.1" } });
     expect(tag).toHaveValue("v2.0.0-rc.1");
     fireEvent.click(screen.getByRole("button", { name: "Review release" }));
-    fireEvent.click(screen.getByRole("button", { name: "Publish release" }));
+    const publish = screen.getByRole("button", { name: "Publish release" });
+    await waitFor(() => expect(publish).toBeEnabled());
+    fireEvent.click(publish);
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent(
@@ -912,6 +1064,7 @@ describe("ReleaseDialog", () => {
       {
         expectedLatestTag: "v1.2.3",
         prerelease: false,
+        preview: releasePreview({ tag: "v2.0.0-rc.1" }),
         repository: "appwrite/cloud",
         tag: "v2.0.0-rc.1",
       },
@@ -965,7 +1118,9 @@ describe("ReleaseDialog", () => {
       expect(screen.getByLabelText("Release tag")).toHaveValue("v1.2.4"),
     );
     fireEvent.click(screen.getByRole("button", { name: "Review release" }));
-    fireEvent.click(screen.getByRole("button", { name: "Publish release" }));
+    const publish = screen.getByRole("button", { name: "Publish release" });
+    await waitFor(() => expect(publish).toBeEnabled());
+    fireEvent.click(publish);
 
     await screen.findByText("v1.2.4 is published.");
     expect(onCreated).toHaveBeenCalledWith(

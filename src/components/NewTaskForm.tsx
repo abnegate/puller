@@ -1,6 +1,10 @@
 import { LoaderCircle, Plus, RefreshCw } from "lucide-react";
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
+import {
+  canonicalRepository,
+  useRepositoryPreferences,
+} from "../repository-preferences";
 import type { NewTaskRequest } from "../tasks";
 import type { Task, TaskOptions, TaskRepository } from "../types";
 import BranchPicker from "./BranchPicker";
@@ -27,7 +31,7 @@ const selectedRepository = (
   options?.repositories.find((item) => item.repository === repository) ?? null;
 
 const message = (error: unknown): string =>
-  error instanceof Error ? error.message : "The task could not be started.";
+  error instanceof Error ? error.message : "The PR could not be created.";
 
 export default function NewTaskForm({
   error,
@@ -42,10 +46,17 @@ export default function NewTaskForm({
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const pending = useRef(false);
+  const preferences = useRepositoryPreferences();
 
   useEffect(() => {
+    const favorite =
+      options?.repositories.find((item) => {
+        const canonical = canonicalRepository(item.repository);
+        return canonical !== null && preferences.favorites.has(canonical);
+      }) ?? null;
     const selected =
       selectedRepository(options, repository) ??
+      favorite ??
       options?.repositories[0] ??
       null;
     if (!selected) {
@@ -56,7 +67,7 @@ export default function NewTaskForm({
 
     if (selected.repository !== repository) setRepository(selected.repository);
     if (!selected.branches.includes(base)) setBase(selected.defaultBranch);
-  }, [base, options, repository]);
+  }, [base, options, preferences.favorites, repository]);
 
   const selected = useMemo(
     () => selectedRepository(options, repository),
@@ -99,7 +110,7 @@ export default function NewTaskForm({
   const status =
     submitError ??
     error ??
-    (promptTooLarge ? "Enter a task prompt of 32 KiB or less." : null) ??
+    (promptTooLarge ? "Enter PR instructions of 32 KiB or less." : null) ??
     (unavailable
       ? "No trusted local repositories with remote branches were found."
       : null);
@@ -113,13 +124,13 @@ export default function NewTaskForm({
     >
       <CardContent className="p-3">
         <form
-          aria-label="New task"
+          aria-label="New PR"
           className="grid gap-2 sm:grid-cols-[minmax(14rem,1fr)_minmax(10rem,0.36fr)_minmax(9rem,0.28fr)_auto] sm:items-center"
           onSubmit={(event) => void submit(event)}
         >
           <div className="min-w-0">
             <Label className="sr-only" htmlFor="new-task-prompt">
-              New task
+              New PR
             </Label>
             <Input
               autoComplete="off"
@@ -131,7 +142,7 @@ export default function NewTaskForm({
                 setPrompt(event.target.value);
                 setSubmitError(null);
               }}
-              placeholder="New task…"
+              placeholder="New PR…"
               value={prompt}
             />
           </div>
@@ -185,7 +196,7 @@ export default function NewTaskForm({
             ) : (
               <Plus aria-hidden="true" />
             )}
-            {submitting ? "Starting" : "Start task"}
+            {submitting ? "Creating" : "Create PR"}
           </Button>
         </form>
 

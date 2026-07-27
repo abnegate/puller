@@ -176,8 +176,25 @@
   transition: opacity 180ms ease-out;
 }
 
+[data-dashboard-columns][data-dashboard-mode] > [data-pull-column] {
+  opacity: 1;
+  transition: opacity 180ms ease-out;
+}
+
 .release-pipeline-chip {
   max-width: min(100%, 13rem);
+}
+
+[data-syntax-token] {
+  color: var(--syntax-light-foreground);
+  font-style: var(--syntax-light-font-style);
+  font-weight: var(--syntax-light-font-weight);
+}
+
+.dark [data-syntax-token] {
+  color: var(--syntax-dark-foreground);
+  font-style: var(--syntax-dark-font-style);
+  font-weight: var(--syntax-dark-font-weight);
 }
 
 @media (min-width: 64rem) {
@@ -201,14 +218,24 @@
     grid-template-columns: minmax(0, 1fr);
   }
 
-  [data-dashboard-columns][data-release-panel-expanded="false"] {
+  [data-dashboard-columns][data-dashboard-mode="pulls"] {
     grid-template-columns: minmax(0, 1fr) minmax(0, 0fr);
     gap: 0;
   }
 
-  [data-dashboard-columns][data-release-panel-expanded="false"]
-    [data-release-column] {
+  [data-dashboard-columns][data-dashboard-mode="releases"] {
+    grid-template-columns: minmax(0, 0fr) minmax(0, 1fr);
+    gap: 0;
+  }
+
+  [data-dashboard-columns][data-dashboard-mode="pulls"] > [data-release-column],
+  [data-dashboard-columns][data-dashboard-mode="releases"]
+    > [data-pull-column] {
+    height: 0;
+    overflow: hidden;
     opacity: 0;
+    pointer-events: none;
+    visibility: hidden;
   }
 
   [data-release-column] {
@@ -231,8 +258,9 @@
 }
 
 @media (max-width: 63.999rem) {
-  [data-dashboard-columns][data-release-panel-expanded="false"]
-    [data-release-column] {
+  [data-dashboard-columns][data-dashboard-mode="pulls"] > [data-release-column],
+  [data-dashboard-columns][data-dashboard-mode="releases"]
+    > [data-pull-column] {
     display: none;
   }
 
@@ -280,6 +308,7 @@
   }
 
   [data-dashboard-columns],
+  [data-dashboard-columns][data-dashboard-mode] > [data-pull-column],
   [data-release-column] {
     transition: none !important;
   }

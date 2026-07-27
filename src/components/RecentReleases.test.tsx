@@ -871,7 +871,7 @@ describe("RecentReleases", () => {
       yield { text: "First result.\n", type: "text" };
       await paused;
       yield { text: "Latest result.\n", type: "text" };
-      yield { exitCode: 0, type: "complete" };
+      yield { exitCode: 0, outcome: "verified", type: "complete" };
       finish();
     });
     render(
@@ -906,7 +906,7 @@ describe("RecentReleases", () => {
     const log = await screen.findByRole("log");
     expect(log).toHaveTextContent("First result.");
     expect(log).toHaveTextContent("Latest result.");
-    expect(screen.getAllByText("Completed").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Verified").length).toBeGreaterThan(0);
   });
 
   it("keeps batch progress and cancellation visible while pull rows are collapsed", async () => {
@@ -965,7 +965,8 @@ describe("RecentReleases", () => {
     await screen.findByText("Verifying release");
 
     expect(screen.getByText("Verifying release")).toBeVisible();
-    expect(screen.getAllByText("0/1")).toHaveLength(2);
+    expect(screen.getByText("0/1")).toBeVisible();
+    expect(screen.getByText(/0\/1 settled/)).toBeVisible();
     expect(
       screen.getByRole("button", {
         name: "Cancel verification of all pull requests in Release one",
@@ -1048,7 +1049,7 @@ describe("RecentReleases", () => {
           pullUrl: pull.pullUrl,
           state: "complete",
           type: "verification",
-          event: { exitCode: 0, type: "complete" },
+          event: { exitCode: 0, outcome: "verified", type: "complete" },
         };
       }
       yield {
@@ -1089,12 +1090,352 @@ describe("RecentReleases", () => {
       expect.any(AbortSignal),
     );
     await waitFor(() =>
-      expect(
-        screen.getByText("Release verification complete"),
-      ).toBeInTheDocument(),
+      expect(screen.getByText("Release verified")).toBeInTheDocument(),
     );
-    expect(screen.getByText("2/2")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "2/2 settled · 2 verified · 0 not verified · 0 unavailable · 0 failed",
+      ),
+    ).toBeInTheDocument();
     expect(api.stream).not.toHaveBeenCalled();
+  });
+
+  it("presents mixed batch outcomes and safe child errors without false completion", async () => {
+    const base = { ...release("one"), id: "123" };
+    const pulls = [
+      base.pulls[0]!,
+      ...(["b", "c", "d"] as const).map((character, index) => ({
+        ...base.pulls[0]!,
+        headSha: character.repeat(40),
+        number: 42 + index,
+        title: `Released change ${42 + index}`,
+        url: `https://github.com/appwrite/cloud/pull/${42 + index}`,
+      })),
+    ];
+    const item = { ...base, pulls };
+    const identities = pulls.map((pull) => ({
+      agent: "claude" as const,
+      headSha: pull.headSha,
+      pullNumber: pull.number,
+      pullUrl: pull.url,
+      releaseId: item.id,
+      repository: item.repository,
+      tag: item.tag,
+    }));
+    const message =
+      "GitHub and local Git cannot prove the exact target pull request delta.";
+    api.streamBatch.mockImplementation(async function* (): AsyncGenerator<
+      ReleaseVerificationEvent,
+      void,
+      undefined
+    > {
+      yield {
+        agent: "claude",
+        batchId: "batch-mixed",
+        pulls: identities,
+        releaseId: item.id,
+        repository: item.repository,
+        tag: item.tag,
+        type: "batch-start",
+      };
+      for (const [index, pull] of identities.entries()) {
+        yield {
+          batchId: "batch-mixed",
+          headSha: pull.headSha,
+          pullNumber: pull.pullNumber,
+          pullUrl: pull.pullUrl,
+          state: "queued",
+          type: "verification",
+        };
+        if (index === 0) {
+          yield {
+            batchId: "batch-mixed",
+            code: "verification_delta_unavailable",
+            headSha: pull.headSha,
+            message,
+            pullNumber: pull.pullNumber,
+            pullUrl: pull.pullUrl,
+            state: "error",
+            type: "verification",
+          };
+          continue;
+        }
+        if (index === 3) {
+          yield {
+            batchId: "batch-mixed",
+            event: {
+              text: "$ pnpm test\nConnection refused by the local service.\n",
+              type: "text",
+            },
+            headSha: pull.headSha,
+            message: "Executing the repository verification recipe.",
+            pullNumber: pull.pullNumber,
+            pullUrl: pull.pullUrl,
+            state: "running",
+            type: "verification",
+          };
+        }
+        yield {
+          batchId: "batch-mixed",
+          event: {
+            exitCode: 0,
+            outcome:
+              index === 1
+                ? "verified"
+                : index === 2
+                  ? "not_verified"
+                  : "unavailable",
+            type: "complete",
+          },
+          headSha: pull.headSha,
+          pullNumber: pull.pullNumber,
+          pullUrl: pull.pullUrl,
+          state: "complete",
+          type: "verification",
+        };
+      }
+      yield {
+        batchId: "batch-mixed",
+        totals: { complete: 3, error: 1, existing: 0, total: 4 },
+        type: "complete",
+      };
+    });
+    render(
+      <RecentReleases
+        data={response([item])}
+        error={null}
+        loading={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Verify all pull requests in Release one",
+      }),
+    );
+
+    expect(
+      await screen.findByText("Release verification finished with errors"),
+    ).toBeVisible();
+    expect(
+      screen.getByText(
+        "4/4 settled · 1 verified · 1 not verified · 1 unavailable · 1 failed",
+      ),
+    ).toBeVisible();
+    expect(
+      screen.queryByText("Release verification complete"),
+    ).not.toBeInTheDocument();
+
+    expandRelease(item.tag);
+    const failed = screen.getByRole("log", {
+      name: "Claude verification output for appwrite/cloud #41",
+    });
+    expect(failed).toHaveTextContent(message);
+    expect(failed).not.toHaveTextContent("Waiting for output");
+    const unavailable = screen.getByRole("log", {
+      name: "Claude verification output for appwrite/cloud #44",
+    });
+    expect(unavailable).toHaveTextContent(
+      "Executing the repository verification recipe.",
+    );
+    expect(unavailable).toHaveTextContent("$ pnpm test");
+    expect(unavailable).toHaveTextContent(
+      "Connection refused by the local service.",
+    );
+    expect(unavailable).not.toHaveTextContent("Waiting for output");
+    expect(
+      screen.getAllByRole("button", { name: "Verify again" }),
+    ).toHaveLength(4);
+    for (const retry of screen.getAllByRole("button", {
+      name: "Verify again",
+    })) {
+      expect(retry).toBeEnabled();
+    }
+  });
+
+  it("clears every stale row terminal as soon as Verify all again starts", async () => {
+    const base = { ...release("one"), id: "123" };
+    const secondPull = {
+      ...base.pulls[0]!,
+      headSha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      number: 42,
+      title: "Second released change",
+      url: "https://github.com/appwrite/cloud/pull/42",
+    };
+    const item = { ...base, pulls: [base.pulls[0]!, secondPull] };
+    const pulls = item.pulls.map((pull) => ({
+      agent: "claude" as const,
+      headSha: pull.headSha,
+      pullNumber: pull.number,
+      pullUrl: pull.url,
+      releaseId: item.id,
+      repository: item.repository,
+      tag: item.tag,
+    }));
+    let resumeRetry!: () => void;
+    const retryGate = new Promise<void>((resolve) => {
+      resumeRetry = resolve;
+    });
+    api.streamBatch
+      .mockImplementationOnce(async function* (): AsyncGenerator<
+        ReleaseVerificationEvent,
+        void,
+        undefined
+      > {
+        yield {
+          agent: "claude",
+          batchId: "old-batch",
+          pulls,
+          releaseId: item.id,
+          repository: item.repository,
+          tag: item.tag,
+          type: "batch-start",
+        };
+        for (const [index, pull] of pulls.entries()) {
+          yield {
+            batchId: "old-batch",
+            headSha: pull.headSha,
+            pullNumber: pull.pullNumber,
+            pullUrl: pull.pullUrl,
+            state: "queued",
+            type: "verification",
+          };
+          yield {
+            batchId: "old-batch",
+            event: {
+              text: `Stale output for pull ${pull.pullNumber}.\n`,
+              type: "text",
+            },
+            headSha: pull.headSha,
+            pullNumber: pull.pullNumber,
+            pullUrl: pull.pullUrl,
+            state: "running",
+            type: "verification",
+          };
+          yield {
+            batchId: "old-batch",
+            event: {
+              exitCode: index,
+              outcome: index === 0 ? "verified" : "unavailable",
+              type: "complete",
+            },
+            headSha: pull.headSha,
+            pullNumber: pull.pullNumber,
+            pullUrl: pull.pullUrl,
+            state: "complete",
+            type: "verification",
+          };
+        }
+        yield {
+          batchId: "old-batch",
+          totals: { complete: 2, error: 0, existing: 0, total: 2 },
+          type: "complete",
+        };
+      })
+      .mockImplementationOnce(async function* (): AsyncGenerator<
+        ReleaseVerificationEvent,
+        void,
+        undefined
+      > {
+        await retryGate;
+        yield {
+          agent: "claude",
+          batchId: "fresh-batch",
+          pulls,
+          releaseId: item.id,
+          repository: item.repository,
+          tag: item.tag,
+          type: "batch-start",
+        };
+        for (const pull of pulls) {
+          yield {
+            batchId: "fresh-batch",
+            headSha: pull.headSha,
+            pullNumber: pull.pullNumber,
+            pullUrl: pull.pullUrl,
+            state: "queued",
+            type: "verification",
+          };
+          yield {
+            batchId: "fresh-batch",
+            event: {
+              text: `Fresh output for pull ${pull.pullNumber}.\n`,
+              type: "text",
+            },
+            headSha: pull.headSha,
+            pullNumber: pull.pullNumber,
+            pullUrl: pull.pullUrl,
+            state: "running",
+            type: "verification",
+          };
+          yield {
+            batchId: "fresh-batch",
+            event: {
+              exitCode: 0,
+              outcome: "verified",
+              type: "complete",
+            },
+            headSha: pull.headSha,
+            pullNumber: pull.pullNumber,
+            pullUrl: pull.pullUrl,
+            state: "complete",
+            type: "verification",
+          };
+        }
+        yield {
+          batchId: "fresh-batch",
+          totals: { complete: 2, error: 0, existing: 0, total: 2 },
+          type: "complete",
+        };
+      });
+
+    render(
+      <RecentReleases
+        data={response([item])}
+        error={null}
+        loading={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+    expandRelease(item.tag);
+    const verifyAll = screen.getByRole("button", {
+      name: "Verify all pull requests in Release one",
+    });
+    fireEvent.click(verifyAll);
+    await screen.findByText("Release verification finished");
+    expect(
+      screen.getByRole("log", {
+        name: "Claude verification output for appwrite/cloud #41",
+      }),
+    ).toHaveTextContent("Stale output for pull 41.");
+    expect(
+      screen.getByRole("log", {
+        name: "Claude verification output for appwrite/cloud #42",
+      }),
+    ).toHaveTextContent("Stale output for pull 42.");
+
+    fireEvent.click(verifyAll);
+    await waitFor(() => expect(api.streamBatch).toHaveBeenCalledTimes(2));
+
+    for (const number of [41, 42]) {
+      const terminal = screen.getByRole("log", {
+        name: `Claude verification output for appwrite/cloud #${number}`,
+      });
+      expect(terminal).toHaveTextContent("Starting Claude verification");
+      expect(terminal).not.toHaveTextContent("Stale output");
+      expect(terminal).not.toHaveTextContent("Fresh output");
+    }
+
+    await act(async () => resumeRetry());
+    await screen.findByText("Release verified");
+    for (const number of [41, 42]) {
+      const terminal = screen.getByRole("log", {
+        name: `Claude verification output for appwrite/cloud #${number}`,
+      });
+      expect(terminal).toHaveTextContent(`Fresh output for pull ${number}.`);
+      expect(terminal).not.toHaveTextContent("Stale output");
+    }
   });
 
   it("shows a newer row verification after a completed Verify all batch", async () => {
@@ -1127,7 +1468,7 @@ describe("RecentReleases", () => {
       };
       yield {
         batchId: "batch-then-row",
-        event: { exitCode: 0, type: "complete" },
+        event: { exitCode: 0, outcome: "verified", type: "complete" },
         headSha: pull.headSha,
         pullNumber: pull.number,
         pullUrl: pull.url,
@@ -1150,7 +1491,7 @@ describe("RecentReleases", () => {
       yield { ...request, runId: "row-after-batch", type: "start" };
       yield { text: "Running the newer row verification.\n", type: "text" };
       await rowGate;
-      yield { exitCode: 0, type: "complete" };
+      yield { exitCode: 0, outcome: "verified", type: "complete" };
     });
 
     render(
@@ -1166,7 +1507,7 @@ describe("RecentReleases", () => {
         name: "Verify all pull requests in Release one",
       }),
     );
-    await screen.findByText("Release verification complete");
+    await screen.findByText("Release verified");
     expandRelease(item.tag);
     fireEvent.click(screen.getByRole("button", { name: "Verify again" }));
 
@@ -1205,7 +1546,7 @@ describe("RecentReleases", () => {
       yield { ...request, runId: "direct-claude", type: "start" };
       yield { text: "Claude direct output.\n", type: "text" };
       await directGate;
-      yield { exitCode: 0, type: "complete" };
+      yield { exitCode: 0, outcome: "verified", type: "complete" };
     });
     api.streamBatch.mockImplementation(async function* (request: {
       agent: "claude" | "codex";
@@ -1229,7 +1570,7 @@ describe("RecentReleases", () => {
       };
       yield {
         batchId: "codex-after-direct",
-        event: { exitCode: 0, type: "complete" },
+        event: { exitCode: 0, outcome: "verified", type: "complete" },
         headSha: pull.headSha,
         pullNumber: pull.number,
         pullUrl: pull.url,
@@ -1339,7 +1680,7 @@ describe("RecentReleases", () => {
       };
       yield {
         batchId: "batch-notes",
-        event: { exitCode: 0, type: "complete" },
+        event: { exitCode: 0, outcome: "verified", type: "complete" },
         headSha: pull.headSha,
         pullNumber: pull.number,
         pullUrl: pull.url,
@@ -1378,7 +1719,7 @@ describe("RecentReleases", () => {
       expect.any(AbortSignal),
     );
     expect(api.stream).not.toHaveBeenCalled();
-    await screen.findByText("Release verification complete");
+    await screen.findByText("Release verified");
   });
 
   it("keeps active release controls on batch cancellation semantics", async () => {
@@ -1678,7 +2019,7 @@ describe("RecentReleases", () => {
     ): AsyncGenerator<VerificationRunEvent, void, undefined> {
       yield { ...request, runId: `run-${request.pullNumber}`, type: "start" };
       yield { text: `Verified pull ${request.pullNumber}.\n`, type: "text" };
-      yield { exitCode: 0, type: "complete" };
+      yield { exitCode: 0, outcome: "verified", type: "complete" };
     });
     render(
       <RecentReleases
@@ -1711,11 +2052,10 @@ describe("RecentReleases", () => {
     const log = await within(firstList).findByRole("log");
     expect(log).toHaveTextContent("Verified pull 41.");
     await waitFor(() =>
-      expect(
-        within(firstList).getAllByText("Completed").length,
-      ).toBeGreaterThan(0),
+      expect(within(firstList).getAllByText("Verified").length).toBeGreaterThan(
+        0,
+      ),
     );
-    expect(within(firstList).queryByText("Verified")).not.toBeInTheDocument();
     const secondList = screen.getByRole("list", {
       name: "Pull requests in Release two",
     });
@@ -1725,13 +2065,45 @@ describe("RecentReleases", () => {
     ).toBeEnabled();
   });
 
+  it("shows a safe direct preflight reason and leaves the row retryable", async () => {
+    const item = release("one");
+    const message =
+      "GitHub and local Git cannot prove the exact target pull request delta.";
+    api.stream.mockImplementation(async function* () {
+      throw new Error(message);
+    });
+    render(
+      <RecentReleases
+        data={response([item])}
+        error={null}
+        loading={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    expandRelease(item.tag);
+    fireEvent.click(screen.getByRole("button", { name: "Verify" }));
+
+    const terminal = await screen.findByRole("log", {
+      name: "Claude verification output for appwrite/cloud #41",
+    });
+    expect(terminal).toHaveTextContent(message);
+    expect(terminal).not.toHaveTextContent("Waiting for output");
+    expect(screen.getByText("Failed")).toBeVisible();
+    const retry = screen.getByRole("button", { name: "Verify again" });
+    expect(retry).toBeEnabled();
+
+    fireEvent.click(retry);
+    await waitFor(() => expect(api.stream).toHaveBeenCalledTimes(2));
+  });
+
   it("starts server-guarded verification for a pull discovered in release notes", async () => {
     const item = release("notes", "notes-fallback");
     api.stream.mockImplementation(async function* (
       request: VerificationRunRequest,
     ): AsyncGenerator<VerificationRunEvent, void, undefined> {
       yield { ...request, runId: "run-notes", type: "start" };
-      yield { exitCode: 0, type: "complete" };
+      yield { exitCode: 0, outcome: "unavailable", type: "complete" };
     });
     render(
       <RecentReleases
@@ -1761,6 +2133,14 @@ describe("RecentReleases", () => {
         expect.any(AbortSignal),
       ),
     );
+    expect(await screen.findAllByText("Unavailable")).not.toHaveLength(0);
+    const terminal = screen.getByRole("log", {
+      name: "Claude verification output for appwrite/cloud #42",
+    });
+    expect(terminal).toHaveTextContent(
+      "Behavioral verification could not exercise this released change safely.",
+    );
+    expect(terminal).not.toHaveTextContent("Waiting for output");
   });
 
   it("does not start verification when release membership is unavailable and explains why", () => {

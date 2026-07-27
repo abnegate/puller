@@ -134,6 +134,7 @@ const input = (
   agent: "claude",
   authoritative: true,
   pulls,
+  refresh: vi.fn(async () => undefined),
   runs: runInput(),
   tasks: [],
   viewerLogin: "jake",
@@ -434,8 +435,8 @@ describe("useAuto", () => {
       updatedAt: "2026-07-21T01:00:00.000Z",
       url: `${baseline.url}#issuecomment-older-greptile-comment`,
     };
-    const start = vi.fn(
-      async (): Promise<RunStartOutcome> => acceptedEquivalent(),
+    const start = vi.fn(async (): Promise<RunStartOutcome> =>
+      acceptedEquivalent(),
     );
     const initial = input(
       [
@@ -474,8 +475,8 @@ describe("useAuto", () => {
   it("never treats Greptile-authored review replies as generic review incidents", async () => {
     settings();
     const baseline = createPullsResponse().ready[0]!;
-    const start = vi.fn(
-      async (): Promise<RunStartOutcome> => acceptedEquivalent(),
+    const start = vi.fn(async (): Promise<RunStartOutcome> =>
+      acceptedEquivalent(),
     );
     const initial = input([baseline], { runs: runInput(start) });
     const view = renderHook((props: AutoInput) => useAuto(props), {
@@ -1873,39 +1874,486 @@ describe("useAuto", () => {
     },
   );
 
-  it.each([
-    [
-      "rebaseline",
-      {
+  it("settles a failed start outcome without looping", async () => {
+    settings();
+    const baseline = createPullsResponse().ready[0]!;
+    const start = vi.fn(async (): Promise<RunStartOutcome> => ({
+      code: "invalid",
+      kind: "failed",
+      message: "Rejected",
+      source: "auto",
+    }));
+    const initial = input([baseline], { runs: runInput(start) });
+    const view = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+    });
+    await waitFor(() => expect(view.result.current.leader).toBe(true));
+    const changed = addIssue(baseline);
+    view.rerender({ ...initial, pulls: [changed] });
+    await waitFor(() => expect(start).toHaveBeenCalledOnce());
+    view.rerender({ ...initial, pulls: [{ ...changed }] });
+    await act(async () => Promise.resolve());
+    expect(start).toHaveBeenCalledOnce();
+  });
+
+  it("coalesces a stale-head refresh and retries once with the latest pull and fresh trigger identities", async () => {
+    vi.useFakeTimers();
+    settings();
+    const baseline = createPullsResponse().ready[0]!;
+    const refresh = deferred<void>();
+    const requestRefresh = vi.fn(async () => refresh.promise);
+    const start = vi
+      .fn<AutoInput["runs"]["start"]>()
+      .mockResolvedValueOnce({
         code: "head_changed",
         kind: "rebaseline",
-        message: "Moved",
+        message: "The pull request head changed.",
         source: "auto",
-      },
-    ],
-    [
-      "failed",
-      { code: "invalid", kind: "failed", message: "Rejected", source: "auto" },
-    ],
-  ] as const)(
-    "settles a %s start outcome without looping",
-    async (_name, outcome) => {
+      })
+      .mockResolvedValueOnce(acceptedEquivalent());
+    const initial = input([baseline], {
+      refresh: requestRefresh,
+      runs: runInput(start),
+    });
+    const view = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+      wrapper: StrictMode,
+    });
+    await act(async () => Promise.resolve());
+
+    const stale = failed(baseline);
+    view.rerender({ ...initial, pulls: [stale] });
+    await act(async () => Promise.resolve());
+    expect(start).toHaveBeenCalledOnce();
+    expect(requestRefresh).toHaveBeenCalledOnce();
+
+    const latest = failed({
+      ...baseline,
+      headRefOid: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      updatedAt: "2026-07-22T03:00:00.000Z",
+    });
+    view.rerender({ ...initial, pulls: [latest] });
+    await act(async () => refresh.resolve());
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(start.mock.calls[0]![0].headRefOid).toBe(stale.headRefOid);
+    expect(start.mock.calls[1]![0].headRefOid).toBe(latest.headRefOid);
+    const firstTriggers = start.mock.calls[0]![1]?.triggers ?? [];
+    const latestTriggers = start.mock.calls[1]![1]?.triggers ?? [];
+    expect(latestTriggers).not.toEqual(firstTriggers);
+    expect(latestTriggers).toContainEqual(
+      expect.objectContaining({
+        headRefOid: latest.headRefOid,
+        kind: "failed_check",
+      }),
+    );
+
+    await act(async () => vi.advanceTimersByTimeAsync(60_000));
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(requestRefresh).toHaveBeenCalledOnce();
+  });
+
+  it("coalesces simultaneous stale preflights into one authoritative refresh", async () => {
+    settings("coalesced-stale-refresh", 2);
+    const baselines = distinctPulls(2);
+    const refresh = deferred<void>();
+    const requestRefresh = vi.fn(async () => refresh.promise);
+    const start = vi.fn<AutoInput["runs"]["start"]>(async () => ({
+      code: "head_changed",
+      kind: "rebaseline",
+      message: "The pull request head changed.",
+      source: "auto",
+    }));
+    const initial = input(baselines, {
+      refresh: requestRefresh,
+      runs: runInput(start),
+    });
+    const view = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+    });
+    await waitFor(() => expect(view.result.current.leader).toBe(true));
+
+    view.rerender({
+      ...initial,
+      pulls: baselines.map((pull) => failed(pull)),
+    });
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(2));
+    expect(requestRefresh).toHaveBeenCalledOnce();
+
+    await act(async () => refresh.resolve());
+  });
+
+  it("holds cross-tab leadership through an in-flight stale refresh", async () => {
+    const locks = new LockHarness();
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: locks.manager,
+    });
+    settings();
+    const baseline = createPullsResponse().ready[0]!;
+    const refresh = deferred<void>();
+    const requestRefresh = vi.fn(async () => refresh.promise);
+    const start = vi.fn<AutoInput["runs"]["start"]>(async () => ({
+      code: "head_changed",
+      kind: "rebaseline",
+      message: "The pull request head changed.",
+      source: "auto",
+    }));
+    const initial = input([baseline], {
+      refresh: requestRefresh,
+      runs: runInput(start),
+    });
+    const first = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+    });
+    const second = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+    });
+    await waitFor(() => expect(first.result.current.leader).toBe(true));
+
+    first.rerender({ ...initial, pulls: [failed(baseline)] });
+    second.rerender({ ...initial, pulls: [failed(baseline)] });
+    await waitFor(() => expect(requestRefresh).toHaveBeenCalledOnce());
+    first.unmount();
+    await act(async () => Promise.resolve());
+    expect(second.result.current.leader).toBe(false);
+
+    await act(async () => refresh.resolve());
+    await waitFor(() => expect(second.result.current.leader).toBe(true));
+    expect(requestRefresh).toHaveBeenCalledOnce();
+  });
+
+  it("never replays a stale payload while authoritative refreshes return the same head and incidents", async () => {
+    vi.useFakeTimers();
+    settings();
+    const baseline = createPullsResponse().ready[0]!;
+    const requestRefresh = vi.fn(async () => undefined);
+    const start = vi.fn<AutoInput["runs"]["start"]>(async () => ({
+      code: "head_changed",
+      kind: "rebaseline",
+      message: "The pull request head changed.",
+      source: "auto",
+    }));
+    const initial = input([baseline], {
+      refresh: requestRefresh,
+      runs: runInput(start),
+    });
+    const view = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+    });
+    await act(async () => Promise.resolve());
+
+    view.rerender({ ...initial, pulls: [failed(baseline)] });
+    await act(async () => Promise.resolve());
+    expect(start).toHaveBeenCalledOnce();
+    expect(requestRefresh).toHaveBeenCalledOnce();
+
+    await act(async () => vi.advanceTimersByTimeAsync(999));
+    expect(requestRefresh).toHaveBeenCalledOnce();
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    expect(requestRefresh).toHaveBeenCalledTimes(2);
+    await act(async () => vi.advanceTimersByTimeAsync(1_999));
+    expect(requestRefresh).toHaveBeenCalledTimes(2);
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    expect(requestRefresh).toHaveBeenCalledTimes(3);
+    expect(start).toHaveBeenCalledOnce();
+  });
+
+  it("rebuilds same-head stale triggers from updated authoritative incident context", async () => {
+    vi.useFakeTimers();
+    settings();
+    const baseline = createPullsResponse().ready[0]!;
+    const refresh = deferred<void>();
+    const requestRefresh = vi.fn(async () => refresh.promise);
+    const start = vi
+      .fn<AutoInput["runs"]["start"]>()
+      .mockResolvedValueOnce({
+        code: "auto_trigger_stale",
+        kind: "rebaseline",
+        message: "The Auto incident is no longer current.",
+        source: "auto",
+      })
+      .mockResolvedValueOnce(acceptedEquivalent());
+    const initial = input([baseline], {
+      refresh: requestRefresh,
+      runs: runInput(start),
+    });
+    const view = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+    });
+    await act(async () => Promise.resolve());
+
+    const stale = addIssue(
+      baseline,
+      "edited-comment",
+      "2026-07-22T01:00:00.000Z",
+    );
+    view.rerender({ ...initial, pulls: [stale] });
+    await act(async () => Promise.resolve());
+    expect(start).toHaveBeenCalledOnce();
+
+    const latest = addIssue(
+      baseline,
+      "edited-comment",
+      "2026-07-22T02:00:00.000Z",
+    );
+    view.rerender({ ...initial, pulls: [latest] });
+    await act(async () => refresh.resolve());
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(start.mock.calls[1]![1]?.triggers).toContainEqual({
+      id: "edited-comment",
+      kind: "issue_comment",
+      updatedAt: "2026-07-22T02:00:00.000Z",
+    });
+  });
+
+  it.each(["failed", "cancelled"] as const)(
+    "keeps a stale incident pending after a manual owner is %s, revalidates, then dispatches it",
+    async (status) => {
       settings();
       const baseline = createPullsResponse().ready[0]!;
-      const start = vi.fn(async (): Promise<RunStartOutcome> => outcome);
-      const initial = input([baseline], { runs: runInput(start) });
+      const staleRefresh = deferred<void>();
+      const ownerRefresh = deferred<void>();
+      const requestRefresh = vi
+        .fn<AutoInput["refresh"]>()
+        .mockImplementationOnce(async () => staleRefresh.promise)
+        .mockImplementationOnce(async () => ownerRefresh.promise);
+      const start = vi
+        .fn<AutoInput["runs"]["start"]>()
+        .mockResolvedValueOnce({
+          code: "head_changed",
+          kind: "rebaseline",
+          message: "The pull request head changed.",
+          source: "auto",
+        })
+        .mockResolvedValueOnce(acceptedEquivalent());
+      const initial = input([baseline], {
+        refresh: requestRefresh,
+        runs: runInput(start),
+      });
       const view = renderHook((props: AutoInput) => useAuto(props), {
         initialProps: initial,
       });
       await waitFor(() => expect(view.result.current.leader).toBe(true));
-      const changed = addIssue(baseline);
-      view.rerender({ ...initial, pulls: [changed] });
+
+      view.rerender({ ...initial, pulls: [failed(baseline)] });
       await waitFor(() => expect(start).toHaveBeenCalledOnce());
-      view.rerender({ ...initial, pulls: [{ ...changed }] });
-      await act(async () => Promise.resolve());
+
+      const latest = failed({
+        ...baseline,
+        headRefOid: "ffffffffffffffffffffffffffffffffffffffff",
+      });
+      const running = new Map([
+        [
+          baseline.url,
+          {
+            ...IDLE_RUN_STATE,
+            source: "manual" as const,
+            status: "running" as const,
+          },
+        ],
+      ]);
+      view.rerender({
+        ...initial,
+        pulls: [latest],
+        runs: { start, states: running },
+      });
+      await act(async () => staleRefresh.resolve());
+
+      let evidence = JSON.parse(
+        window.localStorage.getItem(getAutoEvidenceStorageKey("jake"))!,
+      );
+      expect(evidence.pending[baseline.url]).toHaveLength(1);
       expect(start).toHaveBeenCalledOnce();
+
+      const terminal = new Map([
+        [
+          baseline.url,
+          {
+            ...IDLE_RUN_STATE,
+            source: "manual" as const,
+            status,
+          },
+        ],
+      ]);
+      view.rerender({
+        ...initial,
+        pulls: [latest],
+        runs: { start, states: terminal },
+      });
+      await waitFor(() => expect(requestRefresh).toHaveBeenCalledTimes(2));
+      expect(start).toHaveBeenCalledOnce();
+
+      await act(async () => ownerRefresh.resolve());
+      await waitFor(() => expect(start).toHaveBeenCalledTimes(2));
+      expect(start.mock.calls[1]![0].headRefOid).toBe(latest.headRefOid);
+      evidence = JSON.parse(
+        window.localStorage.getItem(getAutoEvidenceStorageKey("jake"))!,
+      );
+      expect(evidence.pending[baseline.url]).toBeUndefined();
     },
   );
+
+  it("revalidates after a remote pull owner settles instead of replaying the payload after pull_running", async () => {
+    vi.useFakeTimers();
+    settings();
+    const baseline = createPullsResponse().ready[0]!;
+    const staleRefresh = deferred<void>();
+    const ownerRefresh = deferred<void>();
+    const requestRefresh = vi
+      .fn<AutoInput["refresh"]>()
+      .mockImplementationOnce(async () => staleRefresh.promise)
+      .mockImplementationOnce(async () => ownerRefresh.promise);
+    const start = vi
+      .fn<AutoInput["runs"]["start"]>()
+      .mockResolvedValueOnce({
+        code: "head_changed",
+        kind: "rebaseline",
+        message: "The pull request head changed.",
+        source: "auto",
+      })
+      .mockResolvedValueOnce({
+        code: "pull_running",
+        kind: "retryable",
+        message: "Another run owns this pull request.",
+        source: "auto",
+      })
+      .mockResolvedValueOnce(acceptedEquivalent());
+    const initial = input([baseline], {
+      refresh: requestRefresh,
+      runs: runInput(start),
+    });
+    const view = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+    });
+    await act(async () => Promise.resolve());
+
+    view.rerender({ ...initial, pulls: [failed(baseline)] });
+    await act(async () => Promise.resolve());
+    const latest = failed({
+      ...baseline,
+      headRefOid: "9999999999999999999999999999999999999999",
+    });
+    view.rerender({ ...initial, pulls: [latest] });
+    await act(async () => staleRefresh.resolve());
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(requestRefresh).toHaveBeenCalledTimes(2);
+
+    view.rerender({ ...initial, pulls: [{ ...latest }] });
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(requestRefresh).toHaveBeenCalledTimes(2);
+
+    await act(async () => ownerRefresh.resolve());
+    await act(async () => Promise.resolve());
+    expect(start).toHaveBeenCalledTimes(3);
+    expect(start.mock.calls[2]![0].headRefOid).toBe(latest.headRefOid);
+    expect(start.mock.calls[2]![1]?.triggers).toContainEqual(
+      expect.objectContaining({
+        headRefOid: latest.headRefOid,
+        kind: "failed_check",
+      }),
+    );
+  });
+
+  it("backs off rejected external-owner refreshes and reconciles once after recovery", async () => {
+    vi.useFakeTimers();
+    settings("external-owner-refresh-backoff", 2);
+    const pulls = distinctPulls(2);
+    const refreshTimes: number[] = [];
+    const requestRefresh = vi.fn<AutoInput["refresh"]>(async () => {
+      refreshTimes.push(Date.now());
+      if (refreshTimes.length <= 6) {
+        throw new Error("The authoritative refresh failed.");
+      }
+    });
+    let starts = 0;
+    const start = vi.fn<AutoInput["runs"]["start"]>(async () => {
+      starts += 1;
+      return starts <= pulls.length
+        ? {
+            code: "pull_running",
+            kind: "retryable",
+            message: "Another run owns this pull request.",
+            source: "auto",
+          }
+        : acceptedEquivalent();
+    });
+    const initial = input(pulls, {
+      refresh: requestRefresh,
+      runs: runInput(start),
+    });
+    const view = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+
+    view.rerender({ ...initial, pulls: pulls.map(failed) });
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(requestRefresh).toHaveBeenCalledOnce();
+
+    for (const [index, delay] of [
+      1_000, 2_000, 4_000, 8_000, 16_000, 16_000,
+    ].entries()) {
+      await act(async () => vi.advanceTimersByTimeAsync(delay - 1));
+      expect(requestRefresh).toHaveBeenCalledTimes(index + 1);
+      await act(async () => vi.advanceTimersByTimeAsync(1));
+      expect(requestRefresh).toHaveBeenCalledTimes(index + 2);
+    }
+
+    expect(refreshTimes.map((time) => time - refreshTimes[0]!)).toEqual([
+      0, 1_000, 3_000, 7_000, 15_000, 31_000, 47_000,
+    ]);
+    expect(start).toHaveBeenCalledTimes(4);
+    const evidence = JSON.parse(
+      window.localStorage.getItem(getAutoEvidenceStorageKey("jake"))!,
+    );
+    for (const pull of pulls) {
+      expect(evidence.pending[pull.url]).toBeUndefined();
+    }
+
+    await act(async () => vi.advanceTimersByTimeAsync(60_000));
+    expect(requestRefresh).toHaveBeenCalledTimes(7);
+    expect(start).toHaveBeenCalledTimes(4);
+  });
+
+  it("drops pull-ready rebaseline work after the authoritative snapshot is ready", async () => {
+    vi.useFakeTimers();
+    settings();
+    const baseline = createPullsResponse().ready[0]!;
+    const refresh = deferred<void>();
+    const requestRefresh = vi.fn(async () => refresh.promise);
+    const start = vi.fn<AutoInput["runs"]["start"]>(async () => ({
+      code: "pull_ready",
+      kind: "rebaseline",
+      message: "The pull request is already ready.",
+      source: "auto",
+    }));
+    const initial = input([baseline], {
+      refresh: requestRefresh,
+      runs: runInput(start),
+    });
+    const view = renderHook((props: AutoInput) => useAuto(props), {
+      initialProps: initial,
+    });
+    await act(async () => Promise.resolve());
+
+    view.rerender({ ...initial, pulls: [addIssue(baseline)] });
+    await act(async () => Promise.resolve());
+    expect(start).toHaveBeenCalledOnce();
+
+    view.rerender({ ...initial, pulls: [baseline] });
+    await act(async () => refresh.resolve());
+    await act(async () => vi.advanceTimersByTimeAsync(60_000));
+
+    expect(start).toHaveBeenCalledOnce();
+    expect(requestRefresh).toHaveBeenCalledOnce();
+  });
 
   it("is StrictMode-safe and dispatches one request for one incident", async () => {
     settings();

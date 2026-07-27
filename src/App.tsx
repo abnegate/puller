@@ -6,7 +6,13 @@ import {
   useRef,
   useState,
 } from "react";
-import { PanelRightClose, PanelRightOpen, RefreshCw } from "lucide-react";
+import {
+  PanelLeftClose,
+  PanelLeftOpen,
+  PanelRightClose,
+  PanelRightOpen,
+  RefreshCw,
+} from "lucide-react";
 import {
   AnimatePresence,
   LayoutGroup,
@@ -132,11 +138,7 @@ const isAbortError = (error: unknown): boolean =>
   error.name === "AbortError";
 
 type PullLoadKind =
-  | "automatic"
-  | "initial"
-  | "manual"
-  | "mutation"
-  | "visibility";
+  "automatic" | "initial" | "manual" | "mutation" | "visibility";
 
 type PullRequest = {
   controller: AbortController;
@@ -341,14 +343,12 @@ function Dashboard({
   );
   const applyPipelineSnapshot = useCallback(
     (snapshot: ReleasePipelinesResponse) => {
-      setRecent((current) =>
-        applyReleasePipelineSnapshot(current, snapshot),
-      );
+      setRecent((current) => applyReleasePipelineSnapshot(current, snapshot));
     },
     [],
   );
   useReleasePipelinePolling({
-    enabled: releasePanel.expanded,
+    enabled: releasePanel.pipelinePollingEnabled,
     onSnapshot: applyPipelineSnapshot,
     refreshRevision: pipelineRefreshRevision,
     releases: recent?.releases ?? [],
@@ -497,10 +497,7 @@ function Dashboard({
         setData(snapshot);
         setError(null);
       } catch (loadError) {
-        if (
-          mounted.current &&
-          pullRequest.current?.generation === generation
-        ) {
+        if (mounted.current && pullRequest.current?.generation === generation) {
           deadline = Date.now() + refreshBackoff(pullFailures.current);
           pullFailures.current = Math.min(
             pullFailures.current + 1,
@@ -749,10 +746,15 @@ function Dashboard({
     [view.groups.blocked, view.groups.progress, view.groups.ready],
   );
   const artifactEpoch = artifactProof.epoch;
+  const refreshAuto = useCallback(
+    async (): Promise<void> => loadRef.current("mutation"),
+    [],
+  );
   const auto = useAuto({
     agent,
     authoritative: autoAuthoritative,
     pulls: currentPulls,
+    refresh: refreshAuto,
     runs,
     tasks: tasks.states,
     viewerLogin,
@@ -986,28 +988,52 @@ function Dashboard({
                   <AgentToggle agent={agent} onAgentChange={setAgent} />
                   <ThemeToggle />
                   <Button
-                    aria-controls="recent-releases-panel"
-                    aria-expanded={releasePanel.expanded}
+                    aria-controls="pull-requests-panel"
+                    aria-expanded={releasePanel.pulls.visible}
                     aria-label={
-                      releasePanel.expanded
+                      releasePanel.pulls.visible
+                        ? "Hide pull requests"
+                        : "Show pull requests"
+                    }
+                    className="min-h-11 min-w-11 sm:min-h-7 sm:min-w-7"
+                    data-pull-panel-toggle=""
+                    onClick={releasePanel.togglePulls}
+                    size="icon-sm"
+                    title={
+                      releasePanel.pulls.visible
+                        ? "Focus recent releases"
+                        : "Show pull requests"
+                    }
+                    type="button"
+                    variant="outline"
+                  >
+                    {releasePanel.pulls.visible ? (
+                      <PanelLeftClose aria-hidden="true" />
+                    ) : (
+                      <PanelLeftOpen aria-hidden="true" />
+                    )}
+                  </Button>
+                  <Button
+                    aria-controls="recent-releases-panel"
+                    aria-expanded={releasePanel.releases.visible}
+                    aria-label={
+                      releasePanel.releases.visible
                         ? "Hide recent releases"
                         : "Show recent releases"
                     }
                     className="min-h-11 min-w-11 sm:min-h-7 sm:min-w-7"
                     data-release-panel-toggle=""
-                    onClick={() =>
-                      releasePanel.setExpanded(!releasePanel.expanded)
-                    }
+                    onClick={releasePanel.toggleReleases}
                     size="icon-sm"
                     title={
-                      releasePanel.expanded
-                        ? "Hide recent releases"
+                      releasePanel.releases.visible
+                        ? "Focus pull requests"
                         : "Show recent releases"
                     }
                     type="button"
                     variant="outline"
                   >
-                    {releasePanel.expanded ? (
+                    {releasePanel.releases.visible ? (
                       <PanelRightClose aria-hidden="true" />
                     ) : (
                       <PanelRightOpen aria-hidden="true" />
@@ -1064,9 +1090,16 @@ function Dashboard({
         <div
           className="grid items-start gap-5 lg:grid-cols-[minmax(0,1.7fr)_minmax(22rem,0.8fr)] xl:grid-cols-[minmax(0,2fr)_minmax(24rem,0.9fr)]"
           data-dashboard-columns=""
-          data-release-panel-expanded={releasePanel.expanded ? "true" : "false"}
+          data-dashboard-mode={releasePanel.mode}
         >
-          <div className="min-w-0 space-y-5" data-pull-column="">
+          <div
+            aria-hidden={releasePanel.pulls.ariaHidden}
+            className="min-w-0 space-y-5"
+            data-pull-column=""
+            data-state={releasePanel.pulls.dataState}
+            id="pull-requests-panel"
+            inert={releasePanel.pulls.inert}
+          >
             {!data && initialLoading && (
               <section
                 aria-busy="true"
@@ -1279,12 +1312,12 @@ function Dashboard({
             </AnimatePresence>
           </div>
           <aside
-            aria-hidden={!releasePanel.expanded}
+            aria-hidden={releasePanel.releases.ariaHidden}
             className="min-w-0"
             data-release-column=""
-            data-state={releasePanel.expanded ? "expanded" : "collapsed"}
+            data-state={releasePanel.releases.dataState}
             id="recent-releases-panel"
-            inert={!releasePanel.expanded}
+            inert={releasePanel.releases.inert}
           >
             <RecentReleases
               agent={agent}

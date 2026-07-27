@@ -227,6 +227,25 @@ function releaseOptions() {
   };
 }
 
+function releasePreview() {
+  return {
+    baseTag: "v1.2.3",
+    body: "* Released fix by @viewer in https://github.com/owner/repo/pull/7",
+    digest: "a".repeat(64),
+    name: "Generated v1.2.4",
+    pulls: [
+      {
+        number: 7,
+        title: "Released fix",
+        url: "https://github.com/owner/repo/pull/7",
+      },
+    ],
+    repository: "owner/repo",
+    tag: "v1.2.4",
+    targetOid: HEAD,
+  };
+}
+
 function recentReleases() {
   return {
     generatedAt: "2026-07-21T00:00:00.000Z",
@@ -1333,6 +1352,7 @@ describe("GitHub operations API", () => {
         getOptions: vi.fn(async () => releaseOptions()),
         getPipelines: vi.fn(async () => releasePipelines()),
         getRecent: vi.fn(async () => recentReleases()),
+        preview: vi.fn(async () => releasePreview()),
       },
       releaseVerificationManager: {
         cancel: vi.fn(),
@@ -1718,6 +1738,11 @@ describe("GitHub operations API", () => {
     ).resolves.toEqual(releasePipelines());
     await expect(
       (
+        await fetch(`${running.origin}/api/releases/pipelines?discover=1`)
+      ).json(),
+    ).resolves.toEqual(releasePipelines());
+    await expect(
+      (
         await fetch(`${running.origin}/api/releases/pipelines?refresh=1`)
       ).json(),
     ).resolves.toEqual(releasePipelines());
@@ -1732,9 +1757,15 @@ describe("GitHub operations API", () => {
       refresh: true,
     });
     expect(running.releaseService.getPipelines).toHaveBeenNthCalledWith(1, {
+      discover: false,
       refresh: false,
     });
     expect(running.releaseService.getPipelines).toHaveBeenNthCalledWith(2, {
+      discover: true,
+      refresh: false,
+    });
+    expect(running.releaseService.getPipelines).toHaveBeenNthCalledWith(3, {
+      discover: false,
       refresh: true,
     });
     await running.close();
@@ -1793,6 +1824,7 @@ describe("GitHub operations API", () => {
     const body = {
       expectedLatestTag: "v1.2.3",
       prerelease: false,
+      preview: releasePreview(),
       repository: "owner/repo",
       tag: "v1.2.4",
     };
@@ -1812,11 +1844,50 @@ describe("GitHub operations API", () => {
     await running.close();
   });
 
+  it("authorizes and forwards exact release preview requests", async () => {
+    const running = await operationServer();
+    const body = {
+      expectedLatestTag: "v1.2.3",
+      repository: "owner/repo",
+      tag: "v1.2.4",
+    };
+    const response = await fetch(`${running.origin}/api/releases/preview`, {
+      body: JSON.stringify(body),
+      headers: actionHeaders(running.origin),
+      method: "POST",
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual(releasePreview());
+    expect(running.releaseService.preview).toHaveBeenCalledWith(body);
+
+    const unauthorized = await fetch(`${running.origin}/api/releases/preview`, {
+      body: JSON.stringify(body),
+      headers: {
+        "Content-Type": "application/json",
+        Origin: running.origin,
+      },
+      method: "POST",
+    });
+    expect(unauthorized.status).toBe(403);
+    expect(running.releaseService.preview).toHaveBeenCalledTimes(1);
+
+    const extra = await fetch(`${running.origin}/api/releases/preview`, {
+      body: JSON.stringify({ ...body, extra: true }),
+      headers: actionHeaders(running.origin),
+      method: "POST",
+    });
+    expect(extra.status).toBe(400);
+    expect(running.releaseService.preview).toHaveBeenCalledTimes(1);
+    await running.close();
+  });
+
   it("forwards pre-release creation and rejects incomplete or extra release input", async () => {
     const running = await operationServer();
     const prerelease = {
       expectedLatestTag: "v1.2.3",
       prerelease: true,
+      preview: { ...releasePreview(), tag: "v1.2.4-rc.1" },
       repository: "owner/repo",
       tag: "v1.2.4-rc.1",
     };
@@ -2171,7 +2242,12 @@ describe("GitHub operations API", () => {
       (await fetch(`${running.origin}/api/releases/recent?refresh=0`)).status,
     ).toBe(400);
     expect(
-      (await fetch(`${running.origin}/api/releases/pipelines?refresh=0`)).status,
+      (await fetch(`${running.origin}/api/releases/pipelines?refresh=0`))
+        .status,
+    ).toBe(400);
+    expect(
+      (await fetch(`${running.origin}/api/releases/pipelines?discover=0`))
+        .status,
     ).toBe(400);
     const merge = await fetch(
       `${running.origin}/api/pulls/owner/repo/7/merge`,
@@ -2213,6 +2289,7 @@ describe("GitHub operations API", () => {
     const releaseBody = JSON.stringify({
       expectedLatestTag: "v1.2.3",
       prerelease: false,
+      preview: releasePreview(),
       repository: "owner/repo",
       tag: "v1.2.4",
     });
