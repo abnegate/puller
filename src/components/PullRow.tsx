@@ -576,6 +576,7 @@ function RunOutput({ pull, run }: { pull: PullReadiness; run: RunState }) {
         aria-label={`${getRunLabel(run)} output for ${pull.repository} pull request ${pull.number}`}
         aria-live="polite"
         className="max-h-56 min-h-16 overflow-auto whitespace-pre-wrap p-3 font-mono text-xs leading-relaxed text-foreground"
+        data-keyboard-scroll-region=""
         hidden={!visible}
         onScroll={handleScroll}
         ref={terminalRef}
@@ -733,6 +734,7 @@ function HistoryTranscript({
           <pre
             aria-label={`${getHistoryLabel(entry)} transcript from ${formatRelativeTime(entry.finishedAt)}`}
             className="max-h-56 min-h-12 max-w-full overflow-auto whitespace-pre-wrap border-t p-3 font-mono text-xs leading-relaxed text-foreground wrap-anywhere"
+            data-keyboard-scroll-region=""
             data-run-history-transcript=""
             tabIndex={0}
           >

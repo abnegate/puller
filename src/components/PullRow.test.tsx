@@ -730,6 +730,54 @@ describe("PullRow ready presentation", () => {
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
   });
 
+  it("keeps native navigation keys inside active fix output without weakening row shortcuts", async () => {
+    const pull = createPendingPull();
+    const controls = createControls();
+    vi.mocked(getPullDiff).mockResolvedValue(pullDiff(pull));
+    const { container } = renderRow(
+      pull,
+      "progress",
+      createRun({
+        output: "Long active fix output.",
+        status: "running",
+      }),
+      controls,
+    );
+    const terminal = screen.getByRole("log", {
+      name: `Claude output for ${pull.repository} pull request ${pull.number}`,
+    });
+    terminal.focus();
+
+    expect(terminal).toHaveAttribute("data-keyboard-scroll-region", "");
+    for (const key of [
+      "Home",
+      "End",
+      "ArrowUp",
+      "ArrowDown",
+      "ArrowLeft",
+      "ArrowRight",
+      "j",
+      "k",
+    ]) {
+      expect(fireEvent.keyDown(terminal, { key })).toBe(true);
+      expect(terminal).toHaveFocus();
+    }
+    expect(getPullDiff).not.toHaveBeenCalled();
+    expect(getPullCommits).not.toHaveBeenCalled();
+    expect(mergePull).not.toHaveBeenCalled();
+    expect(controls.start).not.toHaveBeenCalled();
+
+    const row = container.querySelector<HTMLElement>("[data-pull-identity]")!;
+    row.focus();
+    fireEvent.keyDown(row, { key: "f" });
+
+    await waitFor(() => expect(getPullDiff).toHaveBeenCalledOnce());
+    expect(document.activeElement).toHaveAttribute(
+      "data-pull-focus-token",
+      "file:src/ready.ts",
+    );
+  });
+
   it("loads the diff only on expansion and aborts an in-flight load on collapse", async () => {
     const pull = getReadyPull();
     let signal: AbortSignal | undefined;
@@ -1523,6 +1571,59 @@ describe("PullRow previous fixes", () => {
     expect(transcript).not.toHaveTextContent("Current output only.");
     expect(transcript).not.toHaveAttribute("aria-live");
     expect(transcript).not.toHaveAttribute("role", "log");
+  });
+
+  it("keeps native navigation keys inside a saved transcript without invoking row actions", async () => {
+    const pull = getBlockedPull();
+    const entry = createHistoryEntry({ transcriptText: "Saved output." });
+    const controls = createControls();
+    const { container } = renderRow(
+      pull,
+      "blocked",
+      createRun({ history: [entry] }),
+      controls,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Previous fixes/ }));
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Show transcript for Claude manual fix completed from 5 mins ago",
+      }),
+    );
+    const transcript = await screen.findByLabelText(
+      "Claude manual fix transcript from 5 mins ago",
+    );
+    transcript.focus();
+
+    expect(transcript).toHaveAttribute("data-keyboard-scroll-region", "");
+    for (const key of [
+      "Home",
+      "End",
+      "ArrowUp",
+      "ArrowDown",
+      "ArrowLeft",
+      "ArrowRight",
+      "j",
+      "k",
+    ]) {
+      expect(fireEvent.keyDown(transcript, { key })).toBe(true);
+      expect(transcript).toHaveFocus();
+    }
+    expect(controls.loadTranscript).toHaveBeenCalledOnce();
+    expect(getPullDiff).not.toHaveBeenCalled();
+    expect(getPullCommits).not.toHaveBeenCalled();
+    expect(mergePull).not.toHaveBeenCalled();
+    expect(controls.start).not.toHaveBeenCalled();
+
+    const row = container.querySelector<HTMLElement>("[data-pull-identity]")!;
+    row.focus();
+    fireEvent.keyDown(row, { key: "b" });
+
+    await waitFor(() =>
+      expect(document.activeElement).toHaveAttribute(
+        "data-blocker-key",
+        "failed-checks",
+      ),
+    );
   });
 });
 
