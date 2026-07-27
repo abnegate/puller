@@ -131,6 +131,14 @@ function stream() {
   };
 }
 
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 function fixture(overrides = {}) {
   const process = overrides.child ?? child();
   const spawn = overrides.spawn ?? vi.fn(() => process);
@@ -364,6 +372,88 @@ describe("review Claude runs", () => {
     expect(running.refreshReadiness).toHaveBeenCalledOnce();
     expect(channel.events.at(-1)).toEqual({ type: "complete", exitCode: 0 });
     expect(running.workspace.cleanup).toHaveBeenCalledOnce();
+  });
+
+  it("reconciles an accepted Claude review push when the client disconnects during completion verification", async () => {
+    const verificationStarted = deferred();
+    const cleanup = vi.fn(async () => undefined);
+    const reportDiagnostic = vi.fn();
+    const coordinator = createRunCoordinator({ limit: 1 });
+    const workspace = {
+      branch: "fix/review",
+      cleanup,
+      cwd: "/trusted/workspace",
+      headRefOid: HEAD,
+      remote: "origin",
+      repository: "owner/repo",
+    };
+    const resolver = {
+      clear: vi.fn(),
+      resolve: vi.fn(),
+      resolveReview: vi.fn(async () => workspace),
+      verifyReview: vi
+        .fn()
+        .mockImplementationOnce((_workspace, { signal }) => {
+          verificationStarted.resolve(signal);
+          return new Promise(() => undefined);
+        })
+        .mockImplementationOnce(async () => ({
+          ...workspace,
+          headRefOid: NEXT,
+        })),
+    };
+    const git = vi.fn(async (_command, arguments_) => ({
+      stderr: "",
+      stdout: arguments_.includes("rev-parse") ? `${NEXT}\n` : "",
+    }));
+    const running = fixture({
+      coordinator,
+      git,
+      reportDiagnostic,
+      resolver,
+    });
+    const channel = stream();
+    const started = await running.manager.start(input(), channel.value);
+
+    running.process.emit("close", 0, null);
+    const completionSignal = await verificationStarted.promise;
+    expect(completionSignal.aborted).toBe(false);
+    channel.close();
+    await started.done;
+
+    expect(git).toHaveBeenCalledOnce();
+    expect(git.mock.calls[0][1]).toContain("rev-parse");
+    expect(resolver.verifyReview).toHaveBeenCalledTimes(2);
+    expect(reportDiagnostic).toHaveBeenCalledWith(
+      expect.stringContaining("Cancellation raced an accepted push"),
+    );
+    expect(running.diffService.invalidate).toHaveBeenCalledWith({
+      number: 7,
+      repository: "owner/repo",
+    });
+    expect(resolver.clear).toHaveBeenCalledWith({
+      number: 7,
+      repository: "owner/repo",
+    });
+    await vi.waitFor(() =>
+      expect(running.refreshReadiness).toHaveBeenCalledWith({
+        number: 7,
+        repository: "owner/repo",
+      }),
+    );
+    expect(channel.events).toContainEqual({
+      message: "The client disconnected.",
+      type: "cancelled",
+    });
+    expect(channel.events).not.toContainEqual({
+      exitCode: 0,
+      type: "complete",
+    });
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(running.manager.activeCount()).toBe(0);
+    expect(running.manager.activeWorkspaceCount()).toBe(0);
+    expect(coordinator.activeCount()).toBe(0);
+    expect(coordinator.activeWorkspaceCount()).toBe(0);
   });
 
   it("rejects stale or truncated anchors before spawning Claude", async () => {
@@ -602,7 +692,9 @@ describe("review Claude runs", () => {
   });
 
   it("cleans once when client cancellation and child termination race", async () => {
-    const running = fixture();
+    const git = vi.fn();
+    const reportDiagnostic = vi.fn();
+    const running = fixture({ git, reportDiagnostic });
     const channel = stream();
     const started = await running.manager.start(input(), channel.value);
 
@@ -613,6 +705,8 @@ describe("review Claude runs", () => {
 
     expect(running.workspace.cleanup).toHaveBeenCalledOnce();
     expect(running.manager.activeCount()).toBe(0);
+    expect(git).not.toHaveBeenCalled();
+    expect(reportDiagnostic).not.toHaveBeenCalled();
   });
 
   it("cleans a provisioned workspace when final preflight authorization times out", async () => {

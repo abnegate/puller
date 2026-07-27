@@ -1965,7 +1965,10 @@ export function createClaudeRunManager({
       }
       await completeReview(run);
     } catch (error) {
-      if (run.review.pushStarted && reviewAbort(error, run)) {
+      if (
+        (run.review.pushStarted || run.review.pushMayHaveCompleted) &&
+        reviewAbort(error, run)
+      ) {
         await reconcileReviewPush(run);
       }
       throw error;
@@ -2319,6 +2322,7 @@ export function createClaudeRunManager({
           cleanup: releaseReviewWorkspace,
           feedback,
           input,
+          pushMayHaveCompleted: false,
           pushStarted: false,
           reconciliation: null,
           workspace,
@@ -2392,6 +2396,7 @@ export function createClaudeRunManager({
           authorization,
           cleanup: releaseReviewWorkspace,
           input: authorizationInput,
+          pushMayHaveCompleted: false,
           pushStarted: false,
           reconciliation: null,
           workspace,
@@ -2643,6 +2648,9 @@ export function createClaudeRunManager({
             };
           } else if (code === 0 && run.source === "review") {
             try {
+              if (run.agent === "claude") {
+                run.review.pushMayHaveCompleted = true;
+              }
               await finishReview(
                 run,
                 run.agent === "codex" ? publishCodexReview : null,
