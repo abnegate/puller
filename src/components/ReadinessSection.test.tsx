@@ -187,6 +187,24 @@ describe("ReadinessSection", () => {
     expect(screen.getAllByText(/^Pull \d+$/)).toHaveLength(1);
   });
 
+  it("accepts a controlled page so keyboard navigation can reveal off-page rows", () => {
+    const onPageChange = vi.fn();
+    const view = render(
+      <ReadinessSection {...props(pullItems(41), { onPageChange, page: 2 })} />,
+    );
+
+    expect(screen.getByText("Page 2 of 3")).toBeVisible();
+    expect(screen.getByText("Pull 21")).toBeVisible();
+    expect(screen.getByText("Pull 40")).toBeVisible();
+    expect(screen.queryByText("Pull 1")).not.toBeInTheDocument();
+
+    view.rerender(
+      <ReadinessSection {...props(pullItems(41), { onPageChange, page: 3 })} />,
+    );
+    expect(screen.getByText("Pull 41")).toBeVisible();
+    expect(onPageChange).not.toHaveBeenCalled();
+  });
+
   it("reveals only the destination page of a pull with current source focus", async () => {
     const items = pullItems(41);
     const focused = items[40]!;

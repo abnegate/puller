@@ -25,6 +25,8 @@ import {
   getReleasePreview,
 } from "./api";
 import type { ClaudeRunEvent, ClaudeRunRequest } from "./fixes";
+import { RELEASE_FOCUS_REQUEST } from "./keyboard";
+import { getPullKey } from "./preferences";
 import {
   RELEASE_PANEL_STORAGE_KEY,
   serializeReleasePanelPreference,
@@ -1566,6 +1568,73 @@ describe("App", () => {
         container.querySelector('[data-release-date="2026-07-21"]'),
       ).toBeInTheDocument(),
     );
+  });
+
+  it("reveals panes and focuses dashboard targets with navigation-only keyboard shortcuts", async () => {
+    window.localStorage.setItem(
+      RELEASE_PANEL_STORAGE_KEY,
+      serializeReleasePanelPreference("releases"),
+    );
+    getPullsMock.mockResolvedValue(createPullsResponse());
+    taskActions.options.mockResolvedValue({
+      repositories: [
+        {
+          branches: ["main"],
+          defaultBranch: "main",
+          name: "cloud",
+          owner: "appwrite",
+          repository: "appwrite/cloud",
+          updatedAt: "2026-07-22T00:00:00.000Z",
+        },
+      ],
+      updatedAt: "2026-07-22T00:00:00.000Z",
+    });
+    const releaseFocus = vi.fn();
+    document.addEventListener(RELEASE_FOCUS_REQUEST, releaseFocus);
+    const view = render(<App />);
+
+    await screen.findByText(createPullsResponse().ready[0]!.title);
+    const requests = getPullsMock.mock.calls.length;
+    fireEvent.keyDown(window, { key: "p" });
+
+    await waitFor(() =>
+      expect(
+        view.container.querySelector("[data-dashboard-columns]"),
+      ).toHaveAttribute("data-dashboard-mode", "split"),
+    );
+    expect(document.activeElement).toHaveAttribute(
+      "data-pull-identity",
+      getPullKey(createPullsResponse().ready[0]!),
+    );
+
+    fireEvent.keyDown(window, { key: "n" });
+    const prompt = screen.getByRole("textbox", { name: "New PR" });
+    expect(prompt).toHaveFocus();
+    expect(prompt).toHaveAttribute("aria-keyshortcuts", "n");
+
+    fireEvent.keyDown(prompt, { key: "j" });
+    expect(prompt).toHaveFocus();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Hide recent releases" }),
+    );
+    fireEvent.keyDown(window, { key: "r" });
+    await waitFor(() => expect(releaseFocus).toHaveBeenCalledTimes(1));
+    expect(
+      view.container.querySelector("[data-dashboard-columns]"),
+    ).toHaveAttribute("data-dashboard-mode", "split");
+
+    fireEvent.keyDown(window, { key: "p" });
+    fireEvent.keyDown(window, { key: "?" });
+    expect(
+      await screen.findByRole("dialog", { name: "Keyboard shortcuts" }),
+    ).toBeInTheDocument();
+
+    expect(getPullsMock).toHaveBeenCalledTimes(requests);
+    expect(actions.merge).not.toHaveBeenCalled();
+    expect(fixes.stream).not.toHaveBeenCalled();
+    expect(taskActions.start).not.toHaveBeenCalled();
+    document.removeEventListener(RELEASE_FOCUS_REQUEST, releaseFocus);
   });
 
   it("focuses either mounted pane without losing release navigation, disclosure, or active verification", async () => {

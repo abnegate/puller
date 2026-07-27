@@ -136,6 +136,7 @@ export default function NewTaskForm({
               autoComplete="off"
               aria-describedby={describedBy}
               aria-invalid={Boolean(submitError || promptTooLarge) || undefined}
+              aria-keyshortcuts="n"
               disabled={submitting || unavailable}
               id="new-task-prompt"
               onChange={(event) => {

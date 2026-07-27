@@ -192,12 +192,16 @@ function TaskRow({
 
   return (
     <motion.li
+      aria-label={`Task: ${state.task.title}`}
       animate={{ opacity: 1, y: 0 }}
+      className="rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+      data-keyboard-item="task"
       data-task-id={state.task.id}
       exit={reducedMotion ? { opacity: 0 } : { opacity: 0, y: -6 }}
       initial={reducedMotion ? false : { opacity: 0, y: 6 }}
       layout
       layoutId={`task-row-${state.task.id}`}
+      tabIndex={-1}
       transition={
         reducedMotion
           ? { duration: 0 }

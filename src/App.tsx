@@ -25,10 +25,12 @@ import { getPulls, getRecentReleases } from "./api";
 import { useAuto, type AutoController } from "./auto";
 import AgentToggle from "./components/AgentToggle";
 import HiddenPullsMenu, { type HiddenPull } from "./components/HiddenPullsMenu";
+import KeyboardShortcuts from "./components/KeyboardShortcuts";
 import NewTaskForm from "./components/NewTaskForm";
 import ReadinessSection from "./components/ReadinessSection";
 import RecentReleases from "./components/RecentReleases";
 import ReleaseDialog from "./components/ReleaseDialog";
+import { SECTION_PAGE_SIZE } from "./components/SectionPager";
 import ThemeToggle from "./components/ThemeToggle";
 import { Button } from "./components/ui/button";
 import {
@@ -60,6 +62,12 @@ import {
   type ToggleViewedFile,
   type ViewedFilesByPull,
 } from "./diffs";
+import {
+  useDashboardKeyboard,
+  type KeyboardItem,
+  type KeyboardPages,
+  type KeyboardSection,
+} from "./keyboard";
 import {
   movementPullKey,
   PullMovementTracker,
@@ -138,7 +146,11 @@ const isAbortError = (error: unknown): boolean =>
   error.name === "AbortError";
 
 type PullLoadKind =
-  "automatic" | "initial" | "manual" | "mutation" | "visibility";
+  | "automatic"
+  | "initial"
+  | "manual"
+  | "mutation"
+  | "visibility";
 
 type PullRequest = {
   controller: AbortController;
@@ -318,9 +330,16 @@ function Dashboard({
   const [recentError, setRecentError] = useState<string | null>(null);
   const [recentLoading, setRecentLoading] = useState(false);
   const [pipelineRefreshRevision, setPipelineRefreshRevision] = useState(0);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [sectionPages, setSectionPages] = useState<KeyboardPages>({
+    blocked: 1,
+    progress: 1,
+    ready: 1,
+  });
   const [viewedFiles, setViewedFiles] = useState<ViewedFilesByPull>(
     () => EMPTY_VIEWED_FILES_BY_PULL,
   );
+  const helpRestoreFocus = useRef<HTMLElement | null>(null);
   const refreshTimer = useRef<number | null>(null);
   const pullDeadline = useRef<number | null>(null);
   const pullFailures = useRef(0);
@@ -745,6 +764,35 @@ function Dashboard({
       ),
     [view.groups.blocked, view.groups.progress, view.groups.ready],
   );
+  const keyboardItems = useMemo<readonly KeyboardItem[]>(() => {
+    const sectionItems = (
+      section: KeyboardSection,
+      items: typeof view.groups.ready,
+    ): KeyboardItem[] =>
+      items.map((item, index) =>
+        item.kind === "pull"
+          ? {
+              identity: item.identity,
+              index,
+              key: item.key,
+              kind: "pull",
+              section,
+            }
+          : {
+              id: item.state.task.id,
+              index,
+              key: item.key,
+              kind: "task",
+              section,
+            },
+      );
+
+    return [
+      ...sectionItems("ready", view.groups.ready),
+      ...sectionItems("progress", view.groups.progress),
+      ...sectionItems("blocked", view.groups.blocked),
+    ];
+  }, [view.groups.blocked, view.groups.progress, view.groups.ready]);
   const artifactEpoch = artifactProof.epoch;
   const refreshAuto = useCallback(
     async (): Promise<void> => loadRef.current("mutation"),
@@ -916,6 +964,53 @@ function Dashboard({
       (warning) => !SILENT_REVALIDATION_NOTICE.test(warning),
     ),
   ].filter((notice): notice is string => Boolean(notice));
+  const setSectionPage = useCallback(
+    (section: KeyboardSection, page: number): void => {
+      setSectionPages((current) =>
+        current[section] === page ? current : { ...current, [section]: page },
+      );
+    },
+    [],
+  );
+  const setBlockedPage = useCallback(
+    (page: number): void => setSectionPage("blocked", page),
+    [setSectionPage],
+  );
+  const setProgressPage = useCallback(
+    (page: number): void => setSectionPage("progress", page),
+    [setSectionPage],
+  );
+  const setReadyPage = useCallback(
+    (page: number): void => setSectionPage("ready", page),
+    [setSectionPage],
+  );
+  const revealPulls = useCallback((): void => {
+    if (!releasePanel.pulls.visible) releasePanel.showSplit();
+  }, [releasePanel.pulls.visible, releasePanel.showSplit]);
+  const revealReleases = useCallback((): void => {
+    if (!releasePanel.releases.visible) releasePanel.showSplit();
+  }, [releasePanel.releases.visible, releasePanel.showSplit]);
+  const handleHelpOpenChange = useCallback((open: boolean): void => {
+    if (open && document.activeElement instanceof HTMLElement) {
+      helpRestoreFocus.current = document.activeElement;
+    }
+    setHelpOpen(open);
+  }, []);
+  const openHelp = useCallback(
+    (): void => handleHelpOpenChange(true),
+    [handleHelpOpenChange],
+  );
+
+  useDashboardKeyboard({
+    items: keyboardItems,
+    newPullId: "new-task-prompt",
+    onHelp: openHelp,
+    onRevealPulls: revealPulls,
+    onRevealReleases: revealReleases,
+    pageSize: SECTION_PAGE_SIZE,
+    pages: sectionPages,
+    setPage: setSectionPage,
+  });
 
   return (
     <main className="min-h-svh bg-background text-foreground">
@@ -987,6 +1082,11 @@ function Dashboard({
                   <AutoControl auto={auto} trusted={autoAuthoritative} />
                   <AgentToggle agent={agent} onAgentChange={setAgent} />
                   <ThemeToggle />
+                  <KeyboardShortcuts
+                    onOpenChange={handleHelpOpenChange}
+                    open={helpOpen}
+                    restoreFocus={helpRestoreFocus}
+                  />
                   <Button
                     aria-controls="pull-requests-panel"
                     aria-expanded={releasePanel.pulls.visible}
@@ -1179,6 +1279,8 @@ function Dashboard({
                       movements={movements}
                       onMutationComplete={handleMerge}
                       onToggleViewed={toggleViewedFile}
+                      onPageChange={setProgressPage}
+                      page={sectionPages.progress}
                       runs={runs}
                       setFavorite={preferences.setFavorite}
                       taskCancel={tasks.cancel}
@@ -1262,6 +1364,8 @@ function Dashboard({
                         movements={movements}
                         onMutationComplete={handleMerge}
                         onToggleViewed={toggleViewedFile}
+                        onPageChange={setReadyPage}
+                        page={sectionPages.ready}
                         runs={runs}
                         setFavorite={preferences.setFavorite}
                         title="Ready"
@@ -1279,6 +1383,8 @@ function Dashboard({
                         movements={movements}
                         onMutationComplete={handleMerge}
                         onToggleViewed={toggleViewedFile}
+                        onPageChange={setProgressPage}
+                        page={sectionPages.progress}
                         runs={runs}
                         setFavorite={preferences.setFavorite}
                         taskCancel={tasks.cancel}
@@ -1297,6 +1403,8 @@ function Dashboard({
                         movements={movements}
                         onMutationComplete={handleMerge}
                         onToggleViewed={toggleViewedFile}
+                        onPageChange={setBlockedPage}
+                        page={sectionPages.blocked}
                         runs={runs}
                         setFavorite={preferences.setFavorite}
                         title="Not ready"

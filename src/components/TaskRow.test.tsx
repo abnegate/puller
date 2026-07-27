@@ -137,12 +137,17 @@ describe("TaskRow", () => {
 
   it("shows worktree progress, the early PR link, live output, and explicit cancellation", () => {
     const cancel = vi.fn(async () => undefined);
-    render(
+    const view = render(
       <ul>
         <TaskRow cancel={cancel} state={state()} />
       </ul>,
     );
+    const row = view.container.querySelector("[data-task-id]");
 
+    expect(row).toHaveAttribute("aria-label", "Task: Add task support");
+    expect(row).toHaveAttribute("data-keyboard-item", "task");
+    expect(row).toHaveAttribute("tabindex", "-1");
+    expect(row).toHaveClass("focus-visible:ring-2");
     expect(screen.getByText("appwrite/cloud")).toBeInTheDocument();
     expect(screen.getByText("puller/add-support-12345678")).toBeInTheDocument();
     expect(
