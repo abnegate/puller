@@ -101,17 +101,19 @@ const commandForKey = (key: string): DashboardKeyboardCommand | null => {
 const isEditableTarget = (target: EventTarget | null): boolean =>
   target instanceof Element && target.closest(EDITABLE_SELECTOR) !== null;
 
+type GuardedKeyboardEvent = Pick<
+  KeyboardEvent,
+  | "altKey"
+  | "ctrlKey"
+  | "defaultPrevented"
+  | "isComposing"
+  | "metaKey"
+  | "repeat"
+  | "target"
+>;
+
 export const keyboardEventBlocked = (
-  event: Pick<
-    KeyboardEvent,
-    | "altKey"
-    | "ctrlKey"
-    | "defaultPrevented"
-    | "isComposing"
-    | "metaKey"
-    | "repeat"
-    | "target"
-  >,
+  event: GuardedKeyboardEvent,
   target: Document = document,
   options: { allowRepeat?: boolean } = {},
 ): boolean =>

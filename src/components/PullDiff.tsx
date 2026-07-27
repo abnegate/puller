@@ -34,6 +34,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 
+import { keyboardEventBlocked } from "../keyboard";
 import {
   isRunActive,
   isRunPreparing,
@@ -63,6 +64,7 @@ export type PullDiffProps = {
   agent?: Agent;
   clearReviewRetry: PullRuns["clearReviewRetry"];
   diff: PullDiffData;
+  onKeyboardExit?: () => void;
   onPersistenceChange?: (persistence: PullDiffPersistence) => void;
   persistence?: PullDiffPersistence;
   pull: PullReadiness;
@@ -457,6 +459,24 @@ type FileTreeDirectory = {
   path: string;
 };
 
+type FileTreeItem =
+  | {
+      depth: number;
+      key: string;
+      kind: "directory";
+      parentPath: string | null;
+      path: string;
+    }
+  | {
+      depth: number;
+      file: PullDiffFile;
+      index: number;
+      key: string;
+      kind: "file";
+      parentPath: string | null;
+      path: string;
+    };
+
 const createFileTree = (files: PullDiffFile[]): FileTreeDirectory => {
   const root: FileTreeDirectory = {
     directories: new Map(),
@@ -497,6 +517,62 @@ const treeFiles = (files: PullDiffFile[]): PullDiffFile[] => {
   };
   append(createFileTree(files));
   return ordered;
+};
+
+const parentDirectory = (path: string): string | null => {
+  const separator = path.lastIndexOf("/");
+  return separator < 0 ? null : path.slice(0, separator);
+};
+
+const visibleTreeItems = (
+  tree: FileTreeDirectory,
+  collapsed: ReadonlySet<string>,
+): FileTreeItem[] => {
+  const items: FileTreeItem[] = [];
+  const append = (directory: FileTreeDirectory, depth: number): void => {
+    for (const child of treeDirectories(directory)) {
+      items.push({
+        depth,
+        key: `directory:${child.path}`,
+        kind: "directory",
+        parentPath: parentDirectory(child.path),
+        path: child.path,
+      });
+      if (!collapsed.has(child.path)) append(child, depth + 1);
+    }
+    for (const { file, index } of directory.files) {
+      items.push({
+        depth,
+        file,
+        index,
+        key: `file:${file.path}`,
+        kind: "file",
+        parentPath: parentDirectory(file.path),
+        path: file.path,
+      });
+    }
+  };
+  append(tree, 0);
+  return items;
+};
+
+const nearestVisibleTreeKey = (
+  key: string | null,
+  items: readonly FileTreeItem[],
+): string | null => {
+  if (items.length === 0) return null;
+  if (key !== null && items.some((item) => item.key === key)) return key;
+  if (key !== null) {
+    let path = key.slice(key.indexOf(":") + 1);
+    while (path.includes("/")) {
+      path = parentDirectory(path) ?? "";
+      const directoryKey = `directory:${path}`;
+      if (items.some((item) => item.key === directoryKey)) {
+        return directoryKey;
+      }
+    }
+  }
+  return items[0]!.key;
 };
 
 const directoriesFor = (diff: PullDiffData): Set<string> => {
@@ -1274,6 +1350,7 @@ const DiffFile = memo(function DiffFile({
       aria-labelledby={`${id}-title`}
       className="flex w-full min-w-0 scroll-mt-0 flex-col rounded-lg border bg-card outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
       data-diff-file=""
+      data-diff-file-path={file.path}
       id={id}
       ref={registerSection}
       tabIndex={-1}
@@ -1283,6 +1360,7 @@ const DiffFile = memo(function DiffFile({
           viewed ? "rounded-lg" : "rounded-t-lg"
         }`}
         data-diff-file-header=""
+        data-pull-focus-token={`file-header:${file.path}`}
         tabIndex={-1}
       >
         <div className="flex min-h-10 w-full min-w-0 flex-wrap items-center gap-2 overflow-clip rounded-[inherit] bg-muted/35 px-3 py-2">
@@ -1376,9 +1454,10 @@ const DiffFile = memo(function DiffFile({
 type FileNavigationProps = {
   activate: (path: string) => void;
   collapsedDirectories: readonly string[];
+  enterHeader: (path: string) => boolean;
   fileIds: readonly string[];
   files: PullDiffFile[];
-  navigate: (path: string) => void;
+  onExit: () => void;
   onScrollChange: (scrollLeft: number, scrollTop: number) => void;
   onToggleDirectory: (path: string) => void;
   scrollLeft: number;
@@ -1390,9 +1469,10 @@ type FileNavigationProps = {
 const FileNavigation = memo(function FileNavigation({
   activate,
   collapsedDirectories,
+  enterHeader,
   fileIds,
   files,
-  navigate,
+  onExit,
   onScrollChange,
   onToggleDirectory,
   scrollLeft,
@@ -1401,10 +1481,22 @@ const FileNavigation = memo(function FileNavigation({
   visibleCount,
 }: FileNavigationProps) {
   const navigation = useRef<HTMLElement>(null);
+  const pendingFocus = useRef<string | null>(null);
   const tree = useMemo(() => createFileTree(files), [files]);
   const collapsed = useMemo(
     () => new Set(collapsedDirectories),
     [collapsedDirectories],
+  );
+  const items = useMemo(
+    () => visibleTreeItems(tree, collapsed),
+    [collapsed, tree],
+  );
+  const [activeKey, setActiveKey] = useState<string | null>(
+    selected === null ? null : `file:${selected}`,
+  );
+  const resolvedActiveKey = nearestVisibleTreeKey(
+    activeKey ?? (selected === null ? null : `file:${selected}`),
+    items,
   );
 
   useLayoutEffect(() => {
@@ -1417,56 +1509,129 @@ const FileNavigation = memo(function FileNavigation({
     }
   }, [scrollLeft, scrollTop]);
 
+  useLayoutEffect(() => {
+    if (activeKey === resolvedActiveKey) return;
+    setActiveKey(resolvedActiveKey);
+  }, [activeKey, resolvedActiveKey]);
+
+  const focusItem = useCallback((key: string): boolean => {
+    const current = navigation.current;
+    const target = [
+      ...(current?.querySelectorAll<HTMLButtonElement>(
+        "button[data-tree-key]",
+      ) ?? []),
+    ].find((candidate) => candidate.dataset.treeKey === key);
+    if (!current || !target) return false;
+
+    const scrollLeft = current.scrollLeft;
+    setActiveKey(key);
+    target.focus({ preventScroll: true });
+    target.scrollIntoView?.({ block: "nearest" });
+    current.scrollLeft = scrollLeft;
+    return true;
+  }, []);
+
+  const toggleDirectory = useCallback(
+    (path: string) => {
+      const closing = !collapsed.has(path);
+      const focusedKey =
+        document.activeElement instanceof HTMLElement
+          ? document.activeElement.closest<HTMLButtonElement>(
+              "button[data-tree-key]",
+            )?.dataset.treeKey
+          : undefined;
+      if (
+        closing &&
+        focusedKey !== undefined &&
+        focusedKey !== `directory:${path}` &&
+        focusedKey.slice(focusedKey.indexOf(":") + 1).startsWith(`${path}/`)
+      ) {
+        pendingFocus.current = `directory:${path}`;
+        setActiveKey(`directory:${path}`);
+      }
+      onToggleDirectory(path);
+    },
+    [collapsed, onToggleDirectory],
+  );
+
+  useLayoutEffect(() => {
+    const key = pendingFocus.current;
+    if (key === null || !focusItem(key)) return;
+    pendingFocus.current = null;
+  }, [focusItem, items]);
+
   const handleKeyDown = useCallback(
     (event: KeyboardEvent<HTMLElement>) => {
       const item = (event.target as HTMLElement).closest<HTMLButtonElement>(
         "button[data-tree-item]",
       );
       if (!item || !event.currentTarget.contains(item)) return;
-      const items = [
-        ...event.currentTarget.querySelectorAll<HTMLButtonElement>(
-          item.dataset.filePath
-            ? "button[data-file-index]"
-            : "button[data-tree-item]",
-        ),
-      ];
-      const index = items.indexOf(item);
-      let next = index;
-
-      if (event.key === "ArrowDown") {
-        next = Math.min(items.length - 1, index + 1);
-      } else if (event.key === "ArrowUp") {
-        next = Math.max(0, index - 1);
-      } else if (event.key === "Home") {
-        next = 0;
-      } else if (event.key === "End") {
-        next = items.length - 1;
-      } else if (
-        (event.key === "ArrowLeft" || event.key === "ArrowRight") &&
-        item.dataset.directory
+      const currentKey = item.dataset.treeKey;
+      const index = items.findIndex(
+        (candidate) => candidate.key === currentKey,
+      );
+      const current = items[index];
+      const allowRepeat = event.key === "ArrowDown" || event.key === "ArrowUp";
+      if (
+        !current ||
+        event.shiftKey ||
+        keyboardEventBlocked(event.nativeEvent, document, { allowRepeat })
       ) {
-        const isCollapsed =
-          item.parentElement?.getAttribute("aria-expanded") === "false";
-        if (
-          (event.key === "ArrowLeft" && !isCollapsed) ||
-          (event.key === "ArrowRight" && isCollapsed)
-        ) {
-          event.preventDefault();
-          item.click();
-        }
-        return;
-      } else {
         return;
       }
 
+      let destination: string | null = null;
+      let handled = true;
+      if (event.key === "ArrowDown") {
+        destination = items[Math.min(items.length - 1, index + 1)]!.key;
+      } else if (event.key === "ArrowUp") {
+        destination = items[Math.max(0, index - 1)]!.key;
+      } else if (event.key === "Home") {
+        destination = items[0]!.key;
+      } else if (event.key === "End") {
+        destination = items.at(-1)!.key;
+      } else if (event.key === "ArrowRight") {
+        if (current.kind === "directory") {
+          if (collapsed.has(current.path)) {
+            toggleDirectory(current.path);
+          } else {
+            const child = items[index + 1];
+            if (child && child.depth > current.depth) destination = child.key;
+          }
+        } else {
+          enterHeader(current.path);
+        }
+      } else if (event.key === "ArrowLeft") {
+        if (current.kind === "directory" && !collapsed.has(current.path)) {
+          toggleDirectory(current.path);
+        } else if (current.parentPath !== null) {
+          destination = `directory:${current.parentPath}`;
+        } else {
+          onExit();
+        }
+      } else if (event.key === "Enter" || event.key === " ") {
+        if (current.kind === "file") activate(current.path);
+        else toggleDirectory(current.path);
+      } else if (event.key === "Escape") {
+        onExit();
+      } else {
+        handled = false;
+      }
+
+      if (!handled) return;
       event.preventDefault();
-      const target = items[next];
-      if (!target) return;
-      const path = target.dataset.filePath;
-      if (path) navigate(path);
-      target.focus();
+      event.stopPropagation();
+      if (destination !== null) focusItem(destination);
     },
-    [navigate],
+    [
+      activate,
+      collapsed,
+      enterHeader,
+      focusItem,
+      items,
+      onExit,
+      toggleDirectory,
+    ],
   );
 
   const renderDirectory = (
@@ -1490,9 +1655,15 @@ const FileNavigation = memo(function FileNavigation({
               <button
                 className="flex min-h-9 w-max min-w-full items-center gap-1.5 rounded-md py-1 pr-2 text-left text-xs text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
                 data-directory={child.path}
+                data-pull-focus-token={`directory:${child.path}`}
                 data-tree-item=""
-                onClick={() => onToggleDirectory(child.path)}
+                data-tree-key={`directory:${child.path}`}
+                onClick={() => toggleDirectory(child.path)}
+                onFocus={() => setActiveKey(`directory:${child.path}`)}
                 style={{ paddingLeft: `${depth * 12 + 8}px` }}
+                tabIndex={
+                  resolvedActiveKey === `directory:${child.path}` ? 0 : -1
+                }
                 type="button"
               >
                 <ChevronRight
@@ -1536,9 +1707,11 @@ const FileNavigation = memo(function FileNavigation({
                 data-file-path={file.path}
                 data-pull-focus-token={`file:${file.path}`}
                 data-tree-item=""
+                data-tree-key={`file:${file.path}`}
                 onClick={() => activate(file.path)}
+                onFocus={() => setActiveKey(`file:${file.path}`)}
                 style={{ paddingLeft: `${depth * 12 + 25}px` }}
-                tabIndex={selected === file.path ? 0 : -1}
+                tabIndex={resolvedActiveKey === `file:${file.path}` ? 0 : -1}
                 type="button"
               >
                 <FileCode2
@@ -1597,6 +1770,7 @@ function PullDiff({
   agent = "claude",
   clearReviewRetry,
   diff,
+  onKeyboardExit,
   onPersistenceChange,
   persistence,
   pull,
@@ -1618,6 +1792,7 @@ function PullDiff({
   const copy = feedbackAgentCopy[feedbackAgent];
   const identifier = useId();
   const reducedMotion = useReducedMotion();
+  const diffRoot = useRef<HTMLDivElement>(null);
   const files = useRef(new Map<string, HTMLElement>());
   const layout = useRef<HTMLDivElement>(null);
   const resize = useRef<{
@@ -1964,7 +2139,9 @@ function PullDiff({
         behavior: reducedMotion ? "auto" : "smooth",
         block: "start",
       });
-      section.focus({ preventScroll: true });
+      (
+        section.querySelector<HTMLElement>("[data-diff-file-header]") ?? section
+      ).focus({ preventScroll: true });
       return true;
     },
     [reducedMotion],
@@ -2004,6 +2181,67 @@ function PullDiff({
       });
     },
     [updatePersistence],
+  );
+  const exitKeyboardNavigation = useCallback(() => {
+    if (onKeyboardExit) {
+      onKeyboardExit();
+      return;
+    }
+    const row = diffRoot.current?.closest<HTMLElement>("[data-pull-identity]");
+    row
+      ?.querySelector<HTMLElement>('[data-pull-focus-token="diff"]')
+      ?.focus({ preventScroll: true });
+  }, [onKeyboardExit]);
+  const enterFileHeader = useCallback(
+    (path: string): boolean => {
+      const section = files.current.get(path);
+      const header = section?.querySelector<HTMLElement>(
+        "[data-diff-file-header]",
+      );
+      if (!header) return false;
+      navigateFile(path);
+      header.focus({ preventScroll: true });
+      return true;
+    },
+    [navigateFile],
+  );
+  const focusTreeFile = useCallback((path: string): boolean => {
+    const navigation = layout.current?.querySelector<HTMLElement>(
+      "[data-diff-navigation]",
+    );
+    const target = [
+      ...(navigation?.querySelectorAll<HTMLButtonElement>(
+        "button[data-file-path]",
+      ) ?? []),
+    ].find((candidate) => candidate.dataset.filePath === path);
+    if (!target) return false;
+    target.focus({ preventScroll: true });
+    return true;
+  }, []);
+  const handleDiffKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLDivElement>) => {
+      const target = event.target as HTMLElement;
+      const header = target.closest<HTMLElement>("[data-diff-file-header]");
+      if (
+        target !== header ||
+        event.shiftKey ||
+        keyboardEventBlocked(event.nativeEvent)
+      ) {
+        return;
+      }
+      const section = header.closest<HTMLElement>("[data-diff-file]");
+      const path = section?.dataset.diffFilePath;
+      if (event.key === "ArrowLeft" && path) {
+        event.preventDefault();
+        event.stopPropagation();
+        focusTreeFile(path);
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        exitKeyboardNavigation();
+      }
+    },
+    [exitKeyboardNavigation, focusTreeFile],
   );
   const changeDraft = useCallback(
     (draft: string) => {
@@ -2165,6 +2403,14 @@ function PullDiff({
   );
   const handleSeparatorKeyDown = useCallback(
     (event: KeyboardEvent<HTMLDivElement>) => {
+      if (
+        event.shiftKey ||
+        keyboardEventBlocked(event.nativeEvent, document, {
+          allowRepeat: event.key === "ArrowLeft" || event.key === "ArrowRight",
+        })
+      ) {
+        return;
+      }
       let width: number | null = null;
       if (event.key === "ArrowLeft") {
         width = persistenceRef.current.navigationWidth - 16;
@@ -2178,6 +2424,7 @@ function PullDiff({
         return;
       }
       event.preventDefault();
+      event.stopPropagation();
       setNavigationWidth(width);
     },
     [maximumNavigationWidth, setNavigationWidth],
@@ -2207,6 +2454,8 @@ function PullDiff({
       aria-label={`Files changed for ${diff.repository} pull request ${diff.number}`}
       className="mt-3 w-full min-w-0 rounded-xl border bg-background"
       data-pull-diff=""
+      onKeyDown={handleDiffKeyDown}
+      ref={diffRoot}
       role="region"
     >
       {selectionAnnouncement !== "" && (
@@ -2294,9 +2543,11 @@ function PullDiff({
                     collapsedDirectories={
                       currentPersistence.collapsedDirectories
                     }
+                    enterHeader={enterFileHeader}
                     fileIds={fileIds}
                     files={orderedFiles}
-                    navigate={navigateFile}
+                    key={revision}
+                    onExit={exitKeyboardNavigation}
                     onScrollChange={changeNavigationScroll}
                     onToggleDirectory={toggleDirectory}
                     scrollLeft={currentPersistence.navigationScrollLeft}

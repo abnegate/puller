@@ -20,6 +20,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 
+import { keyboardEventBlocked } from "../keyboard";
 import {
   getPullCommitDiff,
   getPullCommits,
@@ -134,22 +135,88 @@ const samePersistence = (
   left.viewed === right.viewed;
 
 function CommitList({
+  activeSha,
   commits,
+  onActiveChange,
+  onEnterDiff,
+  onExit,
   onSelect,
   selectedSha,
 }: {
+  activeSha: string | null;
   commits: PullCommit[];
+  onActiveChange: (sha: string) => void;
+  onEnterDiff: (sha: string) => void;
+  onExit: () => void;
   onSelect: (sha: string) => void;
   selectedSha: string | null;
 }) {
-  const ordered = useMemo(() => [...commits].reverse(), [commits]);
+  const focusCommit = useCallback(
+    (list: HTMLElement, sha: string): void => {
+      const target = [
+        ...list.querySelectorAll<HTMLButtonElement>("button[data-commit-sha]"),
+      ].find((button) => button.dataset.commitSha === sha);
+      if (!target) return;
+      onActiveChange(sha);
+      target.focus({ preventScroll: true });
+      target.scrollIntoView?.({ block: "nearest" });
+    },
+    [onActiveChange],
+  );
+  const handleKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLUListElement>): void => {
+      const target = (event.target as HTMLElement).closest<HTMLButtonElement>(
+        "button[data-commit-sha]",
+      );
+      if (!target || !event.currentTarget.contains(target)) return;
+      const allowRepeat = event.key === "ArrowDown" || event.key === "ArrowUp";
+      if (
+        event.shiftKey ||
+        keyboardEventBlocked(event.nativeEvent, document, { allowRepeat })
+      ) {
+        return;
+      }
+      const index = commits.findIndex(
+        (commit) => commit.sha === target.dataset.commitSha,
+      );
+      const current = commits[index];
+      if (!current) return;
+
+      let destination: string | null = null;
+      let handled = true;
+      if (event.key === "ArrowDown") {
+        destination = commits[Math.min(commits.length - 1, index + 1)]!.sha;
+      } else if (event.key === "ArrowUp") {
+        destination = commits[Math.max(0, index - 1)]!.sha;
+      } else if (event.key === "Home") {
+        destination = commits[0]!.sha;
+      } else if (event.key === "End") {
+        destination = commits.at(-1)!.sha;
+      } else if (event.key === "Enter" || event.key === " ") {
+        onSelect(current.sha);
+      } else if (event.key === "ArrowRight") {
+        onEnterDiff(current.sha);
+      } else if (event.key === "ArrowLeft" || event.key === "Escape") {
+        onExit();
+      } else {
+        handled = false;
+      }
+
+      if (!handled) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (destination !== null) focusCommit(event.currentTarget, destination);
+    },
+    [commits, focusCommit, onEnterDiff, onExit, onSelect],
+  );
 
   return (
     <ul
       aria-label="Pull request commits"
       className="m-0 grid min-w-0 max-w-full list-none gap-1 overflow-hidden p-2"
+      onKeyDown={handleKeyDown}
     >
-      {ordered.map((commit) => {
+      {commits.map((commit) => {
         const selected = commit.sha === selectedSha;
         const title = commitTitle(commit);
         return (
@@ -159,9 +226,12 @@ function CommitList({
               aria-label={`${title}, commit ${commit.sha.slice(0, 7)}`}
               aria-pressed={selected}
               className="h-auto w-full min-w-0 max-w-full justify-start gap-2 overflow-hidden px-2.5 py-2 text-left"
+              data-commit-sha={commit.sha}
               data-commit-selected={selected ? "" : undefined}
               data-pull-focus-token={`commit:${commit.sha}`}
               onClick={() => onSelect(commit.sha)}
+              onFocus={() => onActiveChange(commit.sha)}
+              tabIndex={commit.sha === activeSha ? 0 : -1}
               type="button"
               variant={selected ? "secondary" : "ghost"}
             >
@@ -289,6 +359,17 @@ function PullCommits({
     sha: null,
     state: { status: "idle" },
   });
+  const diffCache = useRef(new Map<string, PullCommitDiff>());
+  const diffRequests = useRef(
+    new Map<
+      string,
+      {
+        controller: AbortController;
+        promise: Promise<PullCommitDiff>;
+      }
+    >(),
+  );
+  const pendingEntry = useRef<{ identity: string; sha: string } | null>(null);
   const identity = useMemo(
     () => ({
       baseRefOid: pull.baseRefOid,
@@ -305,6 +386,11 @@ function PullCommits({
       viewerLogin,
     ],
   );
+  const identityKey = `${identity.repository}\u0000${identity.number}\u0000${identity.baseRefOid}\u0000${identity.headRefOid}\u0000${identity.viewerLogin}`;
+  const [activeCommit, setActiveCommit] = useState<{
+    identity: string;
+    sha: string | null;
+  }>({ identity: identityKey, sha: null });
 
   useEffect(() => {
     const controller = new AbortController();
@@ -332,7 +418,14 @@ function PullCommits({
   }, [identity, reloadCommits]);
 
   const commits =
-    commitsState.status === "success" ? commitsState.commits.commits : [];
+    commitsState.status === "success" &&
+    commitsState.commits.baseRefOid === identity.baseRefOid &&
+    commitsState.commits.headRefOid === identity.headRefOid &&
+    commitsState.commits.number === identity.number &&
+    commitsState.commits.repository === identity.repository
+      ? commitsState.commits.commits
+      : [];
+  const orderedCommits = useMemo(() => [...commits].reverse(), [commits]);
   const selectedSha = useMemo(() => {
     if (commits.length === 0) return null;
     const persisted = currentPersistence.selectedSha;
@@ -341,6 +434,25 @@ function PullCommits({
       ? persisted
       : commits.at(-1)!.sha;
   }, [commits, currentPersistence.selectedSha]);
+  const selectedShaRef = useRef(selectedSha);
+  const identityKeyRef = useRef(identityKey);
+  selectedShaRef.current = selectedSha;
+  identityKeyRef.current = identityKey;
+  const activeSha =
+    activeCommit.identity === identityKey &&
+    orderedCommits.some((commit) => commit.sha === activeCommit.sha)
+      ? activeCommit.sha
+      : (selectedSha ?? orderedCommits[0]?.sha ?? null);
+
+  useLayoutEffect(() => {
+    if (
+      activeCommit.identity === identityKey &&
+      activeCommit.sha === activeSha
+    ) {
+      return;
+    }
+    setActiveCommit({ identity: identityKey, sha: activeSha });
+  }, [activeCommit, activeSha, identityKey]);
 
   useEffect(() => {
     if (
@@ -363,23 +475,74 @@ function PullCommits({
       : ({ status: "idle" } as const);
 
   useEffect(() => {
+    const requests = diffRequests.current;
+    const prefix = `${identityKey}\u0000`;
+    return () => {
+      for (const [key, request] of requests) {
+        if (!key.startsWith(prefix)) continue;
+        request.controller.abort();
+        requests.delete(key);
+      }
+      if (pendingEntry.current?.identity === identityKey) {
+        pendingEntry.current = null;
+      }
+    };
+  }, [identityKey]);
+
+  useEffect(() => {
     if (selectedSha === null) {
       setDiffIdentity({ sha: null, state: { status: "idle" } });
       return;
     }
-    const controller = new AbortController();
+    const key = `${identityKey}\u0000${selectedSha}`;
+    const cached = diffCache.current.get(key);
+    if (cached) {
+      setDiffIdentity({
+        sha: selectedSha,
+        state: { diff: cached, status: "success" },
+      });
+      return;
+    }
+
+    let request = diffRequests.current.get(key);
+    if (!request) {
+      const controller = new AbortController();
+      const promise = getPullCommitDiff(
+        identity,
+        selectedSha,
+        controller.signal,
+      );
+      request = { controller, promise };
+      diffRequests.current.set(key, request);
+      const finish = (): void => {
+        if (diffRequests.current.get(key)?.promise === promise) {
+          diffRequests.current.delete(key);
+        }
+      };
+      void promise.then(finish, finish);
+    }
     setDiffIdentity({ sha: selectedSha, state: { status: "loading" } });
-    void getPullCommitDiff(identity, selectedSha, controller.signal).then(
+    void request.promise.then(
       (diff) => {
-        if (!controller.signal.aborted) {
-          setDiffIdentity({
-            sha: selectedSha,
-            state: { diff, status: "success" },
-          });
+        if (!request.controller.signal.aborted) {
+          diffCache.current.set(key, diff);
+          if (
+            identityKeyRef.current === identityKey &&
+            selectedShaRef.current === selectedSha
+          ) {
+            setDiffIdentity({
+              sha: selectedSha,
+              state: { diff, status: "success" },
+            });
+          }
         }
       },
       (error: unknown) => {
-        if (!controller.signal.aborted) {
+        if (
+          !request.controller.signal.aborted &&
+          identityKeyRef.current === identityKey &&
+          selectedShaRef.current === selectedSha
+        ) {
           setDiffIdentity({
             sha: selectedSha,
             state: {
@@ -393,8 +556,7 @@ function PullCommits({
         }
       },
     );
-    return () => controller.abort();
-  }, [identity, reloadDiff, selectedSha]);
+  }, [identity, identityKey, reloadDiff, selectedSha]);
 
   const selectCommit = useCallback(
     (sha: string) => {
@@ -405,6 +567,88 @@ function PullCommits({
     },
     [updatePersistence],
   );
+  const changeActiveCommit = useCallback(
+    (sha: string): void => setActiveCommit({ identity: identityKey, sha }),
+    [identityKey],
+  );
+  const focusCommit = useCallback(
+    (sha: string): boolean => {
+      const target = [
+        ...(layout.current?.querySelectorAll<HTMLButtonElement>(
+          "button[data-commit-sha]",
+        ) ?? []),
+      ].find((button) => button.dataset.commitSha === sha);
+      if (!target) return false;
+      changeActiveCommit(sha);
+      target.focus({ preventScroll: true });
+      return true;
+    },
+    [changeActiveCommit],
+  );
+  const focusDiffTree = useCallback((): boolean => {
+    const target = layout.current?.querySelector<HTMLElement>(
+      '[data-pull-diff] button[data-tree-item][tabindex="0"]',
+    );
+    if (!target) return false;
+    target.focus({ preventScroll: true });
+    return true;
+  }, []);
+  const exitCommitList = useCallback((): void => {
+    layout.current
+      ?.closest<HTMLElement>("[data-pull-identity]")
+      ?.querySelector<HTMLElement>('[data-pull-focus-token="commits"]')
+      ?.focus({ preventScroll: true });
+  }, []);
+  const enterCommitDiff = useCallback(
+    (sha: string): void => {
+      if (sha !== selectedSha) return;
+      if (currentDiffState.status === "success") {
+        focusDiffTree();
+        return;
+      }
+      if (
+        currentDiffState.status === "idle" ||
+        currentDiffState.status === "loading"
+      ) {
+        pendingEntry.current = { identity: identityKey, sha };
+      }
+    },
+    [currentDiffState.status, focusDiffTree, identityKey, selectedSha],
+  );
+  const returnToSelectedCommit = useCallback((): void => {
+    if (selectedSha !== null) focusCommit(selectedSha);
+  }, [focusCommit, selectedSha]);
+  useLayoutEffect(() => {
+    const pending = pendingEntry.current;
+    if (
+      pending === null ||
+      pending.identity !== identityKey ||
+      pending.sha !== selectedSha
+    ) {
+      return;
+    }
+    if (currentDiffState.status === "success") {
+      if (focusDiffTree()) pendingEntry.current = null;
+    } else if (currentDiffState.status === "error") {
+      pendingEntry.current = null;
+      focusCommit(pending.sha);
+    }
+  }, [
+    currentDiffState.status,
+    focusCommit,
+    focusDiffTree,
+    identityKey,
+    selectedSha,
+  ]);
+  const retryDiff = useCallback((): void => {
+    if (selectedSha === null) return;
+    const key = `${identityKey}\u0000${selectedSha}`;
+    diffCache.current.delete(key);
+    const request = diffRequests.current.get(key);
+    request?.controller.abort();
+    diffRequests.current.delete(key);
+    setReloadDiff((value) => value + 1);
+  }, [identityKey, selectedSha]);
   const maximumListWidth = useCallback((): number => {
     const width = layout.current?.getBoundingClientRect().width ?? 0;
     return width > 0
@@ -464,6 +708,14 @@ function PullCommits({
   );
   const handleSeparatorKeyDown = useCallback(
     (event: KeyboardEvent<HTMLDivElement>) => {
+      if (
+        event.shiftKey ||
+        keyboardEventBlocked(event.nativeEvent, document, {
+          allowRepeat: event.key === "ArrowLeft" || event.key === "ArrowRight",
+        })
+      ) {
+        return;
+      }
       let width: number | null = null;
       if (event.key === "ArrowLeft") {
         width = persistenceRef.current.listWidth - 16;
@@ -477,6 +729,7 @@ function PullCommits({
         return;
       }
       event.preventDefault();
+      event.stopPropagation();
       setListWidth(width);
     },
     [maximumListWidth, setListWidth],
@@ -597,7 +850,11 @@ function PullCommits({
             >
               <aside className="w-full min-w-0 max-w-full overflow-hidden">
                 <CommitList
-                  commits={commits}
+                  activeSha={activeSha}
+                  commits={orderedCommits}
+                  onActiveChange={changeActiveCommit}
+                  onEnterDiff={enterCommitDiff}
+                  onExit={exitCommitList}
                   onSelect={selectCommit}
                   selectedSha={selectedSha}
                 />
@@ -637,7 +894,7 @@ function PullCommits({
               <LoadState
                 label="Loading commit changes…"
                 message={currentDiffState.message}
-                retry={() => setReloadDiff((value) => value + 1)}
+                retry={retryDiff}
                 status="error"
               />
             )}
@@ -649,6 +906,7 @@ function PullCommits({
                   clearReviewRetry={clearReviewRetry}
                   diff={currentDiffState.diff}
                   key={selectedSha}
+                  onKeyboardExit={returnToSelectedCommit}
                   onPersistenceChange={saveDiffPersistence}
                   persistence={currentPersistence.diffs[selectedSha]}
                   pull={pull}

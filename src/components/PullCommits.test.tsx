@@ -30,12 +30,14 @@ vi.mock("../api", () => ({
 vi.mock("./PullDiff", () => ({
   default: ({
     diff,
+    onKeyboardExit,
     onPersistenceChange,
     readOnly,
     toggleViewed,
     viewed,
   }: {
     diff: PullCommitDiff;
+    onKeyboardExit?: () => void;
     onPersistenceChange?: (persistence: PullDiffPersistence) => void;
     readOnly?: boolean;
     toggleViewed: (path: string) => void;
@@ -43,10 +45,24 @@ vi.mock("./PullDiff", () => ({
   }) => (
     <div
       aria-label={`Commit diff ${diff.commitSha}`}
+      data-pull-diff=""
       data-read-only={readOnly ? "true" : "false"}
       role="region"
     >
       {diff.files.map((file) => file.path).join(", ")}
+      <button
+        data-tree-item=""
+        onKeyDown={(event) => {
+          if (event.key !== "ArrowLeft" && event.key !== "Escape") return;
+          event.preventDefault();
+          event.stopPropagation();
+          onKeyboardExit?.();
+        }}
+        tabIndex={0}
+        type="button"
+      >
+        Commit file
+      </button>
       {!readOnly && <button type="button">Give feedback</button>}
       <button
         aria-pressed={viewed.has(diff.files[0]!.path)}
@@ -169,14 +185,27 @@ const startRun = vi.fn<PullRuns["start"]>(async () => ({
   source: "auto",
 }));
 
-const renderCommits = (
-  change: {
-    onPersistenceChange?: (persistence: PullCommitsPersistence) => void;
-    persistence?: PullCommitsPersistence;
-    pull?: PullReadiness;
-  } = {},
-) =>
-  render(
+const deferred = <Value,>() => {
+  let resolve!: (value: Value) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<Value>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, reject, resolve };
+};
+
+type CommitsView = {
+  onPersistenceChange?: (persistence: PullCommitsPersistence) => void;
+  persistence?: PullCommitsPersistence;
+  pull?: PullReadiness;
+};
+
+const commitsView = (change: CommitsView = {}) => (
+  <div data-pull-identity="appwrite/cloud#101">
+    <button data-pull-focus-token="commits" type="button">
+      Commits
+    </button>
     <PullCommits
       clearReviewRetry={vi.fn()}
       onPersistenceChange={change.onPersistenceChange}
@@ -185,8 +214,11 @@ const renderCommits = (
       run={IDLE_RUN_STATE}
       startRun={startRun}
       viewerLogin={viewerLogin}
-    />,
-  );
+    />
+  </div>
+);
+
+const renderCommits = (change: CommitsView = {}) => render(commitsView(change));
 
 beforeEach(() => {
   vi.mocked(getPullCommits).mockResolvedValue(commits());
@@ -330,6 +362,159 @@ describe("PullCommits", () => {
       await screen.findByRole("region", { name: `Commit diff ${firstSha}` }),
     ).toBeInTheDocument();
     expect(getPullCommitDiff).toHaveBeenCalledTimes(2);
+  });
+
+  it("moves a separate roving commit cursor without loading diffs until activation", async () => {
+    renderCommits();
+    await screen.findByRole("region", { name: `Commit diff ${secondSha}` });
+    vi.mocked(getPullCommitDiff).mockClear();
+    const latest = screen.getByRole("button", {
+      name: /Polish commit selection, commit 2222222/,
+    });
+    const firstCommit = screen.getByRole("button", {
+      name: /Create the commit viewer, commit 1111111/,
+    });
+
+    latest.focus();
+    fireEvent.keyDown(latest, { key: "ArrowDown" });
+    expect(firstCommit).toHaveFocus();
+    expect(firstCommit).toHaveAttribute("tabindex", "0");
+    expect(firstCommit).not.toHaveAttribute("aria-current");
+    expect(latest).toHaveAttribute("aria-current", "true");
+    fireEvent.keyDown(firstCommit, { key: "Home" });
+    expect(latest).toHaveFocus();
+    fireEvent.keyDown(latest, { key: "End" });
+    expect(firstCommit).toHaveFocus();
+    expect(getPullCommitDiff).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(firstCommit, { key: "Enter" });
+    expect(
+      await screen.findByRole("region", { name: `Commit diff ${firstSha}` }),
+    ).toBeInTheDocument();
+    expect(getPullCommitDiff).toHaveBeenCalledOnce();
+
+    latest.focus();
+    fireEvent.keyDown(latest, { key: " " });
+    expect(
+      await screen.findByRole("region", { name: `Commit diff ${secondSha}` }),
+    ).toBeInTheDocument();
+    expect(getPullCommitDiff).toHaveBeenCalledOnce();
+  });
+
+  it("enters a loaded commit tree and returns through commit and disclosure focus levels", async () => {
+    const leaked = vi.fn();
+    window.addEventListener("keydown", leaked);
+    renderCommits();
+    const commitDiff = await screen.findByRole("region", {
+      name: `Commit diff ${secondSha}`,
+    });
+    const selected = screen.getByRole("button", {
+      name: /Polish commit selection, commit 2222222/,
+    });
+
+    selected.focus();
+    fireEvent.keyDown(selected, { key: "ArrowRight" });
+    const treeItem = commitDiff.querySelector<HTMLElement>("[data-tree-item]")!;
+    expect(treeItem).toHaveFocus();
+    fireEvent.keyDown(treeItem, { key: "Escape" });
+    expect(selected).toHaveFocus();
+    fireEvent.keyDown(selected, { key: "ArrowLeft" });
+    expect(screen.getByRole("button", { name: "Commits" })).toHaveFocus();
+    expect(leaked).not.toHaveBeenCalled();
+    expect(getPullCommitDiff).toHaveBeenCalledOnce();
+    window.removeEventListener("keydown", leaked);
+  });
+
+  it("waits for an already-running selected diff before entering it without another request", async () => {
+    const pending = deferred<PullCommitDiff>();
+    vi.mocked(getPullCommitDiff).mockReturnValueOnce(pending.promise);
+    renderCommits();
+    const selected = await screen.findByRole("button", {
+      name: /Polish commit selection, commit 2222222/,
+    });
+
+    selected.focus();
+    fireEvent.keyDown(selected, { key: "ArrowRight" });
+    expect(getPullCommitDiff).toHaveBeenCalledOnce();
+    await act(async () => {
+      pending.resolve(diff(second));
+      await pending.promise;
+    });
+
+    expect(
+      (
+        await screen.findByRole("region", {
+          name: `Commit diff ${secondSha}`,
+        })
+      ).querySelector("[data-tree-item]"),
+    ).toHaveFocus();
+    expect(getPullCommitDiff).toHaveBeenCalledOnce();
+  });
+
+  it("keeps commit focus safe when pending keyboard entry fails", async () => {
+    const pending = deferred<PullCommitDiff>();
+    vi.mocked(getPullCommitDiff).mockReturnValueOnce(pending.promise);
+    renderCommits();
+    const selected = await screen.findByRole("button", {
+      name: /Polish commit selection, commit 2222222/,
+    });
+
+    selected.focus();
+    fireEvent.keyDown(selected, { key: "ArrowRight" });
+    await act(async () => {
+      pending.reject(new Error("Commit patch unavailable."));
+      await pending.promise.catch(() => undefined);
+    });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Commit patch unavailable.",
+    );
+    expect(selected).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Retry" })).not.toHaveFocus();
+    expect(getPullCommitDiff).toHaveBeenCalledOnce();
+  });
+
+  it("does not let a stale pending diff enter the refreshed pull identity", async () => {
+    const nextHead = "dddddddddddddddddddddddddddddddddddddddd";
+    const nextPull = { ...pull, headRefOid: nextHead };
+    const oldDiff = deferred<PullCommitDiff>();
+    const nextDiff = deferred<PullCommitDiff>();
+    vi.mocked(getPullCommits)
+      .mockResolvedValueOnce(commits())
+      .mockResolvedValueOnce(commits({ headRefOid: nextHead }));
+    vi.mocked(getPullCommitDiff)
+      .mockReturnValueOnce(oldDiff.promise)
+      .mockReturnValueOnce(nextDiff.promise);
+    const view = renderCommits();
+    const oldSelected = await screen.findByRole("button", {
+      name: /Polish commit selection, commit 2222222/,
+    });
+    oldSelected.focus();
+    fireEvent.keyDown(oldSelected, { key: "ArrowRight" });
+
+    view.rerender(commitsView({ pull: nextPull }));
+    const nextSelected = await screen.findByRole("button", {
+      name: /Polish commit selection, commit 2222222/,
+    });
+    nextSelected.focus();
+    await waitFor(() => expect(getPullCommitDiff).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      oldDiff.resolve(diff(second, "src/stale.ts"));
+      await oldDiff.promise;
+    });
+    expect(screen.queryByText("src/stale.ts")).not.toBeInTheDocument();
+    expect(nextSelected).toHaveFocus();
+
+    await act(async () => {
+      nextDiff.resolve({
+        ...diff(second, "src/current.ts"),
+        headRefOid: nextHead,
+      });
+      await nextDiff.promise;
+    });
+    expect(
+      await screen.findByRole("region", { name: `Commit diff ${secondSha}` }),
+    ).toHaveTextContent("src/current.ts");
   });
 
   it("keeps the commit rail visible without visibility controls", async () => {

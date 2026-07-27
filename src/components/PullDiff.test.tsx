@@ -827,7 +827,7 @@ describe("PullDiff", () => {
       behavior: "smooth",
       block: "start",
     });
-    expect(section).toHaveFocus();
+    expect(section!.querySelector("[data-diff-file-header]")).toHaveFocus();
     expect(
       screen.getByRole("checkbox", { name: `Viewed ${second.path}` }),
     ).not.toHaveAttribute("aria-controls");
@@ -1255,7 +1255,9 @@ describe("PullDiff", () => {
     expect(navigation).toHaveAttribute("aria-current", "true");
     expect(navigation).toHaveAttribute("aria-controls");
     expect(
-      document.getElementById(navigation.getAttribute("aria-controls")!),
+      document
+        .getElementById(navigation.getAttribute("aria-controls")!)
+        ?.querySelector("[data-diff-file-header]"),
     ).toHaveFocus();
     expect(checkbox).toBeInTheDocument();
     expect(
@@ -1502,7 +1504,7 @@ describe("PullDiff", () => {
     });
   });
 
-  it("uses roving keyboard navigation and reveals a distant selected file", () => {
+  it("uses roving keyboard navigation and materializes a distant file only when activated", () => {
     const scrollIntoView = vi.fn();
     Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
       configurable: true,
@@ -1529,27 +1531,145 @@ describe("PullDiff", () => {
     first.focus();
     fireEvent.keyDown(first, { key: "ArrowDown" });
     expect(second).toHaveFocus();
-    expect(second).toHaveAttribute("aria-current", "true");
+    expect(first).toHaveAttribute("aria-current", "true");
+    expect(second).not.toHaveAttribute("aria-current");
     expect(buttons.filter((button) => button.tabIndex === 0)).toEqual([second]);
 
     fireEvent.keyDown(second, { key: "End" });
     expect(last).toHaveFocus();
-    expect(last).toHaveAttribute("aria-current", "true");
+    expect(first).toHaveAttribute("aria-current", "true");
+    expect(last).not.toHaveAttribute("aria-current");
     expect(buttons.filter((button) => button.tabIndex === 0)).toEqual([last]);
     expect(
-      screen.getByRole("checkbox", { name: "Viewed src/file-45.ts" }),
-    ).toBeInTheDocument();
+      screen.queryByRole("checkbox", { name: "Viewed src/file-45.ts" }),
+    ).not.toBeInTheDocument();
 
     fireEvent.click(last);
     expect(
-      document.getElementById(last.getAttribute("aria-controls")!),
+      screen.getByRole("checkbox", { name: "Viewed src/file-45.ts" }),
+    ).toBeInTheDocument();
+    expect(
+      document
+        .getElementById(last.getAttribute("aria-controls")!)
+        ?.querySelector("[data-diff-file-header]"),
     ).toHaveFocus();
     last.focus();
     fireEvent.keyDown(last, { key: "Home" });
-    expect(first).toHaveFocus();
+    expect(
+      navigation.querySelector('[data-tree-key="directory:src"]'),
+    ).toHaveFocus();
     second.focus();
     fireEvent.keyDown(second, { key: "ArrowUp" });
     expect(first).toHaveFocus();
+  });
+
+  it("navigates the flattened directory tree and returns through stable keyboard focus contracts", () => {
+    const data = diff({
+      files: [
+        file({ path: "src/z.ts" }),
+        file({ path: "docs/readme.md" }),
+        file({ path: "src/core/a.ts" }),
+      ],
+    });
+    const leaked = vi.fn();
+    window.addEventListener("keydown", leaked);
+    const { container } = render(
+      <div data-pull-identity="appwrite/cloud#101">
+        <button data-pull-focus-token="diff" type="button">
+          Files changed
+        </button>
+        <ControlledPullDiff data={data} />
+      </div>,
+    );
+    const tree = screen.getByRole("tree");
+    const treeItems = () => [
+      ...tree.querySelectorAll<HTMLButtonElement>("button[data-tree-key]"),
+    ];
+    const item = (key: string) =>
+      treeItems().find((candidate) => candidate.dataset.treeKey === key)!;
+
+    expect(treeItems().map(({ dataset }) => dataset.treeKey)).toEqual([
+      "directory:docs",
+      "file:docs/readme.md",
+      "directory:src",
+      "directory:src/core",
+      "file:src/core/a.ts",
+      "file:src/z.ts",
+    ]);
+    expect(treeItems().filter(({ tabIndex }) => tabIndex === 0)).toEqual([
+      item("file:docs/readme.md"),
+    ]);
+
+    item("file:docs/readme.md").focus();
+    fireEvent.keyDown(document.activeElement!, { key: "Home" });
+    expect(item("directory:docs")).toHaveFocus();
+    fireEvent.keyDown(document.activeElement!, { key: "ArrowRight" });
+    expect(item("file:docs/readme.md")).toHaveFocus();
+    fireEvent.keyDown(document.activeElement!, { key: "ArrowLeft" });
+    expect(item("directory:docs")).toHaveFocus();
+    fireEvent.keyDown(document.activeElement!, { key: "ArrowLeft" });
+    expect(item("directory:docs")).toHaveFocus();
+    expect(item("directory:docs").closest('[role="treeitem"]')).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    fireEvent.keyDown(document.activeElement!, { key: "ArrowRight" });
+    expect(item("directory:docs").closest('[role="treeitem"]')).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    fireEvent.keyDown(document.activeElement!, { key: "ArrowRight" });
+    expect(item("file:docs/readme.md")).toHaveFocus();
+
+    fireEvent.keyDown(document.activeElement!, { key: "Enter" });
+    const firstHeader = container.querySelector<HTMLElement>(
+      '[data-diff-file-path="docs/readme.md"] [data-diff-file-header]',
+    )!;
+    expect(firstHeader).toHaveFocus();
+    fireEvent.keyDown(firstHeader, { key: "ArrowLeft" });
+    expect(item("file:docs/readme.md")).toHaveFocus();
+
+    item("file:src/core/a.ts").focus();
+    fireEvent.click(item("directory:src"));
+    expect(item("directory:src")).toHaveFocus();
+    expect(item("file:src/core/a.ts")).toBeUndefined();
+    expect(treeItems().filter(({ tabIndex }) => tabIndex === 0)).toEqual([
+      item("directory:src"),
+    ]);
+
+    fireEvent.keyDown(item("directory:src"), { key: "Escape" });
+    expect(screen.getByRole("button", { name: "Files changed" })).toHaveFocus();
+    expect(leaked).not.toHaveBeenCalled();
+    window.removeEventListener("keydown", leaked);
+  });
+
+  it("enters an already-mounted file header with Right without activating an unmounted file", () => {
+    const files = Array.from({ length: 25 }, (_, index) =>
+      file({ path: `src/file-${index + 1}.ts` }),
+    );
+    renderPullDiff(diff({ files }));
+    const tree = screen.getByRole("tree");
+    const mounted = tree.querySelector<HTMLButtonElement>(
+      'button[data-file-path="src/file-2.ts"]',
+    )!;
+    const distant = tree.querySelector<HTMLButtonElement>(
+      'button[data-file-path="src/file-25.ts"]',
+    )!;
+
+    mounted.focus();
+    fireEvent.keyDown(mounted, { key: "ArrowRight" });
+    expect(
+      document.querySelector(
+        '[data-diff-file-path="src/file-2.ts"] [data-diff-file-header]',
+      ),
+    ).toHaveFocus();
+
+    distant.focus();
+    fireEvent.keyDown(distant, { key: "ArrowRight" });
+    expect(distant).toHaveFocus();
+    expect(
+      screen.queryByRole("checkbox", { name: "Viewed src/file-25.ts" }),
+    ).not.toBeInTheDocument();
   });
 
   it("only emits aria-controls references for mounted elements", () => {

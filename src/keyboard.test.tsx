@@ -224,6 +224,10 @@ describe("dashboardKeyboardCommand", () => {
 describe("keyboardEventBlocked", () => {
   it("blocks handled, composing, modified, repeated, editable, and overlaid events", () => {
     const input = document.createElement("input");
+    const editable = document.createElement("span");
+    editable.setAttribute("contenteditable", "true");
+    const child = document.createElement("span");
+    editable.append(child);
     expect(
       keyboardEventBlocked({
         altKey: false,
@@ -233,6 +237,17 @@ describe("keyboardEventBlocked", () => {
         metaKey: false,
         repeat: false,
         target: input,
+      }),
+    ).toBe(true);
+    expect(
+      keyboardEventBlocked({
+        altKey: false,
+        ctrlKey: false,
+        defaultPrevented: false,
+        isComposing: false,
+        metaKey: false,
+        repeat: false,
+        target: child,
       }),
     ).toBe(true);
     expect(
@@ -272,6 +287,15 @@ describe("keyboardEventBlocked", () => {
         { allowRepeat: true },
       ),
     ).toBe(false);
+
+    const overlay = document.createElement("div");
+    overlay.dataset.slot = "popover-content";
+    overlay.dataset.state = "open";
+    document.body.append(overlay);
+    expect(
+      keyboardEventBlocked(new KeyboardEvent("keydown", { key: "Escape" })),
+    ).toBe(true);
+    overlay.remove();
   });
 });
 
