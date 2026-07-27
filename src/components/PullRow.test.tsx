@@ -2083,7 +2083,7 @@ describe("PullRow progress and blocker presentation", () => {
     });
     const commits = screen.getByRole("button", { name: "Commits" });
 
-    expect(row).toHaveAttribute("tabindex", "0");
+    expect(row).toHaveAttribute("tabindex", "-1");
     expect(row).toHaveAttribute(
       "aria-label",
       `${pull.repository} pull request ${pull.number}: ${pull.title}`,

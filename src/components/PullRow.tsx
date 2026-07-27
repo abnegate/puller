@@ -2218,7 +2218,7 @@ function PullRow({
       onFocusCapture={(event) => captureFocus(event.target)}
       onKeyDown={handleRowKeyDown}
       ref={row}
-      tabIndex={0}
+      tabIndex={-1}
       animate={{ opacity: 1, y: 0 }}
       exit={reducedMotion ? { opacity: 0 } : { opacity: 0, y: -6 }}
       initial={reducedMotion ? false : { opacity: 0, y: 6 }}
