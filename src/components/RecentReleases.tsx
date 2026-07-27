@@ -788,6 +788,8 @@ function ReleaseGroup({
   const handleDisclosureKeyDown = (
     event: ReactKeyboardEvent<HTMLButtonElement>,
   ): void => {
+    if (event.target !== event.currentTarget) return;
+
     const repeated = event.key === "j" || event.key === "k";
     if (
       keyboardEventBlocked(event.nativeEvent, document, {
@@ -813,11 +815,11 @@ function ReleaseGroup({
     event.preventDefault();
     event.stopPropagation();
 
-    if (
-      event.key === " " ||
-      event.key === "ArrowRight" ||
-      event.key === "Enter"
-    ) {
+    if (event.key === " " || event.key === "Enter") {
+      onOpenChange(identity, !open);
+      return;
+    }
+    if (event.key === "ArrowRight") {
       onOpenChange(identity, true);
       return;
     }

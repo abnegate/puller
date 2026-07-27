@@ -912,6 +912,61 @@ describe("RecentReleases", () => {
     expect(api.streamBatch).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["Enter", "Enter"],
+    ["Space", " "],
+  ])(
+    "toggles a release disclosure with %s without starting verification",
+    async (_label, key) => {
+      render(
+        <RecentReleases
+          data={response([release("one")])}
+          error={null}
+          loading={false}
+          onRefresh={vi.fn()}
+        />,
+      );
+
+      act(() => requestReleaseFocus(1));
+      const disclosure = await screen.findByRole("button", {
+        name: "Show 1 pull request in v1.2.3",
+      });
+      expect(document.activeElement).toBe(disclosure);
+
+      fireEvent.keyDown(disclosure, { key });
+      expect(disclosure).toHaveAttribute("aria-expanded", "true");
+      expect(document.activeElement).toBe(disclosure);
+
+      fireEvent.keyDown(disclosure, { key });
+      expect(disclosure).toHaveAttribute("aria-expanded", "false");
+      expect(document.activeElement).toBe(disclosure);
+      expect(api.stream).not.toHaveBeenCalled();
+      expect(api.streamBatch).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not intercept release disclosure shortcuts from nested targets", () => {
+    render(
+      <RecentReleases
+        data={response([release("one")])}
+        error={null}
+        loading={false}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    const disclosure = screen.getByRole("button", {
+      name: "Show 1 pull request in v1.2.3",
+    });
+    const icon = disclosure.querySelector("svg");
+    expect(icon).not.toBeNull();
+
+    fireEvent.keyDown(icon!, { key: "Enter" });
+    expect(disclosure).toHaveAttribute("aria-expanded", "false");
+    expect(api.stream).not.toHaveBeenCalled();
+    expect(api.streamBatch).not.toHaveBeenCalled();
+  });
+
   it("traverses release disclosures across pages and retains open state", async () => {
     render(
       <RecentReleases
