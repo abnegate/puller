@@ -358,76 +358,65 @@ describe("usePullRuns", () => {
     ).toEqual(["codex", "claude"]);
   });
 
-  it.each([
-    { expected: "", instructions: "", label: "empty" },
-    { expected: "", instructions: "  \n\t ", label: "whitespace-only" },
-    {
-      expected: "Resolve every blocker.",
-      instructions: "  Resolve every blocker.  \n",
-      label: "custom",
-    },
-  ])(
-    "sends trimmed $label instructions through the normal stream lifecycle",
-    async ({ expected, instructions }) => {
-      const [pull] = pulls();
-      fixes.stream.mockImplementation(async function* (
-        request: ClaudeRunRequest,
-      ) {
-        yield {
-          number: request.number,
-          repository: request.repository,
-          runId: "run-instructions",
-          type: "start",
-        } satisfies ClaudeRunEvent;
-        yield { text: "Working.", type: "text" } satisfies ClaudeRunEvent;
-        yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
-      });
-      const view = renderPullRuns([pull]);
-      act(() => view.result.current.setMessage(pull.url, instructions));
+  it("sends shepherd-bar instructions for every manual run", async () => {
+    const [pull] = pulls();
+    fixes.stream.mockImplementation(async function* (
+      request: ClaudeRunRequest,
+    ) {
+      yield {
+        number: request.number,
+        repository: request.repository,
+        runId: "run-instructions",
+        type: "start",
+      } satisfies ClaudeRunEvent;
+      yield { text: "Working.", type: "text" } satisfies ClaudeRunEvent;
+      yield { exitCode: 0, type: "complete" } satisfies ClaudeRunEvent;
+    });
+    const view = renderPullRuns([pull]);
+    act(() =>
+      view.result.current.setMessage(pull.url, "  Resolve every blocker.  \n"),
+    );
 
-      await act(async () => {
-        await finishRun(view.result.current.start(pull));
-      });
+    await act(async () => {
+      await finishRun(view.result.current.start(pull));
+    });
 
-      expect(fixes.stream).toHaveBeenCalledWith(
-        {
-          agent: "claude",
-          expectedHeadRefOid: pull.headRefOid,
-          message: expected,
-          number: pull.number,
-          repository: pull.repository,
-          source: "manual",
-        },
-        expect.any(AbortSignal),
-      );
-      expect(view.result.current.states.get(pull.url)).toMatchObject({
+    expect(fixes.stream).toHaveBeenCalledWith(
+      {
+        agent: "claude",
+        expectedHeadRefOid: pull.headRefOid,
         message: "",
-        output: "",
-        status: "idle",
-      });
-      const [history] = view.result.current.states.get(pull.url)?.history ?? [];
-      expect(history).toMatchObject({
-        headRefOid: pull.headRefOid,
-        id: "run-instructions",
-        instructions: {
-          kind: "manual",
-          text: expected || DEFAULT_FIX_INSTRUCTIONS,
-        },
+        number: pull.number,
+        repository: pull.repository,
         source: "manual",
-        status: "completed",
-      });
-      if (!history) throw new Error("Run history was not archived.");
-      await expect(view.result.current.loadTranscript(history)).resolves.toBe(
-        "Working.",
-      );
-      expect(Object.isFrozen(history)).toBe(true);
-      expect(
-        Object.isFrozen(
-          view.result.current.states.get(pull.url)?.history ?? [],
-        ),
-      ).toBe(true);
-    },
-  );
+      },
+      expect.any(AbortSignal),
+    );
+    expect(view.result.current.states.get(pull.url)).toMatchObject({
+      message: "",
+      output: "",
+      status: "idle",
+    });
+    const [history] = view.result.current.states.get(pull.url)?.history ?? [];
+    expect(history).toMatchObject({
+      headRefOid: pull.headRefOid,
+      id: "run-instructions",
+      instructions: {
+        kind: "manual",
+        text: DEFAULT_FIX_INSTRUCTIONS,
+      },
+      source: "manual",
+      status: "completed",
+    });
+    if (!history) throw new Error("Run history was not archived.");
+    await expect(view.result.current.loadTranscript(history)).resolves.toBe(
+      "Working.",
+    );
+    expect(Object.isFrozen(history)).toBe(true);
+    expect(
+      Object.isFrozen(view.result.current.states.get(pull.url)?.history ?? []),
+    ).toBe(true);
+  });
 
   it("keeps a rate-limit failure on the idle run after the transcript is archived", async () => {
     const [pull] = pulls();
@@ -1198,7 +1187,7 @@ describe("usePullRuns", () => {
         id: "successive-1",
         instructions: {
           kind: "manual",
-          text: "First instructions.",
+          text: DEFAULT_FIX_INSTRUCTIONS,
         },
       }),
     ]);
@@ -1223,14 +1212,14 @@ describe("usePullRuns", () => {
         id: "successive-2",
         instructions: {
           kind: "manual",
-          text: "Second instructions.",
+          text: DEFAULT_FIX_INSTRUCTIONS,
         },
       }),
       expect.objectContaining({
         id: "successive-1",
         instructions: {
           kind: "manual",
-          text: "First instructions.",
+          text: DEFAULT_FIX_INSTRUCTIONS,
         },
       }),
     ]);

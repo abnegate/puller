@@ -45,7 +45,6 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { Separator } from "@/components/ui/separator";
-import { Textarea } from "@/components/ui/textarea";
 
 import { agentLabel, alternateAgent, useAgentPreference } from "../agent";
 import { getPullDiff, mergePull, PullDiffHttpError } from "../api";
@@ -54,7 +53,7 @@ import {
   type ToggleViewedFile,
   type ViewedFiles,
 } from "../diffs";
-import { DEFAULT_FIX_INSTRUCTIONS, DEFAULT_FIX_PLACEHOLDER } from "../fixes";
+import { DEFAULT_FIX_INSTRUCTIONS } from "../fixes";
 import { keyboardEventBlocked } from "../keyboard";
 import type { PullMovement } from "../movements";
 import { getPullKey, type PullKey } from "../preferences";
@@ -102,7 +101,6 @@ type PullRowProps = {
   revealFocusedPull?: (key: PullKey) => boolean;
   run: RunState;
   setFavorite?: (key: PullKey, favorite: boolean) => void;
-  setRunMessage: PullRuns["setMessage"];
   startRun: PullRuns["start"];
   variant: "ready" | "progress" | "blocked";
   viewerLogin: string | null;
@@ -910,24 +908,8 @@ function FixPanel({
   cancelRun,
   pull,
   run,
-  setRunMessage,
   startRun,
-}: Omit<
-  PullRowProps,
-  | "artifactEpoch"
-  | "agent"
-  | "clearReviewRetry"
-  | "favorite"
-  | "hidePull"
-  | "loadTranscript"
-  | "onMutationComplete"
-  | "onToggleViewed"
-  | "setFavorite"
-  | "variant"
-  | "viewerLogin"
-  | "viewedFiles"
->) {
-  const inputId = useId();
+}: Pick<PullRowProps, "cancelRun" | "pull" | "run" | "startRun">) {
   const active = isRunActive(run);
   const { agent: preferredAgent, setAgent } = useAgentPreference();
 
@@ -940,61 +922,37 @@ function FixPanel({
           rateLimit={run.rateLimit}
         />
       )}
-      <form
-        className="grid gap-2"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void startRun(pull);
-        }}
-      >
-        <label
-          className="text-sm font-medium text-foreground"
-          htmlFor={inputId}
-        >
-          Fix instructions for {pull.repository} #{pull.number}
-          <span
-            aria-hidden="true"
-            className="ml-1 font-normal text-muted-foreground"
-          >
-            (optional)
-          </span>
-        </label>
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-start">
-          <Textarea
-            className="field-sizing-content min-h-11 max-h-32 resize-none overflow-y-auto sm:min-h-8 sm:py-1 sm:text-sm"
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <p className="m-0 text-xs leading-relaxed text-muted-foreground">
+          Run fix drives this pull request to the shepherd bar. Select lines in
+          Files changed to give specific instructions.
+        </p>
+        <div className="flex shrink-0 gap-2">
+          <Button
+            className="min-h-11 flex-1 sm:min-h-8 sm:flex-none"
             disabled={active}
-            id={inputId}
-            onChange={(event) => setRunMessage(pull.url, event.target.value)}
-            placeholder={DEFAULT_FIX_PLACEHOLDER}
-            rows={1}
-            value={run.message}
-          />
-          <div className="flex shrink-0 gap-2">
+            onClick={() => void startRun(pull)}
+            type="button"
+          >
+            {active && (
+              <LoaderCircle aria-hidden="true" className="animate-spin" />
+            )}
+            {isRunPreparing(run) ? "Preparing review fix" : "Run fix"}
+          </Button>
+          {active && (
             <Button
               className="min-h-11 flex-1 sm:min-h-8 sm:flex-none"
-              disabled={active}
-              type="submit"
+              disabled={run.cancelling}
+              onClick={() => void cancelRun(pull.url)}
+              type="button"
+              variant="outline"
             >
-              {active && (
-                <LoaderCircle aria-hidden="true" className="animate-spin" />
-              )}
-              {isRunPreparing(run) ? "Preparing review fix" : "Run fix"}
+              <X aria-hidden="true" />
+              {run.cancelling ? "Cancelling" : "Cancel"}
             </Button>
-            {active && (
-              <Button
-                className="min-h-11 flex-1 sm:min-h-8 sm:flex-none"
-                disabled={run.cancelling}
-                onClick={() => void cancelRun(pull.url)}
-                type="button"
-                variant="outline"
-              >
-                <X aria-hidden="true" />
-                {run.cancelling ? "Cancelling" : "Cancel"}
-              </Button>
-            )}
-          </div>
+          )}
         </div>
-      </form>
+      </div>
 
       <RunOutput pull={pull} run={run} />
     </div>
@@ -1770,7 +1728,6 @@ function PullRow({
   revealFocusedPull,
   run,
   setFavorite,
-  setRunMessage,
   startRun,
   variant,
   viewerLogin,
@@ -2412,7 +2369,6 @@ function PullRow({
               cancelRun={cancelRun}
               pull={pull}
               run={run}
-              setRunMessage={setRunMessage}
               startRun={startRun}
             />
             <PreviousFixes

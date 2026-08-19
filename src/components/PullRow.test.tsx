@@ -264,7 +264,6 @@ function ControlledRow({
         pull={pull}
         run={run}
         setFavorite={setFavorite}
-        setRunMessage={controls.setMessage}
         startRun={controls.start}
         variant={variant}
         viewerLogin={viewerLogin}
@@ -1180,40 +1179,25 @@ describe("PullRow ready presentation", () => {
 });
 
 describe("PullRow controlled Fix presentation", () => {
-  it("runs the default fix with empty instructions and delegates controlled actions", () => {
+  it("runs a shepherd-bar fix without a free-text composer", () => {
     const pull = getBlockedPull();
     const controls = createControls();
     const view = renderRow(pull, "blocked", createRun(), controls);
-    const input = screen.getByRole("textbox", {
-      name: `Fix instructions for ${pull.repository} #${pull.number}`,
-    });
     const start = screen.getByRole("button", { name: "Run fix" });
 
-    expect(input).toHaveValue("");
-    expect(screen.getByText("(optional)")).toBeInTheDocument();
-    expect(input).toHaveAttribute(
-      "placeholder",
-      "Leave blank to drive this pull request to the shepherd bar.",
-    );
+    expect(
+      screen.getByText(
+        "Run fix drives this pull request to the shepherd bar. Select lines in Files changed to give specific instructions.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
     expect(start).toBeEnabled();
     fireEvent.click(start);
     expect(controls.start).toHaveBeenCalledWith(pull);
 
-    fireEvent.change(input, { target: { value: "Resolve every blocker." } });
-    expect(controls.setMessage).toHaveBeenCalledWith(
-      pull.url,
-      "Resolve every blocker.",
-    );
-
     view.rerender(
-      row(
-        pull,
-        "progress",
-        createRun({ message: "Resolve every blocker.", status: "running" }),
-        controls,
-      ),
+      row(pull, "progress", createRun({ status: "running" }), controls),
     );
-    expect(screen.getByRole("textbox")).toBeDisabled();
     expect(screen.getByRole("button", { name: "Run fix" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(controls.cancel).toHaveBeenCalledWith(pull.url);
@@ -1248,18 +1232,8 @@ describe("PullRow controlled Fix presentation", () => {
 
   it("keeps compact desktop controls and 44px mobile targets", () => {
     renderRow(getBlockedPull(), "blocked");
-    const input = screen.getByRole("textbox");
     const start = screen.getByRole("button", { name: "Run fix" });
 
-    expect(input).toHaveAttribute("rows", "1");
-    expect(input).toHaveClass(
-      "field-sizing-content",
-      "min-h-11",
-      "max-h-32",
-      "resize-none",
-      "overflow-y-auto",
-      "sm:min-h-8",
-    );
     expect(start).toHaveClass("min-h-11", "sm:min-h-8");
   });
 });
@@ -1494,7 +1468,7 @@ describe("PullRow previous fixes", () => {
     ["progress", createPendingPull],
     ["blocked", getBlockedPull],
   ] as const)(
-    "keeps %s history below the fresh composer and outside row action boundaries",
+    "keeps %s history below Run fix and outside row action boundaries",
     (variant, getPull) => {
       const pull = getPull();
       const { container } = render(
@@ -1513,13 +1487,13 @@ describe("PullRow previous fixes", () => {
       const controls = container.querySelector<HTMLElement>(
         "[data-pull-controls]",
       );
-      const input = screen.getByRole("textbox");
+      const start = screen.getByRole("button", { name: "Run fix" });
       const history = screen.getByRole("button", { name: /Previous fixes/ });
 
       expect(actionBoundary).not.toContainElement(history);
       expect(controls).not.toContainElement(history);
       expect(
-        input.compareDocumentPosition(history) &
+        start.compareDocumentPosition(history) &
           Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy();
       fireEvent.contextMenu(history);
@@ -1677,7 +1651,7 @@ describe("PullRow progress and blocker presentation", () => {
     const details = screen.getByRole("button", {
       name: "Show blocker details",
     });
-    const input = screen.getByRole("textbox");
+    const start = screen.getByRole("button", { name: "Run fix" });
     const terminal = screen.getByRole("log");
     const files = screen.getByRole("button", { name: "Files changed" });
     const commits = screen.getByRole("button", { name: "Commits" });
@@ -1686,13 +1660,13 @@ describe("PullRow progress and blocker presentation", () => {
     expect(trigger).not.toContainElement(details);
     expect(trigger).not.toContainElement(commits);
     expect(trigger).not.toContainElement(files);
-    expect(trigger).not.toContainElement(input);
+    expect(trigger).not.toContainElement(start);
     expect(trigger).not.toContainElement(terminal);
 
     fireEvent.contextMenu(commits);
     fireEvent.contextMenu(files);
     fireEvent.contextMenu(details);
-    fireEvent.contextMenu(input);
+    fireEvent.contextMenu(start);
     fireEvent.contextMenu(terminal);
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
 
@@ -1832,7 +1806,6 @@ describe("PullRow progress and blocker presentation", () => {
     expect(
       screen.getByRole("button", { name: "Show blocker details" }),
     ).toBeEnabled();
-    expect(screen.getByRole("textbox")).toBeEnabled();
     expect(screen.getByRole("button", { name: "Run fix" })).toBeEnabled();
     expect(getPullDiff).toHaveBeenCalledTimes(2);
   });
@@ -3097,7 +3070,7 @@ describe("ReadinessSection controlled reparenting", () => {
         />
       </>,
     );
-    expect(screen.getByRole("textbox")).toHaveValue("Keep this draft.");
+    expect(screen.getByRole("button", { name: "Run fix" })).toBeEnabled();
 
     const running = createRuns(
       new Map([
@@ -3135,7 +3108,6 @@ describe("ReadinessSection controlled reparenting", () => {
       </>,
     );
 
-    expect(screen.getByRole("textbox")).toHaveValue("Keep this draft.");
     expect(screen.getByRole("log")).toHaveTextContent(
       "Streaming after reparent.",
     );

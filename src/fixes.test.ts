@@ -5,7 +5,6 @@ import {
   cancelClaudeRun,
   ClaudeRunHttpError,
   DEFAULT_FIX_INSTRUCTIONS,
-  DEFAULT_FIX_PLACEHOLDER,
   resetActionTokenForTests,
   streamAgentRun,
   streamClaudeRun,
@@ -55,9 +54,6 @@ describe("default fix instructions", () => {
       "The target is the shepherd bar.",
     );
     expect(DEFAULT_FIX_INSTRUCTIONS).toContain("Do not merge.");
-    expect(DEFAULT_FIX_PLACEHOLDER).toBe(
-      "Leave blank to drive this pull request to the shepherd bar.",
-    );
   });
 });
 

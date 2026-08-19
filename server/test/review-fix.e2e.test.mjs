@@ -378,7 +378,6 @@ function Harness({ pullRequest, transcriptStore }) {
           onToggleViewed: () => undefined,
           pull: pullRequest,
           run,
-          setRunMessage: runs.setMessage,
           startRun: runs.start,
           variant,
           viewerLogin: "viewer",

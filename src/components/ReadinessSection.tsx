@@ -245,7 +245,6 @@ function ReadinessSection({
                     revealFocusedPull={revealFocusedPull}
                     run={runs.states.get(item.pull.url) ?? IDLE_RUN_STATE}
                     setFavorite={rowSetFavorite}
-                    setRunMessage={runs.setMessage}
                     startRun={runs.start}
                     variant={variant}
                     viewerLogin={viewerLogin}

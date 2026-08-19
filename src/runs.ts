@@ -858,9 +858,7 @@ export function usePullRuns(
         };
       }
       const label = agentLabel(selectedAgent);
-      const message = (
-        options.message ?? (source === "manual" ? state.message : "")
-      ).trim();
+      const message = (options.message ?? "").trim();
       if (isRunActive(state)) {
         const runtime = runtimesRef.current.get(key);
         const requested =

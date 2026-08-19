@@ -24,7 +24,11 @@ import {
   getReleasePipelines,
   getReleasePreview,
 } from "./api";
-import type { ClaudeRunEvent, ClaudeRunRequest } from "./fixes";
+import {
+  DEFAULT_FIX_INSTRUCTIONS,
+  type ClaudeRunEvent,
+  type ClaudeRunRequest,
+} from "./fixes";
 import { RELEASE_FOCUS_REQUEST } from "./keyboard";
 import { getPullKey } from "./preferences";
 import {
@@ -2591,13 +2595,6 @@ describe("App", () => {
     render(<App runTranscriptStore={createMemoryRunTranscriptStore()} />);
 
     await screen.findByRole("heading", { name: "Not ready" });
-    const prompt = "Resolve every unresolved review thread.";
-    fireEvent.change(
-      within(getSection("Not ready")).getByRole("textbox", {
-        name: `Fix instructions for ${blocked.repository} #${blocked.number}`,
-      }),
-      { target: { value: prompt } },
-    );
     fireEvent.click(
       within(getSection("Not ready")).getByRole("button", { name: "Run fix" }),
     );
@@ -2607,10 +2604,8 @@ describe("App", () => {
     ).toBeInTheDocument();
     expect(getSignal()?.aborted).toBe(false);
     expect(
-      within(getSection("In progress")).getByRole("textbox", {
-        name: `Fix instructions for ${blocked.repository} #${blocked.number}`,
-      }),
-    ).toHaveValue(prompt);
+      within(getSection("In progress")).queryByRole("textbox"),
+    ).not.toBeInTheDocument();
     expect(
       within(getSection("In progress")).getByRole("log"),
     ).toHaveTextContent("Working on the pull request.");
@@ -2629,10 +2624,8 @@ describe("App", () => {
     const completedSection = getSection("Not ready");
     expect(within(completedSection).queryByRole("log")).not.toBeInTheDocument();
     expect(
-      within(completedSection).getByRole("textbox", {
-        name: `Fix instructions for ${blocked.repository} #${blocked.number}`,
-      }),
-    ).toHaveValue("");
+      within(completedSection).queryByRole("textbox"),
+    ).not.toBeInTheDocument();
     expect(
       within(completedSection).getByRole("button", { name: "Run fix" }),
     ).toBeEnabled();
@@ -2648,7 +2641,9 @@ describe("App", () => {
       name: `Previous fixes for ${blocked.repository} pull request ${blocked.number}`,
     });
     expect(within(history).getByText("Completed")).toBeInTheDocument();
-    expect(within(history).getByText(prompt)).toBeInTheDocument();
+    expect(
+      within(history).getByText(DEFAULT_FIX_INSTRUCTIONS),
+    ).toBeInTheDocument();
     fireEvent.click(
       within(history).getByRole("button", { name: /Show transcript/ }),
     );
@@ -2915,9 +2910,6 @@ describe("App", () => {
     expect(
       within(getSection("In progress")).getByText(pending.title),
     ).toBeInTheDocument();
-    fireEvent.change(within(getSection("In progress")).getByRole("textbox"), {
-      target: { value: "Prepare the pull while CI finishes." },
-    });
     fireEvent.click(
       within(getSection("In progress")).getByRole("button", {
         name: "Run fix",
@@ -2932,11 +2924,7 @@ describe("App", () => {
       within(getSection("Not ready")).queryByText(pending.title),
     ).not.toBeInTheDocument();
     expect(within(progress).queryByRole("log")).not.toBeInTheDocument();
-    expect(
-      within(progress).getByRole("textbox", {
-        name: `Fix instructions for ${pending.repository} #${pending.number}`,
-      }),
-    ).toHaveValue("");
+    expect(within(progress).queryByRole("textbox")).not.toBeInTheDocument();
     expect(
       within(progress).getByRole("button", { name: "Run fix" }),
     ).toBeEnabled();
@@ -2981,9 +2969,6 @@ describe("App", () => {
     render(<App runTranscriptStore={createMemoryRunTranscriptStore()} />);
 
     await screen.findByText(blocked.title);
-    fireEvent.change(within(getSection("Not ready")).getByRole("textbox"), {
-      target: { value: "Finish the readiness work." },
-    });
     fireEvent.click(
       within(getSection("Not ready")).getByRole("button", { name: "Run fix" }),
     );
@@ -3055,10 +3040,6 @@ describe("App", () => {
     render(<App runTranscriptStore={createMemoryRunTranscriptStore()} />);
 
     await screen.findByText(blocked.title);
-    const prompt = "Keep this run attached by pull URL.";
-    fireEvent.change(within(getSection("Not ready")).getByRole("textbox"), {
-      target: { value: prompt },
-    });
     fireEvent.click(
       within(getSection("Not ready")).getByRole("button", { name: "Run fix" }),
     );
@@ -3070,9 +3051,9 @@ describe("App", () => {
       await within(getSection("In progress")).findByText(changed.title),
     ).toBeInTheDocument();
     expect(getSignal()?.aborted).toBe(false);
-    expect(within(getSection("In progress")).getByRole("textbox")).toHaveValue(
-      prompt,
-    );
+    expect(
+      within(getSection("In progress")).queryByRole("textbox"),
+    ).not.toBeInTheDocument();
     expect(
       within(getSection("In progress")).getByRole("log"),
     ).toHaveTextContent("Head work persists.");
@@ -3091,10 +3072,8 @@ describe("App", () => {
     const completedSection = getSection("Not ready");
     expect(within(completedSection).queryByRole("log")).not.toBeInTheDocument();
     expect(
-      within(completedSection).getByRole("textbox", {
-        name: `Fix instructions for ${changed.repository} #${changed.number}`,
-      }),
-    ).toHaveValue("");
+      within(completedSection).queryByRole("textbox"),
+    ).not.toBeInTheDocument();
     const historyTrigger = within(completedSection).getByRole("button", {
       name: /Previous fixes/,
     });
@@ -3105,7 +3084,9 @@ describe("App", () => {
     const history = within(completedSection).getByRole("region", {
       name: `Previous fixes for ${changed.repository} pull request ${changed.number}`,
     });
-    expect(within(history).getByText(prompt)).toBeInTheDocument();
+    expect(
+      within(history).getByText(DEFAULT_FIX_INSTRUCTIONS),
+    ).toBeInTheDocument();
     fireEvent.click(
       within(history).getByRole("button", { name: /Show transcript/ }),
     );
@@ -3144,9 +3125,6 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByText(blocked.title);
-    fireEvent.change(within(getSection("Not ready")).getByRole("textbox"), {
-      target: { value: "This prompt must be purged too." },
-    });
     fireEvent.click(
       within(getSection("Not ready")).getByRole("button", { name: "Run fix" }),
     );
@@ -3173,9 +3151,9 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
 
     expect(await screen.findByText(blocked.title)).toBeInTheDocument();
-    expect(within(getSection("Not ready")).getByRole("textbox")).toHaveValue(
-      "",
-    );
+    expect(
+      within(getSection("Not ready")).queryByRole("textbox"),
+    ).not.toBeInTheDocument();
     expect(
       within(getSection("Not ready")).queryByRole("log"),
     ).not.toBeInTheDocument();
@@ -3201,10 +3179,6 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByText(blocked.title);
-    const prompt = "Keep this prompt after refresh failure.";
-    fireEvent.change(within(getSection("Not ready")).getByRole("textbox"), {
-      target: { value: prompt },
-    });
     fireEvent.click(
       within(getSection("Not ready")).getByRole("button", { name: "Run fix" }),
     );
@@ -3216,9 +3190,9 @@ describe("App", () => {
       await screen.findByText(/Refresh failed: temporary refresh failure/),
     ).toBeInTheDocument();
     expect(getSignal()?.aborted).toBe(false);
-    expect(within(getSection("In progress")).getByRole("textbox")).toHaveValue(
-      prompt,
-    );
+    expect(
+      within(getSection("In progress")).queryByRole("textbox"),
+    ).not.toBeInTheDocument();
     expect(
       within(getSection("In progress")).getByRole("log"),
     ).toHaveTextContent("Keep this output after refresh failure.");
@@ -3234,7 +3208,6 @@ describe("App", () => {
 
   it("retains an active run through a partial omission until a complete snapshot removes it", async () => {
     const blocked = createPullsResponse().notReady[0]!;
-    const prompt = "Keep this active run through incomplete snapshots.";
     const partial = {
       ...responseWith([], []),
       partial: true,
@@ -3267,9 +3240,6 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByText(blocked.title);
-    fireEvent.change(within(getSection("Not ready")).getByRole("textbox"), {
-      target: { value: prompt },
-    });
     fireEvent.click(
       within(getSection("Not ready")).getByRole("button", { name: "Run fix" }),
     );
@@ -3284,9 +3254,9 @@ describe("App", () => {
     ).toBeInTheDocument();
     expect(streamSignal?.aborted).toBe(false);
     expect(fixes.cancel).not.toHaveBeenCalled();
-    expect(within(getSection("In progress")).getByRole("textbox")).toHaveValue(
-      prompt,
-    );
+    expect(
+      within(getSection("In progress")).queryByRole("textbox"),
+    ).not.toBeInTheDocument();
     expect(
       within(getSection("In progress")).getByRole("log"),
     ).toHaveTextContent("State retained across partial data.");
@@ -3312,9 +3282,9 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
 
     expect(await screen.findByText(blocked.title)).toBeInTheDocument();
-    expect(within(getSection("Not ready")).getByRole("textbox")).toHaveValue(
-      "",
-    );
+    expect(
+      within(getSection("Not ready")).queryByRole("textbox"),
+    ).not.toBeInTheDocument();
     expect(
       within(getSection("Not ready")).queryByRole("log"),
     ).not.toBeInTheDocument();
@@ -3352,9 +3322,6 @@ describe("App", () => {
     const view = render(<App />);
 
     await screen.findByText(blocked.title);
-    fireEvent.change(within(getSection("Not ready")).getByRole("textbox"), {
-      target: { value: "Keep this prompt through stale data." },
-    });
     fireEvent.click(
       within(getSection("Not ready")).getByRole("button", { name: "Run fix" }),
     );
@@ -3366,9 +3333,9 @@ describe("App", () => {
     ).toBeInTheDocument();
     expect(streamSignal?.aborted).toBe(false);
     expect(fixes.cancel).not.toHaveBeenCalled();
-    expect(within(getSection("In progress")).getByRole("textbox")).toHaveValue(
-      "Keep this prompt through stale data.",
-    );
+    expect(
+      within(getSection("In progress")).queryByRole("textbox"),
+    ).not.toBeInTheDocument();
     expect(
       within(getSection("In progress")).getByRole("log"),
     ).toHaveTextContent("State retained across stale data.");

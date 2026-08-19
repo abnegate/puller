@@ -65,7 +65,7 @@ Click a diff line to give the selected agent one-shot fix instructions, or shift
 
 ## Fix with Claude Code or Codex
 
-Every agent-launching action has a Claude Code/Codex selector. The choice is captured when the action starts and remains attached to that run, including manual Fix, Auto, diff feedback, New Task, Verify, Verify all, and conflict repair. Each non-ready row has Fix instructions and streamed terminal output. Starting a Fix moves the row to **In progress** while preserving its prompt, agent, and output across background refreshes. Cancel, browser disconnect, or server shutdown terminates the spawned process group.
+Every agent-launching action has a Claude Code/Codex selector. The choice is captured when the action starts and remains attached to that run, including manual Fix, Auto, diff feedback, New Task, Verify, Verify all, and conflict repair. Each non-ready row has **Run fix**, which always targets the shepherd bar, and streamed terminal output. Comment on specific diff lines to give narrower review-fix instructions. Starting a Fix moves the row to **In progress** while preserving its agent and output across background refreshes. Cancel, browser disconnect, or server shutdown terminates the spawned process group.
 
 **Auto** watches the canonical open-pull snapshot for new or edited issue comments, new unresolved review comments, new CI failure sequences, and a current-head Greptile review below `5/5`. Enabling it first records a baseline, so existing blockers are not dispatched as new work. Later matching evidence starts a context-rich Auto fix and moves that pull request to **In progress**; hidden pull requests remain watched.
 
