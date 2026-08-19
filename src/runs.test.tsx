@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ClaudeRunHttpError,
+  DEFAULT_FIX_INSTRUCTIONS,
   type AgentRunRequest,
   type AutoTrigger,
   type ClaudeRunEvent,
@@ -410,7 +411,7 @@ describe("usePullRuns", () => {
         id: "run-instructions",
         instructions: {
           kind: "manual",
-          text: expected || "Fix every current readiness blocker.",
+          text: expected || DEFAULT_FIX_INSTRUCTIONS,
         },
         source: "manual",
         status: "completed",

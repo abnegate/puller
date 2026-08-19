@@ -4,6 +4,8 @@ import {
   cancelAgentRun,
   cancelClaudeRun,
   ClaudeRunHttpError,
+  DEFAULT_FIX_INSTRUCTIONS,
+  DEFAULT_FIX_PLACEHOLDER,
   resetActionTokenForTests,
   streamAgentRun,
   streamClaudeRun,
@@ -45,6 +47,18 @@ const request = {
 afterEach(() => {
   resetActionTokenForTests();
   vi.unstubAllGlobals();
+});
+
+describe("default fix instructions", () => {
+  it("names the shepherd bar as the blank-run target", () => {
+    expect(DEFAULT_FIX_INSTRUCTIONS).toContain(
+      "The target is the shepherd bar.",
+    );
+    expect(DEFAULT_FIX_INSTRUCTIONS).toContain("Do not merge.");
+    expect(DEFAULT_FIX_PLACEHOLDER).toBe(
+      "Leave blank to drive this pull request to the shepherd bar.",
+    );
+  });
 });
 
 describe("streamClaudeRun", () => {

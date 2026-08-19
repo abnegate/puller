@@ -8,6 +8,7 @@ import {
   streamAgentRun,
   type AgentRunEvent,
   type AgentRunRequest,
+  DEFAULT_FIX_INSTRUCTIONS,
   type AutoParallelism,
   type AutoTrigger,
   type ReviewFeedback,
@@ -529,7 +530,7 @@ const effectiveInstructions = (
 
   return Object.freeze({
     kind: "manual",
-    text: message || "Fix every current readiness blocker.",
+    text: message || DEFAULT_FIX_INSTRUCTIONS,
   });
 };
 

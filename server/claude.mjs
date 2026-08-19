@@ -673,7 +673,7 @@ function autoTriggerFingerprint(trigger) {
 }
 
 const DEFAULT_FIX_INSTRUCTIONS =
-  "Make the local code changes and run the local validation needed for this pull request to satisfy these target outcomes after the normal CI, review, and sync workflows run: all CI checks pass; no review comments remain unaddressed and no review threads remain unresolved; Greptile reports 5/5 confidence for the current head commit; and no merge conflicts remain. Address the local cause of each evidence item, but do not claim that remote checks, comments, review threads, Greptile evidence, or conflict state changed. Merge conflicts are handled by Puller's dedicated merge/conflict-repair flow; do not use Git or attempt remote state changes.";
+  "The target is the shepherd bar. Make the local code changes and run the local validation needed for this pull request to satisfy these target outcomes after the normal CI, review, and sync workflows run: all CI checks pass; no review comments remain unaddressed and no review threads remain unresolved; Greptile reports 5/5 confidence for the current head commit; and no merge conflicts remain. Do not merge. Address the local cause of each evidence item, but do not claim that remote checks, comments, review threads, Greptile evidence, or conflict state changed. Merge conflicts are handled by Puller's dedicated merge/conflict-repair flow; do not use Git or attempt remote state changes.";
 const BODY_TRUNCATION_MARKER =
   "\n[body truncated to fit the local Claude prompt limit]";
 

@@ -1190,7 +1190,7 @@ describe("PullRow controlled Fix presentation", () => {
     expect(screen.getByText("(optional)")).toBeInTheDocument();
     expect(input).toHaveAttribute(
       "placeholder",
-      "Leave blank to fix every readiness blocker.",
+      "Leave blank to drive this pull request to the shepherd bar.",
     );
     expect(start).toBeEnabled();
     fireEvent.click(start);
@@ -1384,9 +1384,7 @@ describe("PullRow previous fixes", () => {
     expect(
       within(entries[1] as HTMLElement).getByText("Cancelled"),
     ).toBeInTheDocument();
-    expect(entries[1]).toHaveTextContent(
-      "Fix every current readiness blocker.",
-    );
+    expect(entries[1]).toHaveTextContent("The target is the shepherd bar.");
     expect(
       transcripts.get(
         older.transcript.availability === "available"

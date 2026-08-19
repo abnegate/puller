@@ -638,6 +638,7 @@ describe("Claude Code request and parser", () => {
     expect(blank).toContain(
       "Default instructions (used because no custom instructions were provided)",
     );
+    expect(blank).toContain("The target is the shepherd bar.");
     expect(blank).toContain(
       "Make the local code changes and run the local validation needed",
     );
@@ -651,6 +652,7 @@ describe("Claude Code request and parser", () => {
       "Greptile reports 5/5 confidence for the current head commit",
     );
     expect(blank).toContain("no merge conflicts remain");
+    expect(blank).toContain("Do not merge.");
     expect(blank).toContain("Address the local cause of each evidence item");
     expect(blank).toContain(
       "do not claim that remote checks, comments, review threads, Greptile evidence, or conflict state changed",
@@ -664,6 +666,7 @@ describe("Claude Code request and parser", () => {
     const prompt = buildPrompt(pull(), custom);
     expect(prompt).toContain(`<instructions>\n${custom}\n</instructions>`);
     expect(prompt).not.toContain("Default instructions");
+    expect(prompt).not.toContain("The target is the shepherd bar.");
     expect(prompt).not.toContain("no merge conflicts remain");
     expect(prompt).not.toContain("dedicated merge/conflict-repair flow");
   });
@@ -1338,6 +1341,7 @@ describe("Claude Code run manager", () => {
     expect(prompt).toContain(
       "Default instructions (used because no custom instructions were provided)",
     );
+    expect(prompt).toContain("The target is the shepherd bar.");
     expect(prompt).toContain("all CI checks pass");
     expect(contextFrom(prompt).identity).toMatchObject({
       headRefOid: SHA,

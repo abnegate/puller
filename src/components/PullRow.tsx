@@ -54,6 +54,7 @@ import {
   type ToggleViewedFile,
   type ViewedFiles,
 } from "../diffs";
+import { DEFAULT_FIX_INSTRUCTIONS, DEFAULT_FIX_PLACEHOLDER } from "../fixes";
 import { keyboardEventBlocked } from "../keyboard";
 import type { PullMovement } from "../movements";
 import { getPullKey, type PullKey } from "../preferences";
@@ -294,7 +295,7 @@ const getHistoryInstructions = (entry: RunHistoryEntry): string => {
   const { instructions } = entry;
   if (instructions.kind === "manual") return instructions.text;
   if (instructions.kind === "auto") {
-    return instructions.message || "Fix every current readiness blocker.";
+    return instructions.message || DEFAULT_FIX_INSTRUCTIONS;
   }
 
   const feedback = instructions.feedback.body;
@@ -908,7 +909,7 @@ function FixPanel({
             disabled={active}
             id={inputId}
             onChange={(event) => setRunMessage(pull.url, event.target.value)}
-            placeholder="Leave blank to fix every readiness blocker."
+            placeholder={DEFAULT_FIX_PLACEHOLDER}
             rows={1}
             value={run.message}
           />
