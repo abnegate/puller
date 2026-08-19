@@ -12,6 +12,7 @@ import {
   createLineDecoder,
   createRunCoordinator,
   createStreamRedactor,
+  eventsForClaudeLine,
   reviewClaudeEnvironment,
   streamingClaudeArguments,
   validateRunInput,
@@ -402,6 +403,63 @@ describe("Claude Code request and parser", () => {
       "--include-partial-messages",
       "--verbose",
     ]);
+  });
+
+  it("surfaces Claude result errors instead of a generic failure", () => {
+    expect(
+      eventsForClaudeLine(
+        JSON.stringify({
+          is_error: true,
+          result:
+            "You've hit your weekly limit · resets 3pm (Pacific/Auckland)",
+          subtype: "success",
+          type: "result",
+        }),
+      ),
+    ).toEqual([
+      {
+        message: "You've hit your weekly limit · resets 3pm (Pacific/Auckland)",
+        type: "error",
+      },
+    ]);
+    expect(
+      eventsForClaudeLine(
+        JSON.stringify({
+          errors: ["Sandbox unavailable.", "Permission denied."],
+          subtype: "error",
+          type: "result",
+        }),
+      ),
+    ).toEqual([
+      {
+        message: "Sandbox unavailable. Permission denied.",
+        type: "error",
+      },
+    ]);
+    expect(
+      eventsForClaudeLine(JSON.stringify({ is_error: true, type: "result" })),
+    ).toEqual([
+      {
+        message: "Claude Code reported that the run failed.",
+        type: "error",
+      },
+    ]);
+  });
+
+  it("reports rejected rate-limit events before the result line", () => {
+    expect(
+      eventsForClaudeLine(
+        JSON.stringify({
+          rate_limit_info: {
+            overageDisabledReason: "out_of_credits",
+            overageStatus: "rejected",
+            rateLimitType: "seven_day",
+            status: "rejected",
+          },
+          type: "rate_limit_event",
+        }),
+      ),
+    ).toEqual([{ text: "Claude Code is out of credits.", type: "diagnostic" }]);
   });
 
   it("uses the verified fixed one-shot argument surface", () => {

@@ -1133,6 +1133,50 @@ export function createLineDecoder({
   };
 }
 
+const claudeDetail = (value, cwd) => {
+  if (typeof value === "string") {
+    const text = cleanText(value, cwd).replace(/\s+/g, " ").trim();
+    return text === "" ? null : text;
+  }
+  if (Array.isArray(value)) {
+    const parts = value.flatMap((entry) => {
+      const text = claudeDetail(entry, cwd);
+      return text === null ? [] : [text];
+    });
+    return parts.length === 0 ? null : parts.join(" ");
+  }
+  if (value && typeof value === "object") {
+    return (
+      claudeDetail(value.message, cwd) ??
+      claudeDetail(value.result, cwd) ??
+      claudeDetail(value.error, cwd) ??
+      claudeDetail(value.errors, cwd)
+    );
+  }
+  return null;
+};
+
+const claudeFailureMessage = (value, cwd) =>
+  claudeDetail(value.result, cwd) ??
+  claudeDetail(value.error, cwd) ??
+  claudeDetail(value.errors, cwd) ??
+  "Claude Code reported that the run failed.";
+
+const claudeRateLimitMessage = (value) => {
+  const info = value?.rate_limit_info;
+  if (!info || typeof info !== "object") return null;
+  if (info.status !== "rejected" && info.overageStatus !== "rejected") {
+    return null;
+  }
+  if (info.overageDisabledReason === "out_of_credits") {
+    return "Claude Code is out of credits.";
+  }
+  if (info.rateLimitType === "seven_day") {
+    return "Claude Code hit the weekly limit.";
+  }
+  return "Claude Code hit a rate limit.";
+};
+
 export function eventsForClaudeLine(line, cwd) {
   if (line === "") return [];
   let value;
@@ -1170,11 +1214,19 @@ export function eventsForClaudeLine(line, cwd) {
   if (value?.type === "result") {
     if (value.is_error || value.subtype === "error") {
       return [
-        { type: "error", message: "Claude Code reported that the run failed." },
+        {
+          type: "error",
+          message: claudeFailureMessage(value, cwd),
+        },
       ];
     }
     // The child close event owns completion so the browser receives the actual exit code.
     return [];
+  }
+
+  if (value?.type === "rate_limit_event") {
+    const detail = claudeRateLimitMessage(value);
+    return detail === null ? [] : [{ type: "diagnostic", text: detail }];
   }
 
   if (value?.type === "system" && value.subtype === "init") {
