@@ -16,9 +16,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   CodexError,
   createCodexInvocation,
+  defaultCodexSearchDirectories,
   eventsForCodexLine,
   readCodexFixture,
   resetCodexExecutableForTests,
+  resolveCodexExecutable,
+  runtimePath,
 } from "../codex.mjs";
 
 const roots = new Set();
@@ -67,6 +70,167 @@ afterEach(async () => {
     [...roots].map((value) => rm(value, { force: true, recursive: true })),
   );
   roots.clear();
+});
+
+describe("Codex executable discovery", () => {
+  it("searches Homebrew, Linuxbrew, /usr/local/bin, and ~/.local/bin", () => {
+    expect(defaultCodexSearchDirectories("/home/jake")).toEqual([
+      "/opt/homebrew/bin",
+      "/usr/local/bin",
+      "/home/linuxbrew/.linuxbrew/bin",
+      "/home/jake/.local/bin",
+    ]);
+  });
+
+  it("includes the resolved binary directory in the host-neutral PATH fallback", () => {
+    expect(runtimePath("/home/jake/.local/bin").split(":")).toEqual([
+      "/usr/bin",
+      "/bin",
+      "/usr/sbin",
+      "/sbin",
+      "/home/jake/.local/bin",
+      "/opt/homebrew/bin",
+      "/usr/local/bin",
+      "/home/linuxbrew/.linuxbrew/bin",
+    ]);
+  });
+
+  it("uses an explicit executable path", async () => {
+    const value = await fixture();
+    await expect(
+      resolveCodexExecutable({ path: value.binary, run: value.run }),
+    ).resolves.toBe(value.binary);
+  });
+
+  it("uses CODEX_PATH when no explicit executable is provided", async () => {
+    const value = await fixture();
+    await expect(
+      resolveCodexExecutable({
+        directories: [],
+        environment: { CODEX_PATH: value.binary, PATH: "" },
+        run: value.run,
+      }),
+    ).resolves.toBe(value.binary);
+  });
+
+  it("rejects a relative CODEX_PATH", async () => {
+    await expect(
+      resolveCodexExecutable({
+        directories: [],
+        environment: { CODEX_PATH: "codex", PATH: "" },
+        run: async () => ({ stdout: "codex-cli-exec 0.144.6\n" }),
+      }),
+    ).rejects.toMatchObject({
+      code: "codex_path_invalid",
+      status: 500,
+    });
+  });
+
+  it("discovers Codex from PATH when well-known prefixes are empty", async () => {
+    const value = await fixture();
+    const missing = join(value.state, "missing");
+    await expect(
+      resolveCodexExecutable({
+        directories: [missing],
+        environment: { PATH: dirname(value.binary) },
+        run: value.run,
+      }),
+    ).resolves.toBe(value.binary);
+  });
+
+  it("skips a wrong-version candidate and uses a later matching binary", async () => {
+    const value = await fixture();
+    const other = join(await root(), "codex");
+    await writeFile(other, "#!/bin/sh\n", { mode: 0o700 });
+    const run = async (command) => ({
+      stdout:
+        command === other
+          ? "codex-cli-exec 0.145.0\n"
+          : "codex-cli-exec 0.144.6\n",
+    });
+
+    await expect(
+      resolveCodexExecutable({
+        directories: [dirname(other), dirname(value.binary)],
+        environment: { PATH: "" },
+        run,
+      }),
+    ).resolves.toBe(value.binary);
+  });
+
+  it("refuses an exclusive wrong-version CODEX_PATH without falling through", async () => {
+    const value = await fixture();
+    await expect(
+      resolveCodexExecutable({
+        directories: [dirname(value.binary)],
+        environment: {
+          CODEX_PATH: value.binary,
+          PATH: dirname(value.binary),
+        },
+        run: async () => ({ stdout: "codex-cli-exec 0.145.0\n" }),
+      }),
+    ).rejects.toMatchObject({
+      code: "codex_version_unsupported",
+      status: 503,
+    });
+  });
+
+  it("reports a missing exclusive path without assuming Homebrew", async () => {
+    const value = await fixture();
+    const missing = join(value.state, "codex");
+    await expect(
+      resolveCodexExecutable({
+        path: missing,
+        run: value.run,
+      }),
+    ).rejects.toMatchObject({
+      code: "codex_unavailable",
+      message: `Codex 0.144.6 is not available at ${missing}.`,
+      status: 503,
+    });
+  });
+
+  it("explains how to install or set CODEX_PATH when nothing matches", async () => {
+    await expect(
+      resolveCodexExecutable({
+        directories: [],
+        environment: { PATH: "" },
+        run: async () => ({ stdout: "codex-cli-exec 0.144.6\n" }),
+      }),
+    ).rejects.toMatchObject({
+      code: "codex_unavailable",
+      message:
+        "Codex 0.144.6 is not available. Install the audited Codex CLI or set CODEX_PATH to its executable.",
+      status: 503,
+    });
+  });
+
+  it("lets createCodexInvocation discover Codex through CODEX_PATH", async () => {
+    const value = await fixture();
+    const invocation = await createCodexInvocation({
+      environment: {
+        ...value.environment,
+        CODEX_PATH: value.binary,
+        PATH: undefined,
+      },
+      prompt: "Fix the pull request.",
+      purpose: "fix",
+      run: value.run,
+      stateRoot: value.state,
+      target: value.target,
+    });
+    expect(invocation.command).toBe(value.binary);
+    expect(invocation.environment.PATH.split(":")).toEqual(
+      expect.arrayContaining([
+        "/usr/bin",
+        "/bin",
+        dirname(value.binary),
+        "/usr/local/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+      ]),
+    );
+    await invocation.cleanup();
+  });
 });
 
 describe("Codex invocation", () => {

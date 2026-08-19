@@ -11,11 +11,11 @@ Puller keeps GitHub's result order and divides pull requests into **Ready**, **I
 ## Requirements
 
 - Node.js 22.12 or newer
-- pnpm 11.15.1
+- pnpm 11.17.0
 - [GitHub CLI](https://cli.github.com/) authenticated for the repositories you want to inspect
 - At least one local agent:
   - Claude Code authenticated locally; or
-  - Codex `codex-cli-exec 0.144.6` installed at `/opt/homebrew/bin/codex` and authenticated locally
+  - Codex `codex-cli-exec 0.144.6` on your `PATH` and authenticated locally. Homebrew, Linuxbrew, `/usr/local/bin`, and `~/.local/bin` are searched automatically. Set `CODEX_PATH` to an absolute executable if it lives somewhere else.
 - Local clones or worktrees for repositories where an agent will run
 
 Check the command-line tools before starting:
@@ -23,8 +23,8 @@ Check the command-line tools before starting:
 ```bash
 gh auth status
 claude --version
-/opt/homebrew/bin/codex exec --version
-/opt/homebrew/bin/codex login status
+codex exec --version
+codex login status
 ```
 
 ## Run locally
@@ -79,7 +79,7 @@ ACTION_WORKSPACE_ROOTS="/path/to/repos:/path/to/worktrees" pnpm dev
 
 Fix can edit the selected worktree and consume the chosen agent's usage. Claude starts in safe mode with user, project, and local settings disabled, an empty strict MCP configuration, and hooks, plugins, skills, custom commands, and browser integration unavailable. Worktree-scoped file tools and a fixed allowlist of local test commands are approved; other write-capable shell commands are denied non-interactively. Every Git command—including fetch, pull, push, merge, rebase, checkout, switch, reset, clean, and worktree operations—plus GitHub CLI, publishing, and network commands has an explicit deny rule. Bash and its child processes run in a fail-closed sandbox that blocks outbound network access, Unix sockets, `.git` writes, and unsandboxed retries while allowing worktree edits and writes to one run-specific temporary directory. The child receives only a narrow runtime environment; tokens, API keys, arbitrary server variables, and `SSH_AUTH_SOCK` are not inherited and are also denied inside sandboxed commands.
 
-Codex support is deliberately pinned to the locally audited `codex-cli-exec 0.144.6` at `/opt/homebrew/bin/codex`; Puller refuses a different binary identity or version until the adapter is re-audited. It launches `codex exec` with JSONL output, an ephemeral isolated home containing only a copied `auth.json`, no inherited user configuration or exec rules, network disabled, and a named least-privilege filesystem profile. For Fix, Auto, diff feedback, and Verify, project instructions, root markers, bundled skills, plugins, apps, hooks, browser/computer tools, image generation, workspace dependencies, tool suggestions, and interactive input are disabled. Codex cannot write Git metadata or publish; Puller validates, commits, and pushes the result itself.
+Codex support is deliberately pinned to the locally audited `codex-cli-exec 0.144.6`. Puller finds that binary on Homebrew, Linuxbrew, `/usr/local/bin`, `~/.local/bin`, `PATH`, or `CODEX_PATH`, then refuses a different version or a swapped file until the adapter is re-audited. It launches `codex exec` with JSONL output, an ephemeral isolated home containing only a copied `auth.json`, no inherited user configuration or exec rules, network disabled, and a named least-privilege filesystem profile. For Fix, Auto, diff feedback, and Verify, project instructions, root markers, bundled skills, plugins, apps, hooks, browser/computer tools, image generation, workspace dependencies, tool suggestions, and interactive input are disabled. Codex cannot write Git metadata or publish; Puller validates, commits, and pushes the result itself.
 
 Codex 0.144.6's named profile necessarily includes the CLI's built-in `:minimal` filesystem baseline, which grants access to standard macOS temporary roots. Puller cannot subtract that baseline in this version. It keeps verification snapshots and real conflict-repair checkouts outside global temporary roots under protected `~/.puller` state; conflict repair exposes only a disposable non-Git mirror and explicitly denies the real checkout. Treat unrelated secrets in global temporary directories as potentially visible to a Codex run.
 
@@ -129,4 +129,4 @@ pnpm test:claude-smoke
 pnpm test:codex-smoke
 ```
 
-These opt-in smoke tests invoke the real local agents and may consume account usage. The Codex smoke runs through Puller's exact production adapter, requires `/opt/homebrew/bin/codex exec --version` to print `codex-cli-exec 0.144.6`, requires a working local login, verifies a completed JSONL turn and sandboxed file write, and confirms hostile repository instructions/skills and `.git` were untouched.
+These opt-in smoke tests invoke the real local agents and may consume account usage. The Codex smoke runs through Puller's exact production adapter, requires `codex exec --version` (or `CODEX_PATH`) to print `codex-cli-exec 0.144.6`, requires a working local login, verifies a completed JSONL turn and sandboxed file write, and confirms hostile repository instructions/skills and `.git` were untouched.

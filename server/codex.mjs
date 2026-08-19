@@ -23,9 +23,21 @@ import {
 import { promisify } from "node:util";
 
 const execFile = promisify(executeFile);
-const CODEX_LINK = "/opt/homebrew/bin/codex";
+const CODEX_NAME = "codex";
 const CODEX_VERSION = "codex-cli-exec 0.144.6";
 const VERSION = /^codex-cli-exec 0\.144\.6\s*$/;
+const HOST_PATH_SEPARATOR = ":";
+const SAFE_PATH_DIRECTORIES = Object.freeze([
+  "/usr/bin",
+  "/bin",
+  "/usr/sbin",
+  "/sbin",
+]);
+const OPTIONAL_PATH_DIRECTORIES = Object.freeze([
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  "/home/linuxbrew/.linuxbrew/bin",
+]);
 const STANDARD_TEMP_ROOTS = [
   "/tmp",
   "/private/tmp",
@@ -122,11 +134,83 @@ function profileValue(filesystem) {
   return `{filesystem=${tomlInline(filesystem)},network={enabled=false}}`;
 }
 
-function shellPolicy(environment, home, temporary) {
+export function defaultCodexSearchDirectories(home = homedir()) {
+  return Object.freeze([
+    ...OPTIONAL_PATH_DIRECTORIES,
+    join(home, ".local", "bin"),
+  ]);
+}
+
+function uniqueDirectories(values) {
+  const seen = new Set();
+  const directories = [];
+  for (const value of values) {
+    if (typeof value !== "string" || value === "" || seen.has(value)) continue;
+    seen.add(value);
+    directories.push(value);
+  }
+  return directories;
+}
+
+export function runtimePath(binaryDirectory) {
+  return uniqueDirectories([
+    ...SAFE_PATH_DIRECTORIES,
+    binaryDirectory,
+    ...OPTIONAL_PATH_DIRECTORIES,
+  ]).join(HOST_PATH_SEPARATOR);
+}
+
+function environmentPath(environment) {
+  const value = environment?.PATH;
+  return typeof value === "string" && value !== "" && !value.includes("\0")
+    ? value
+    : "";
+}
+
+function configuredCodexPath(environment) {
+  const value = environment?.CODEX_PATH;
+  if (typeof value !== "string" || value.trim() === "") return null;
+  const path = value.trim();
+  if (!isAbsolute(path) || path.includes("\0")) {
+    throw new CodexError(
+      500,
+      "codex_path_invalid",
+      "CODEX_PATH must be an absolute path to the Codex executable.",
+    );
+  }
+  return path;
+}
+
+function discoverCodexCandidates({ directories, environment, path } = {}) {
+  if (typeof path === "string" && path !== "") {
+    return { exclusive: true, paths: [path] };
+  }
+  const configured = configuredCodexPath(environment);
+  if (configured) {
+    return { exclusive: true, paths: [configured] };
+  }
+  const home =
+    typeof environment?.HOME === "string" && environment.HOME !== ""
+      ? environment.HOME
+      : homedir();
+  const search = directories ?? defaultCodexSearchDirectories(home);
+  return {
+    exclusive: false,
+    paths: uniqueDirectories([
+      ...search.map((directory) => join(directory, CODEX_NAME)),
+      ...environmentPath(environment)
+        .split(HOST_PATH_SEPARATOR)
+        .filter((directory) => directory !== "")
+        .map((directory) => join(directory, CODEX_NAME)),
+    ]),
+  };
+}
+
+function shellPolicy(environment, home, temporary, binaryDirectory) {
   const path =
     typeof environment.PATH === "string" && !environment.PATH.includes("\0")
       ? environment.PATH
-      : "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin";
+      : runtimePath(binaryDirectory);
   return `{inherit="none",set=${tomlInline({
     PATH: path,
     HOME: home,
@@ -255,7 +339,7 @@ async function executableIdentity(path, run) {
     env: {
       LANG: "C",
       LC_ALL: "C",
-      PATH: "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
+      PATH: runtimePath(dirname(resolved)),
     },
     maxBuffer: 64 * 1024,
     windowsHide: true,
@@ -276,20 +360,55 @@ async function executableIdentity(path, run) {
 }
 
 export async function resolveCodexExecutable({
-  path = CODEX_LINK,
+  directories,
+  environment = process.env,
+  path,
   run = execFile,
 } = {}) {
   if (!executableProof) {
-    try {
-      executableProof = await executableIdentity(path, run);
-    } catch (error) {
-      executableProof = null;
-      if (error instanceof CodexError) throw error;
+    const candidates = discoverCodexCandidates({
+      directories,
+      environment,
+      path,
+    });
+    let lastError = null;
+    let sawUnsupportedVersion = false;
+    for (const candidate of candidates.paths) {
+      try {
+        executableProof = await executableIdentity(candidate, run);
+        lastError = null;
+        break;
+      } catch (error) {
+        executableProof = null;
+        lastError = error;
+        if (
+          error instanceof CodexError &&
+          error.code === "codex_version_unsupported"
+        ) {
+          sawUnsupportedVersion = true;
+        }
+        if (candidates.exclusive) break;
+      }
+    }
+    if (!executableProof) {
+      if (candidates.exclusive && lastError instanceof CodexError) {
+        throw lastError;
+      }
+      if (sawUnsupportedVersion) {
+        throw new CodexError(
+          503,
+          "codex_version_unsupported",
+          `Puller supports ${CODEX_VERSION}; re-audit the installed Codex version before enabling it.`,
+        );
+      }
+      const location = candidates.exclusive ? candidates.paths[0] : null;
       throw new CodexError(
         503,
         "codex_unavailable",
-        "Codex 0.144.6 is not available at /opt/homebrew/bin/codex.",
-        error,
+        location
+          ? `Codex 0.144.6 is not available at ${location}.`
+          : "Codex 0.144.6 is not available. Install the audited Codex CLI or set CODEX_PATH to its executable.",
+        lastError instanceof Error ? lastError : undefined,
       );
     }
   }
@@ -341,7 +460,13 @@ async function copyAuthentication(environment, codexHome) {
   }
 }
 
-function childEnvironment(environment, home, codexHome, temporary) {
+function childEnvironment(
+  environment,
+  home,
+  codexHome,
+  temporary,
+  binaryDirectory,
+) {
   const selected = {};
   for (const name of SAFE_ENVIRONMENT) {
     const value = environment[name];
@@ -355,7 +480,7 @@ function childEnvironment(environment, home, codexHome, temporary) {
     HOME: home,
     LANG: selected.LANG ?? "C.UTF-8",
     LC_ALL: selected.LC_ALL ?? "C.UTF-8",
-    PATH: selected.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
+    PATH: selected.PATH ?? runtimePath(binaryDirectory),
     TEMP: temporary,
     TMP: temporary,
     TMPDIR: temporary,
@@ -396,7 +521,7 @@ async function gitMetadata(target) {
 export async function createCodexInvocation({
   deniedPaths = [],
   environment = process.env,
-  executable = CODEX_LINK,
+  executable,
   newTask = false,
   prompt,
   purpose,
@@ -483,7 +608,12 @@ export async function createCodexInvocation({
       mkdir(temporary, { mode: 0o700 }),
     ]);
     await copyAuthentication(environment, codexHome);
-    const binary = await resolveCodexExecutable({ path: executable, run });
+    const binary = await resolveCodexExecutable({
+      environment,
+      path: executable,
+      run,
+    });
+    const binaryDirectory = dirname(binary);
     const profile = purposeProfile(purpose);
     const filesystem = {
       ":minimal": "read",
@@ -524,7 +654,12 @@ export async function createCodexInvocation({
       "-c",
       "tools.experimental_request_user_input.enabled=false",
       "-c",
-      `shell_environment_policy=${shellPolicy(environment, home, temporary)}`,
+      `shell_environment_policy=${shellPolicy(
+        environment,
+        home,
+        temporary,
+        binaryDirectory,
+      )}`,
       "-c",
       `default_permissions=${tomlString(profile)}`,
       "-c",
@@ -550,7 +685,13 @@ export async function createCodexInvocation({
       command: binary,
       cwd,
       environment: Object.freeze(
-        childEnvironment(environment, home, codexHome, temporary),
+        childEnvironment(
+          environment,
+          home,
+          codexHome,
+          temporary,
+          binaryDirectory,
+        ),
       ),
       prompt: codexPrompt(prompt, canonicalTarget, purpose),
       target: canonicalTarget,
