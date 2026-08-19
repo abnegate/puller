@@ -945,11 +945,11 @@ function Dashboard({
   const stats = useMemo(
     () => ({
       active: countActiveLocalWork(currentPulls, runs.states, tasks.states),
-      blocked: groupedPulls.blocked.length,
+      blocked: view.groups.blocked.length,
       open: new Set(currentPulls.map(getPullKey)).size,
-      ready: groupedPulls.ready.length,
+      ready: view.groups.ready.length,
     }),
-    [currentPulls, groupedPulls, runs.states, tasks.states],
+    [currentPulls, runs.states, tasks.states, view.groups],
   );
   const hasGlobalEmptyState = view.visibleCount === 0 && !tasks.loading;
   const allCurrentPullsHidden = hasGlobalEmptyState && view.hiddenCount > 0;

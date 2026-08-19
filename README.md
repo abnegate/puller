@@ -45,7 +45,7 @@ pnpm start
 
 The interface follows the system light or dark preference by default and lets you override it. The pull list refreshes silently every 10 seconds while the page is visible; the existing snapshot stays rendered during background requests, so rows can move between sections without a loading flash.
 
-The header reports four stable counts: **Open** includes every current authored pull request (including hidden rows), **Ready** and **Blocked** use the full unfiltered pull set, and **Active** counts distinct local Task, Fix, and conflict-repair runs rather than CI-only work. Sections stay sticky while scrolling, paginate after 20 items, and briefly show an up/down marker when a trusted snapshot moves a pull toward or away from Ready. Favourite pulls sort first; hidden pulls remain counted and can be restored from the header.
+The header reports four stable counts: **Open** includes every current authored pull request (including hidden rows), **Ready** and **Blocked** match the visible Ready and Not ready sections, and **Active** counts distinct local Task, Fix, and conflict-repair runs rather than CI-only work. Sections stay sticky while scrolling, paginate after 20 items, and briefly show an up/down marker when a trusted snapshot moves a pull toward or away from Ready. Favourite pulls sort first; hidden pulls stay in **Open** and can be restored from the header.
 
 ## Readiness and pull request actions
 

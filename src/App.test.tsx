@@ -1060,6 +1060,9 @@ describe("App", () => {
     expect(
       within(blockedSection).getByLabelText("2 pull requests"),
     ).toHaveTextContent("2");
+    expect(screen.getByLabelText("Open 4")).toHaveTextContent("Open4");
+    expect(screen.getByLabelText("Ready 1")).toHaveTextContent("Ready1");
+    expect(screen.getByLabelText("Blocked 2")).toHaveTextContent("Blocked2");
     expect(
       within(readySection).getByRole("list", {
         name: "Ready pull requests",
@@ -1171,6 +1174,8 @@ describe("App", () => {
       }),
     ).toHaveTextContent("Hidden 1");
     expect(screen.getByLabelText("Open 1")).toHaveTextContent("Open1");
+    expect(screen.getByLabelText("Ready 0")).toHaveTextContent("Ready0");
+    expect(screen.getByLabelText("Blocked 0")).toHaveTextContent("Blocked0");
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     await waitFor(() => expect(getPullsMock).toHaveBeenCalledTimes(2));
@@ -1191,6 +1196,8 @@ describe("App", () => {
         }),
       ).not.toBeInTheDocument(),
     );
+    expect(screen.getByLabelText("Open 1")).toHaveTextContent("Open1");
+    expect(screen.getByLabelText("Ready 1")).toHaveTextContent("Ready1");
   });
 
   it("restores every current hidden pull through Show all", async () => {
