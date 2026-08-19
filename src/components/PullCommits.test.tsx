@@ -81,6 +81,7 @@ vi.mock("./PullDiff", () => ({
             navigationVisible: false,
             navigationWidth: 224,
             patchScrollLeft: {},
+            query: "",
             selectedPath: diff.files[0]?.path ?? null,
             selection: null,
             visibleCount: diff.files.length,

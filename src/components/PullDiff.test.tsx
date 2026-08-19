@@ -322,6 +322,61 @@ const expectAriaControlsToResolve = (container: HTMLElement): void => {
   }
 };
 
+const fileNavigationViewport = (
+  container: HTMLElement = document.body,
+): HTMLElement =>
+  container.querySelector<HTMLElement>("[data-diff-navigation-viewport]")!;
+
+const expectFileNavigationHeightContract = (container: HTMLElement): void => {
+  const pane = container.querySelector<HTMLElement>(
+    "[data-diff-navigation-pane]",
+  )!;
+  const sticky = container.querySelector<HTMLElement>(
+    "[data-diff-navigation-sticky]",
+  )!;
+  const aside = container.querySelector<HTMLElement>("[data-diff-navigation]")!;
+  const navigation = within(aside).getByRole("navigation", {
+    name: "Changed files",
+  });
+  const chrome = navigation.firstElementChild as HTMLElement;
+  const viewport = fileNavigationViewport(container);
+
+  expect(pane).toHaveClass("self-stretch");
+  expect(sticky).toHaveClass(
+    "lg:sticky",
+    "lg:top-0",
+    "lg:h-full",
+    "lg:max-h-[calc(100vh-3rem)]",
+  );
+  expect(aside).toHaveClass("lg:h-full", "lg:min-h-0");
+  expect(navigation).toHaveClass(
+    "flex",
+    "min-h-0",
+    "max-w-full",
+    "flex-col",
+    "lg:h-full",
+  );
+  expect(navigation).not.toHaveClass(
+    "lg:max-h-[70vh]",
+    "lg:[max-height:calc(100vh-3rem)]",
+  );
+  expect(chrome).toHaveClass("shrink-0");
+  expect(viewport).toHaveClass(
+    "flex",
+    "min-h-0",
+    "max-w-full",
+    "flex-1",
+    "overflow-x-auto",
+    "lg:overflow-auto",
+  );
+
+  for (const element of [pane, sticky, aside, navigation, chrome]) {
+    expect(
+      element.className.split(/\s+/).some((name) => name.includes("overflow")),
+    ).toBe(false);
+  }
+};
+
 beforeEach(() => {
   vi.mocked(highlightFile).mockReset();
   vi.mocked(highlightFile).mockResolvedValue(null);
@@ -632,12 +687,13 @@ describe("PullDiff", () => {
     expect(screen.getByText("1 file changed")).toBeInTheDocument();
     expect(
       screen.getByRole("navigation", { name: "Changed files" }),
-    ).toHaveClass(
+    ).toHaveClass("lg:h-full", "flex-col");
+    expect(fileNavigationViewport(container)).toHaveClass(
       "overflow-x-auto",
-      "lg:max-h-[70vh]",
       "lg:flex-col",
       "lg:overflow-auto",
     );
+    expectFileNavigationHeightContract(container);
     expect(
       screen.getByRole("button", { name: /^readiness\.ts/ }),
     ).toHaveAttribute("aria-current", "true");
@@ -679,6 +735,7 @@ describe("PullDiff", () => {
     );
     expect(commitRevision).toHaveTextContent(COMMIT.slice(0, 7));
     expect(commitRevision).toHaveAttribute("title", COMMIT);
+    expectFileNavigationHeightContract(commitView.container);
   });
 
   it("keeps every short file flush and content-sized without width traps", () => {
@@ -804,9 +861,10 @@ describe("PullDiff", () => {
       headers[0]!.compareDocumentPosition(headers[1]!) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
-    expect(
-      screen.getByRole("navigation", { name: "Changed files" }),
-    ).toHaveClass("overflow-x-auto", "lg:overflow-auto");
+    expect(fileNavigationViewport(container)).toHaveClass(
+      "overflow-x-auto",
+      "lg:overflow-auto",
+    );
   });
 
   it("selects, scrolls to, and focuses a file without moving the whole page", () => {
@@ -844,14 +902,18 @@ describe("PullDiff", () => {
     );
   });
 
-  it("scrolls long file names within the fixed rail without truncating them", () => {
+  it("keeps a long tree and long file names inside the full-height scroll viewport", () => {
     const path =
       "src/platform/modules/database/reviews/a-very-long-file-name-that-stays-readable.ts";
-    renderPullDiff(diff({ files: [file({ path })] }));
+    const files = [
+      ...Array.from({ length: 44 }, (_, index) =>
+        file({ path: `src/generated/file-${index + 1}.ts` }),
+      ),
+      file({ path }),
+    ];
+    const { container } = renderPullDiff(diff({ files }));
 
-    const navigation = screen.getByRole("navigation", {
-      name: "Changed files",
-    });
+    const navigation = fileNavigationViewport();
     const button = screen.getByRole("button", {
       name: /^a-very-long-file-name-that-stays-readable\.ts/,
     });
@@ -863,6 +925,193 @@ describe("PullDiff", () => {
     expect(button).toHaveClass("w-max", "min-w-full");
     expect(name).toHaveClass("whitespace-nowrap");
     expect(name).not.toHaveClass("truncate");
+    expectFileNavigationHeightContract(container);
+  });
+
+  it("filters the file tree by case-insensitive full path without changing diff order", () => {
+    const data = diff({
+      files: [
+        file({ path: "src/z.ts" }),
+        file({ path: "docs/README.md" }),
+        file({ path: "src/core/a.ts" }),
+      ],
+    });
+    const { container } = renderPullDiff(data);
+    const search = screen.getByRole("searchbox", {
+      name: "Search changed files",
+    });
+    const tree = screen.getByRole("tree", {
+      name: "Changed file results",
+    });
+    const treePaths = () =>
+      [...tree.querySelectorAll<HTMLButtonElement>("[data-file-path]")].map(
+        ({ dataset }) => dataset.filePath,
+      );
+    const cardPaths = () =>
+      [...container.querySelectorAll<HTMLElement>("[data-diff-file-name]")].map(
+        ({ textContent }) => textContent,
+      );
+    const originalCardPaths = ["docs/README.md", "src/core/a.ts", "src/z.ts"];
+
+    expect(fileNavigationViewport(container)).not.toContainElement(search);
+    expect(cardPaths()).toEqual(originalCardPaths);
+
+    fireEvent.change(search, { target: { value: "CORE" } });
+    expect(treePaths()).toEqual(["src/core/a.ts"]);
+    expect(
+      tree.querySelectorAll<HTMLButtonElement>("[data-directory]"),
+    ).toHaveLength(2);
+    expect(
+      tree.querySelector('[role="group"][aria-label="Changed file results"]'),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("1 of 3 files")).toHaveAttribute(
+      "aria-live",
+      "polite",
+    );
+    expect(cardPaths()).toEqual(originalCardPaths);
+    expectFileNavigationHeightContract(container);
+
+    fireEvent.change(search, { target: { value: "readme.MD" } });
+    expect(treePaths()).toEqual(["docs/README.md"]);
+    expect(cardPaths()).toEqual(originalCardPaths);
+
+    fireEvent.change(search, { target: { value: "not-present" } });
+    expect(treePaths()).toEqual([]);
+    expect(screen.getByText("No matching files")).toHaveAttribute(
+      "aria-live",
+      "polite",
+    );
+    expect(cardPaths()).toEqual(originalCardPaths);
+    expectFileNavigationHeightContract(container);
+  });
+
+  it("keeps original file indices when a distant filtered result is activated", () => {
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: scrollIntoView,
+    });
+    const files = Array.from({ length: 45 }, (_, index) =>
+      file({ path: `src/file-${index + 1}.ts` }),
+    );
+    const { container } = renderPullDiff(diff({ files }));
+    const search = screen.getByRole("searchbox", {
+      name: "Search changed files",
+    });
+
+    fireEvent.change(search, { target: { value: "FILE-45.TS" } });
+    const result = screen.getByRole("button", { name: /^file-45\.ts/ });
+    expect(result).toHaveAttribute("data-file-index", "44");
+    expect(result).not.toHaveAttribute("aria-controls");
+    expect(
+      screen.queryByRole("checkbox", { name: "Viewed src/file-45.ts" }),
+    ).not.toBeInTheDocument();
+    expectAriaControlsToResolve(container);
+
+    fireEvent.click(result);
+    expect(
+      screen.getByRole("checkbox", { name: "Viewed src/file-45.ts" }),
+    ).toBeInTheDocument();
+    expect(result).toHaveAttribute("aria-controls");
+    expectAriaControlsToResolve(container);
+  });
+
+  it("persists the search query through the controlled remount boundary", () => {
+    const data = diff({
+      files: [
+        file({ path: "docs/readme.md" }),
+        file({ path: "src/core/a.ts" }),
+      ],
+    });
+    render(<PersistentPullDiff data={data} />);
+    const search = screen.getByRole("searchbox", {
+      name: "Search changed files",
+    });
+
+    fireEvent.change(search, { target: { value: "CORE" } });
+    expect(search).toHaveAttribute("data-pull-focus-token", "file-search");
+    expect(screen.getByRole("button", { name: /^a\.ts/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Toggle diff" }));
+    fireEvent.click(screen.getByRole("button", { name: "Toggle diff" }));
+
+    expect(
+      screen.getByRole("searchbox", { name: "Search changed files" }),
+    ).toHaveValue("CORE");
+    expect(screen.getByRole("button", { name: /^a\.ts/ })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^readme\.md/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("uses transient directory collapse state while searching and restores persistence", () => {
+    const data = diff({
+      files: [
+        file({ path: "docs/readme.md" }),
+        file({ path: "src/core/a.ts" }),
+      ],
+    });
+    render(<PersistentPullDiff data={data} />);
+    const search = screen.getByRole("searchbox", {
+      name: "Search changed files",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^src$/ }));
+    expect(
+      screen.queryByRole("button", { name: /^a\.ts/ }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.change(search, { target: { value: "CORE" } });
+    expect(screen.getByRole("button", { name: /^a\.ts/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^src$/ }));
+    expect(
+      screen.queryByRole("button", { name: /^a\.ts/ }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.change(search, { target: { value: "core" } });
+    expect(screen.getByRole("button", { name: /^a\.ts/ })).toBeInTheDocument();
+    fireEvent.change(search, { target: { value: "" } });
+    expect(
+      screen.queryByRole("button", { name: /^a\.ts/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen
+        .getByRole("button", { name: /^src$/ })
+        .closest('[role="treeitem"]'),
+    ).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("moves from search into filtered results and uses two-stage Escape without leaking keys", () => {
+    const data = diff({
+      files: [file({ path: "src/z.ts" }), file({ path: "docs/readme.md" })],
+    });
+    const leaked = vi.fn();
+    window.addEventListener("keydown", leaked);
+    render(
+      <div data-pull-identity="appwrite/cloud#101">
+        <button data-pull-focus-token="diff" type="button">
+          Files changed
+        </button>
+        <ControlledPullDiff data={data} />
+      </div>,
+    );
+    const search = screen.getByRole("searchbox", {
+      name: "Search changed files",
+    });
+
+    search.focus();
+    fireEvent.keyDown(search, { key: "r" });
+    fireEvent.change(search, { target: { value: "README" } });
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    expect(screen.getByRole("button", { name: /^readme\.md/ })).toHaveFocus();
+
+    search.focus();
+    fireEvent.keyDown(search, { key: "Escape" });
+    expect(search).toHaveValue("");
+    expect(search).toHaveFocus();
+    fireEvent.keyDown(search, { key: "Escape" });
+    expect(screen.getByRole("button", { name: "Files changed" })).toHaveFocus();
+    expect(leaked).not.toHaveBeenCalled();
+    window.removeEventListener("keydown", leaked);
   });
 
   it("unmounts only a viewed file body and restores it when unviewed", () => {
@@ -971,9 +1220,7 @@ describe("PullDiff", () => {
     });
     owner.scrollLeft = 53;
     owner.scrollTop = 400;
-    const navigation = screen.getByRole("navigation", {
-      name: "Changed files",
-    });
+    const navigation = fileNavigationViewport(view.container);
     navigation.scrollLeft = 81;
     const nextSection = screen
       .getByRole("checkbox", { name: `Viewed ${next.path}` })
@@ -1307,9 +1554,7 @@ describe("PullDiff", () => {
       target: { value: "Keep this unsaved feedback." },
     });
 
-    const navigation = screen.getByRole("navigation", {
-      name: "Changed files",
-    });
+    const navigation = fileNavigationViewport(container);
     navigation.scrollLeft = 84;
     fireEvent.scroll(navigation);
     const patch = selectedFile.querySelector<HTMLElement>(
@@ -1361,9 +1606,7 @@ describe("PullDiff", () => {
         name: /Show more changed files/,
       }),
     ).not.toBeInTheDocument();
-    expect(
-      screen.getByRole("navigation", { name: "Changed files" }).scrollLeft,
-    ).toBe(84);
+    expect(fileNavigationViewport(container).scrollLeft).toBe(84);
     const restoredFile = screen
       .getByRole("checkbox", { name: "Viewed src/file-21.ts" })
       .closest<HTMLElement>("[data-diff-file]")!;
@@ -1419,9 +1662,7 @@ describe("PullDiff", () => {
         persistence={persistence}
       />,
     );
-    const navigation = screen.getByRole("navigation", {
-      name: "Changed files",
-    });
+    const navigation = fileNavigationViewport(view.container);
     const patch = view.container.querySelector<HTMLElement>(
       "[data-diff-file-patch]",
     )!;
@@ -1459,7 +1700,7 @@ describe("PullDiff", () => {
 
   it("normalizes stale persistence to the current diff boundary", () => {
     const data = diff();
-    const stale: PullDiffPersistence = {
+    const stale = {
       collapsedDirectories: ["missing", "src", "src"],
       draft: "This draft no longer has a valid anchor.",
       navigationScrollLeft: Number.NaN,
@@ -1495,7 +1736,7 @@ describe("PullDiff", () => {
         },
       },
       visibleCount: 999,
-    };
+    } as unknown as PullDiffPersistence;
 
     expect(normalizePullDiffPersistence(data, stale)).toEqual({
       collapsedDirectories: ["src"],
@@ -1505,6 +1746,7 @@ describe("PullDiff", () => {
       navigationVisible: true,
       navigationWidth: 224,
       patchScrollLeft: { "src/readiness.ts": 0 },
+      query: "",
       selectedPath: "src/readiness.ts",
       selection: null,
       visibleCount: 1,
@@ -1695,6 +1937,13 @@ describe("PullDiff", () => {
     fireEvent.click(
       screen.getByRole("checkbox", { name: "Viewed src/file-45.ts" }),
     );
+    expectAriaControlsToResolve(container);
+    const search = screen.getByRole("searchbox", {
+      name: "Search changed files",
+    });
+    fireEvent.change(search, { target: { value: "FILE-45.TS" } });
+    expectAriaControlsToResolve(container);
+    fireEvent.change(search, { target: { value: "not-present" } });
     expectAriaControlsToResolve(container);
   });
 

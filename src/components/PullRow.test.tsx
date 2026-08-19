@@ -2864,6 +2864,44 @@ describe("ReadinessSection controlled reparenting", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("keeps the changed-file search query and exact input focus after a section move", async () => {
+    const pull = getReadyPull();
+    const item = pullItem(pull);
+    const controls = createControls();
+    const runs = createRuns(new Map(), controls);
+    vi.mocked(getPullDiff).mockResolvedValue(pullDiff(pull));
+    const view = render(<ContinuitySections ready={[item]} runs={runs} />);
+    const source = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="ready"] [data-pull-identity]',
+    )!;
+
+    fireEvent.click(
+      within(source).getByRole("button", { name: "Files changed" }),
+    );
+    const search = await within(source).findByRole("searchbox", {
+      name: "Search changed files",
+    });
+    fireEvent.change(search, { target: { value: "READY.TS" } });
+    search.focus();
+    expect(search).toHaveFocus();
+    expect(search).toHaveAttribute("data-pull-focus-token", "file-search");
+
+    view.rerender(<ContinuitySections progress={[item]} runs={runs} />);
+
+    const destination = view.container.querySelector<HTMLElement>(
+      '[data-readiness-section="progress"] [data-pull-identity]',
+    )!;
+    const restored = await within(destination).findByRole("searchbox", {
+      name: "Search changed files",
+    });
+    await waitFor(() => expect(restored).toHaveFocus());
+    expect(restored).toHaveValue("READY.TS");
+    expect(
+      within(destination).getByRole("button", { name: /^ready\.ts/ }),
+    ).toBeInTheDocument();
+    expect(getPullDiff).toHaveBeenCalledOnce();
+  });
+
   it("keeps the selected commit and visible rail through outer collapse and a section move", async () => {
     const pull = getReadyPull();
     const item = pullItem(pull);

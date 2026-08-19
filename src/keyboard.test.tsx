@@ -540,7 +540,11 @@ describe("useDashboardKeyboard", () => {
       ).toBeVisible();
     }
     expect(dialog).toHaveTextContent("Open files, blockers, or commits");
+    expect(dialog).toHaveTextContent("Filter the file tree by full path");
     expect(dialog).toHaveTextContent("Collapse file and move to the next file");
+    expect(dialog).toHaveTextContent(
+      "Clear search, then return to Files changed",
+    );
     expect(dialog).toHaveTextContent("Enter the selected commit diff");
     expect(dialog).toHaveTextContent(
       "Return to the blocker, then Blocker details",

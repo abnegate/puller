@@ -40,12 +40,13 @@ const groups = [
   {
     label: "Files",
     shortcuts: [
+      ["Search", "Filter the file tree by full path"],
       ["↑ / ↓", "Previous / next tree item"],
       ["Home / End", "First / last tree item"],
       ["Enter / Space", "Open a file or toggle a directory"],
       ["← / →", "Parent or collapse / child or file header"],
       ["Viewed", "Collapse file and move to the next file"],
-      ["Esc", "Return to Files changed"],
+      ["Esc", "Clear search, then return to Files changed"],
     ],
   },
   {

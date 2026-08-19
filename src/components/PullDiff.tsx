@@ -9,6 +9,7 @@ import {
   FolderOpen,
   LoaderCircle,
   MessageSquare,
+  Search,
 } from "lucide-react";
 import { useReducedMotion } from "motion/react";
 import {
@@ -31,6 +32,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 
@@ -118,6 +120,7 @@ export type PullDiffPersistence = Readonly<{
   navigationVisible: boolean;
   navigationWidth: number;
   patchScrollLeft: Readonly<Record<string, number>>;
+  query: string;
   selectedPath: string | null;
   selection: PullDiffCommentSelection | null;
   visibleCount: number;
@@ -477,7 +480,10 @@ type FileTreeItem =
       path: string;
     };
 
-const createFileTree = (files: PullDiffFile[]): FileTreeDirectory => {
+const createFileTree = (
+  files: PullDiffFile[],
+  originalIndices?: ReadonlyMap<string, number>,
+): FileTreeDirectory => {
   const root: FileTreeDirectory = {
     directories: new Map(),
     files: [],
@@ -498,7 +504,10 @@ const createFileTree = (files: PullDiffFile[]): FileTreeDirectory => {
       }
       directory = child;
     }
-    directory.files.push({ file, index });
+    directory.files.push({
+      file,
+      index: originalIndices?.get(file.path) ?? index,
+    });
   });
 
   return root;
@@ -596,6 +605,7 @@ export const createPullDiffPersistence = (
   navigationVisible: true,
   navigationWidth: NAVIGATION_DEFAULT_WIDTH,
   patchScrollLeft: {},
+  query: "",
   selectedPath: treeFiles(diff.files)[0]?.path ?? null,
   selection: null,
   visibleCount: Math.min(FILE_BATCH_SIZE, diff.files.length),
@@ -649,6 +659,7 @@ export const normalizePullDiffPersistence = (
     navigationVisible: true,
     navigationWidth: navigationWidth(persistence.navigationWidth),
     patchScrollLeft,
+    query: typeof persistence.query === "string" ? persistence.query : "",
     selectedPath,
     selection,
     visibleCount,
@@ -684,6 +695,7 @@ const samePersistence = (
     left.navigationScrollTop === right.navigationScrollTop &&
     left.navigationVisible === right.navigationVisible &&
     left.navigationWidth === right.navigationWidth &&
+    left.query === right.query &&
     left.selectedPath === right.selectedPath &&
     left.visibleCount === right.visibleCount &&
     sameSelection(left.selection, right.selection) &&
@@ -1462,8 +1474,10 @@ type FileNavigationProps = {
   fileIds: readonly string[];
   files: PullDiffFile[];
   onExit: () => void;
+  onQueryChange: (query: string) => void;
   onScrollChange: (scrollLeft: number, scrollTop: number) => void;
   onToggleDirectory: (path: string) => void;
+  query: string;
   scrollLeft: number;
   scrollTop: number;
   selected: string | null;
@@ -1477,19 +1491,45 @@ const FileNavigation = memo(function FileNavigation({
   fileIds,
   files,
   onExit,
+  onQueryChange,
   onScrollChange,
   onToggleDirectory,
   scrollLeft,
   scrollTop,
   selected,
   visibleCount,
+  query,
 }: FileNavigationProps) {
-  const navigation = useRef<HTMLElement>(null);
+  const input = useRef<HTMLInputElement>(null);
+  const navigation = useRef<HTMLDivElement>(null);
   const pendingFocus = useRef<string | null>(null);
-  const tree = useMemo(() => createFileTree(files), [files]);
+  const searchId = useId();
+  const statusId = useId();
+  const treeId = useId();
+  const [searchCollapsedDirectories, setSearchCollapsedDirectories] = useState<
+    readonly string[]
+  >([]);
+  const needle = query.trim().toLocaleLowerCase();
+  const searching = needle !== "";
+  const originalIndices = useMemo(
+    () => new Map(files.map((file, index) => [file.path, index])),
+    [files],
+  );
+  const filteredFiles = useMemo(
+    () =>
+      searching
+        ? files.filter((file) => file.path.toLocaleLowerCase().includes(needle))
+        : files,
+    [files, needle, searching],
+  );
+  const tree = useMemo(
+    () => createFileTree(filteredFiles, originalIndices),
+    [filteredFiles, originalIndices],
+  );
   const collapsed = useMemo(
-    () => new Set(collapsedDirectories),
-    [collapsedDirectories],
+    () =>
+      new Set(searching ? searchCollapsedDirectories : collapsedDirectories),
+    [collapsedDirectories, searchCollapsedDirectories, searching],
   );
   const items = useMemo(
     () => visibleTreeItems(tree, collapsed),
@@ -1553,9 +1593,18 @@ const FileNavigation = memo(function FileNavigation({
         pendingFocus.current = `directory:${path}`;
         setActiveKey(`directory:${path}`);
       }
-      onToggleDirectory(path);
+      if (searching) {
+        setSearchCollapsedDirectories((current) => {
+          const next = new Set(current);
+          if (next.has(path)) next.delete(path);
+          else next.add(path);
+          return [...next].sort();
+        });
+      } else {
+        onToggleDirectory(path);
+      }
     },
-    [collapsed, onToggleDirectory],
+    [collapsed, onToggleDirectory, searching],
   );
 
   useLayoutEffect(() => {
@@ -1565,7 +1614,7 @@ const FileNavigation = memo(function FileNavigation({
   }, [focusItem, items]);
 
   const handleKeyDown = useCallback(
-    (event: KeyboardEvent<HTMLElement>) => {
+    (event: KeyboardEvent<HTMLDivElement>) => {
       const item = (event.target as HTMLElement).closest<HTMLButtonElement>(
         "button[data-tree-item]",
       );
@@ -1636,6 +1685,34 @@ const FileNavigation = memo(function FileNavigation({
       onExit,
       toggleDirectory,
     ],
+  );
+
+  const changeQuery = useCallback(
+    (value: string) => {
+      onQueryChange(value);
+      setSearchCollapsedDirectories([]);
+    },
+    [onQueryChange],
+  );
+
+  const handleSearchKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLInputElement>) => {
+      event.stopPropagation();
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        const first = items.find((item) => item.kind === "file") ?? items[0];
+        if (first) focusItem(first.key);
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        if (query !== "") {
+          changeQuery("");
+          input.current?.focus({ preventScroll: true });
+        } else {
+          onExit();
+        }
+      }
+    },
+    [changeQuery, focusItem, items, onExit, query],
   );
 
   const renderDirectory = (
@@ -1742,7 +1819,9 @@ const FileNavigation = memo(function FileNavigation({
 
     return (
       <ul
+        aria-label={depth === 0 ? "Changed file results" : undefined}
         className="m-0 min-w-full list-none p-0"
+        id={depth === 0 ? treeId : undefined}
         role={depth === 0 ? "tree" : "group"}
       >
         {children.map(({ key, node }) => (
@@ -1755,17 +1834,60 @@ const FileNavigation = memo(function FileNavigation({
   return (
     <nav
       aria-label="Changed files"
-      className="flex max-w-full gap-1 overflow-x-auto p-2 lg:max-h-[70vh] lg:flex-col lg:overflow-auto lg:[max-height:calc(100vh-3rem)]"
-      onKeyDown={handleKeyDown}
-      onScroll={(event) =>
-        onScrollChange(
-          event.currentTarget.scrollLeft,
-          event.currentTarget.scrollTop,
-        )
-      }
-      ref={navigation}
+      className="flex min-h-0 max-w-full flex-col lg:h-full"
     >
-      {renderDirectory(tree, 0)}
+      <div className="shrink-0 border-b p-2">
+        <Label className="sr-only" htmlFor={searchId}>
+          Search changed files
+        </Label>
+        <div className="relative">
+          <Search
+            aria-hidden="true"
+            className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground"
+          />
+          <Input
+            aria-controls={treeId}
+            aria-describedby={statusId}
+            autoComplete="off"
+            className="h-7 bg-background pl-8 text-xs dark:bg-background"
+            id={searchId}
+            data-pull-focus-token="file-search"
+            onChange={(event) => changeQuery(event.currentTarget.value)}
+            onKeyDown={handleSearchKeyDown}
+            placeholder="Search changed files"
+            ref={input}
+            type="search"
+            value={query}
+          />
+        </div>
+        <p
+          aria-atomic="true"
+          aria-live="polite"
+          className="m-0 px-1 pt-1.5 text-[11px] text-muted-foreground"
+          data-file-search-status=""
+          id={statusId}
+        >
+          {searching
+            ? filteredFiles.length === 0
+              ? "No matching files"
+              : `${filteredFiles.length} of ${files.length} files`
+            : `${files.length} ${files.length === 1 ? "file" : "files"}`}
+        </p>
+      </div>
+      <div
+        className="flex min-h-0 max-w-full flex-1 gap-1 overflow-x-auto p-2 lg:flex-col lg:overflow-auto"
+        data-diff-navigation-viewport=""
+        onKeyDown={handleKeyDown}
+        onScroll={(event) =>
+          onScrollChange(
+            event.currentTarget.scrollLeft,
+            event.currentTarget.scrollTop,
+          )
+        }
+        ref={navigation}
+      >
+        {renderDirectory(tree, 0)}
+      </div>
     </nav>
   );
 });
@@ -2302,6 +2424,12 @@ function PullDiff({
     },
     [scheduleScrollPersistence],
   );
+  const changeQuery = useCallback(
+    (query: string) => {
+      updatePersistence((current) => ({ ...current, query }));
+    },
+    [updatePersistence],
+  );
   const changePatchScrollLeft = useCallback(
     (path: string, patchScrollLeft: number) => {
       pendingScroll.current.patchScrollLeft[path] = patchScrollLeft;
@@ -2538,10 +2666,10 @@ function PullDiff({
               data-diff-navigation-pane=""
             >
               <div
-                className="lg:sticky lg:top-0 lg:max-h-[calc(100vh-3rem)]"
+                className="lg:sticky lg:top-0 lg:h-full lg:max-h-[calc(100vh-3rem)]"
                 data-diff-navigation-sticky=""
               >
-                <aside data-diff-navigation="">
+                <aside className="lg:h-full lg:min-h-0" data-diff-navigation="">
                   <FileNavigation
                     activate={selectFile}
                     collapsedDirectories={
@@ -2552,8 +2680,10 @@ function PullDiff({
                     files={orderedFiles}
                     key={revision}
                     onExit={exitKeyboardNavigation}
+                    onQueryChange={changeQuery}
                     onScrollChange={changeNavigationScroll}
                     onToggleDirectory={toggleDirectory}
+                    query={currentPersistence.query}
                     scrollLeft={currentPersistence.navigationScrollLeft}
                     scrollTop={currentPersistence.navigationScrollTop}
                     selected={selected}
