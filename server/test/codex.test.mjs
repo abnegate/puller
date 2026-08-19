@@ -521,6 +521,20 @@ describe("Codex JSONL", () => {
     ]);
   });
 
+  it("tags Codex quota failures as rate limits", () => {
+    expect(
+      eventsForCodexLine(
+        '{"type":"turn.failed","error":{"message":"You have no weighted tokens left"}}',
+      ),
+    ).toEqual([
+      {
+        code: "rate_limit",
+        message: "You have no weighted tokens left",
+        type: "error",
+      },
+    ]);
+  });
+
   it("bounds malformed and unknown input safely", () => {
     expect(eventsForCodexLine("{")).toEqual([
       { text: "Codex emitted an unreadable event.", type: "diagnostic" },

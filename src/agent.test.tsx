@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   AGENT_STORAGE_KEY,
+  alternateAgent,
   setAgentPreference,
   useAgentPreference,
 } from "./agent";
@@ -52,6 +53,14 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   window.localStorage.clear();
+});
+
+describe("alternateAgent", () => {
+  it("swaps Claude and Codex", () => {
+    expect(alternateAgent("claude")).toBe("codex");
+    expect(alternateAgent("codex")).toBe("claude");
+    expect(alternateAgent("unknown")).toBe("codex");
+  });
 });
 
 describe("agent preference", () => {

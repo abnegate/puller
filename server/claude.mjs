@@ -1162,6 +1162,29 @@ const claudeFailureMessage = (value, cwd) =>
   claudeDetail(value.errors, cwd) ??
   "Claude Code reported that the run failed.";
 
+const rateLimitErrorCode = (value, message) => {
+  if (value?.api_error_status === 429) return "rate_limit";
+  const text = [
+    message,
+    value?.result,
+    value?.error,
+    value?.message,
+    value?.terminal_reason,
+  ]
+    .filter((part) => typeof part === "string")
+    .join(" ");
+  return /weekly limit|rate limit|out of credits|no weighted tokens|usage limit|\bquota\b/i.test(
+    text,
+  )
+    ? "rate_limit"
+    : undefined;
+};
+
+const agentErrorEvent = (message, value) => {
+  const code = rateLimitErrorCode(value, message);
+  return code ? { type: "error", message, code } : { type: "error", message };
+};
+
 const claudeRateLimitMessage = (value) => {
   const info = value?.rate_limit_info;
   if (!info || typeof info !== "object") return null;
@@ -1213,12 +1236,7 @@ export function eventsForClaudeLine(line, cwd) {
 
   if (value?.type === "result") {
     if (value.is_error || value.subtype === "error") {
-      return [
-        {
-          type: "error",
-          message: claudeFailureMessage(value, cwd),
-        },
-      ];
+      return [agentErrorEvent(claudeFailureMessage(value, cwd), value)];
     }
     // The child close event owns completion so the browser receives the actual exit code.
     return [];

@@ -103,7 +103,8 @@ vi.mock("./api", async (importOriginal) => ({
   streamTaskEvents: taskActions.stream,
 }));
 
-vi.mock("./fixes", () => ({
+vi.mock("./fixes", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./fixes")>()),
   cancelAgentRun: fixes.cancel,
   ClaudeRunHttpError: class ClaudeRunHttpError extends Error {},
   streamAgentRun: fixes.stream,
@@ -584,18 +585,10 @@ describe("App", () => {
     const pull = createPullsResponse().ready[0]!;
     const ciOnly = createPendingPull(301);
     const run: RunState = {
+      ...IDLE_RUN_STATE,
       actionId: "run-one",
       agent: "claude",
-      cancelling: false,
       headRefOid: pull.headRefOid,
-      history: [],
-      kind: "fix",
-      message: "",
-      output: "",
-      repairState: null,
-      reviewAttemptToken: null,
-      reviewRetry: null,
-      source: "manual",
       status: "running",
     };
     const linked: TaskState = {

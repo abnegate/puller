@@ -47,7 +47,7 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
 
-import { agentLabel } from "../agent";
+import { agentLabel, alternateAgent, useAgentPreference } from "../agent";
 import { getPullDiff, mergePull, PullDiffHttpError } from "../api";
 import {
   getPullDiffKey,
@@ -64,6 +64,7 @@ import {
   isRunPreparing,
   type PullRuns,
   type RunHistoryEntry,
+  type RunRateLimit,
   type RunState,
   type RunStatus,
 } from "../runs";
@@ -858,6 +859,53 @@ function PreviousFixes({
   );
 }
 
+function RateLimitNotice({
+  preferredAgent,
+  rateLimit,
+  onSwitch,
+}: {
+  onSwitch: (agent: Agent) => void;
+  preferredAgent: Agent;
+  rateLimit: RunRateLimit;
+}) {
+  const failed = agentLabel(rateLimit.agent);
+  const next = alternateAgent(rateLimit.agent);
+  const nextLabel = agentLabel(next);
+  const switched = preferredAgent === next;
+
+  return (
+    <div
+      aria-label={`${failed} hit a rate limit`}
+      className="mb-3 flex flex-col gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2.5 text-amber-950 sm:flex-row sm:items-center dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100"
+      data-rate-limit-notice=""
+      role="status"
+    >
+      <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
+      <div className="min-w-0 flex-1">
+        <p className="m-0 text-sm font-medium">{failed} hit a rate limit</p>
+        <p className="m-0 mt-0.5 text-xs leading-relaxed wrap-anywhere">
+          {rateLimit.message}
+        </p>
+      </div>
+      {switched ? (
+        <p className="m-0 text-xs text-amber-900 dark:text-amber-200">
+          Using {nextLabel}. Run fix to continue.
+        </p>
+      ) : (
+        <Button
+          className="min-h-11 shrink-0 sm:min-h-8"
+          onClick={() => onSwitch(next)}
+          size="sm"
+          type="button"
+          variant="outline"
+        >
+          Switch to {nextLabel}
+        </Button>
+      )}
+    </div>
+  );
+}
+
 function FixPanel({
   cancelRun,
   pull,
@@ -881,9 +929,17 @@ function FixPanel({
 >) {
   const inputId = useId();
   const active = isRunActive(run);
+  const { agent: preferredAgent, setAgent } = useAgentPreference();
 
   return (
     <div>
+      {run.rateLimit !== null && (
+        <RateLimitNotice
+          onSwitch={setAgent}
+          preferredAgent={preferredAgent}
+          rateLimit={run.rateLimit}
+        />
+      )}
       <form
         className="grid gap-2"
         onSubmit={(event) => {
@@ -1678,8 +1734,24 @@ function ReadyRow({
           </CardContent>
         )}
       </Card>
+      {run.rateLimit !== null && (
+        <div className="mt-3">
+          <ReadyRateLimitNotice rateLimit={run.rateLimit} />
+        </div>
+      )}
       {terminal && <RunOutput pull={pull} run={run} />}
     </>
+  );
+}
+
+function ReadyRateLimitNotice({ rateLimit }: { rateLimit: RunRateLimit }) {
+  const { agent, setAgent } = useAgentPreference();
+  return (
+    <RateLimitNotice
+      onSwitch={setAgent}
+      preferredAgent={agent}
+      rateLimit={rateLimit}
+    />
   );
 }
 

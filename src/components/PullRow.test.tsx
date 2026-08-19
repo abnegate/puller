@@ -22,6 +22,8 @@ import {
 } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { setAgentPreference } from "../agent";
+
 const motionSettings = vi.hoisted(() => ({ reduced: false }));
 
 vi.mock("motion/react", async (importOriginal) => {
@@ -467,6 +469,7 @@ afterEach(() => {
   cleanup();
   transcripts.clear();
   motionSettings.reduced = false;
+  setAgentPreference("claude");
   vi.mocked(getPullCommitDiff).mockReset();
   vi.mocked(getPullCommits).mockReset();
   vi.mocked(getPullDiff).mockReset();
@@ -1214,6 +1217,33 @@ describe("PullRow controlled Fix presentation", () => {
     expect(screen.getByRole("button", { name: "Run fix" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(controls.cancel).toHaveBeenCalledWith(pull.url);
+  });
+
+  it("shows a rate-limit notice with a control to switch agents", () => {
+    const pull = getBlockedPull();
+    renderRow(
+      pull,
+      "blocked",
+      createRun({
+        agent: "claude",
+        rateLimit: {
+          agent: "claude",
+          message: "You've hit your weekly limit.",
+        },
+        status: "idle",
+      }),
+    );
+
+    const notice = screen.getByRole("status", { name: /rate limit/i });
+    expect(notice).toHaveTextContent("You've hit your weekly limit.");
+    const swap = screen.getByRole("button", { name: "Switch to Codex" });
+    fireEvent.click(swap);
+    expect(
+      screen.getByText("Using Codex. Run fix to continue."),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Switch to Codex" }),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps compact desktop controls and 44px mobile targets", () => {

@@ -742,6 +742,23 @@ function bounded(value) {
     : `${text.slice(0, MAX_DIAGNOSTIC)}\n[diagnostic truncated]`;
 }
 
+function codexErrorEvent(value, cwd) {
+  const message = cleanText(
+    value.error?.message ??
+      value.message ??
+      "Codex reported that the run failed.",
+    cwd,
+  );
+  const text = [message, value.error?.message, value.message]
+    .filter((part) => typeof part === "string")
+    .join(" ");
+  return /weekly limit|rate limit|out of credits|no weighted tokens|usage limit|\bquota\b/i.test(
+    text,
+  )
+    ? { type: "error", message, code: "rate_limit" }
+    : { type: "error", message };
+}
+
 export function eventsForCodexLine(line, cwd = "") {
   if (line === "") return [];
   let value;
@@ -758,30 +775,10 @@ export function eventsForCodexLine(line, cwd = "") {
     return [{ type: "protocol", status: "completed" }];
   }
   if (value?.type === "turn.failed") {
-    return [
-      {
-        type: "error",
-        message: cleanText(
-          value.error?.message ??
-            value.message ??
-            "Codex reported that the run failed.",
-          cwd,
-        ),
-      },
-    ];
+    return [codexErrorEvent(value, cwd)];
   }
   if (value?.type === "error") {
-    return [
-      {
-        type: "error",
-        message: cleanText(
-          value.message ??
-            value.error?.message ??
-            "Codex reported that the run failed.",
-          cwd,
-        ),
-      },
-    ];
+    return [codexErrorEvent(value, cwd)];
   }
   if (
     (value?.type === "item.started" ||

@@ -61,6 +61,34 @@ describe("default fix instructions", () => {
   });
 });
 
+describe("rate-limit events", () => {
+  it("accepts a tagged rate-limit error from the stream", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(tokenResponse())
+        .mockResolvedValueOnce(
+          streamResponse([
+            '{"type":"start","runId":"run-1","repository":"appwrite/cloud","number":102}\n',
+            '{"type":"error","code":"rate_limit","message":"You\'ve hit your weekly limit."}\n',
+          ]),
+        ),
+    );
+
+    const events = [];
+    for await (const event of streamClaudeRun(request)) {
+      events.push(event);
+    }
+
+    expect(events.at(-1)).toEqual({
+      code: "rate_limit",
+      message: "You've hit your weekly limit.",
+      type: "error",
+    });
+  });
+});
+
 describe("streamClaudeRun", () => {
   it("decodes fragmented, coalesced, and final unterminated NDJSON incrementally", async () => {
     const fetchMock = vi

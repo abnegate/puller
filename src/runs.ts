@@ -9,6 +9,8 @@ import {
   type AgentRunEvent,
   type AgentRunRequest,
   DEFAULT_FIX_INSTRUCTIONS,
+  RATE_LIMIT_EVENT_CODE,
+  isRateLimitMessage,
   type AutoParallelism,
   type AutoTrigger,
   type ReviewFeedback,
@@ -163,6 +165,11 @@ export type RunStartOutcome =
       source: RunSource;
     };
 
+export type RunRateLimit = Readonly<{
+  agent: Agent;
+  message: string;
+}>;
+
 export type RunState = {
   actionId: string | null;
   agent: Agent;
@@ -172,6 +179,7 @@ export type RunState = {
   kind: "fix" | "repair";
   message: string;
   output: string;
+  rateLimit: RunRateLimit | null;
   repairState: RepairState | null;
   reviewAttemptToken: ReviewAttemptToken | null;
   reviewRetry: ReviewRetryContext | null;
@@ -229,6 +237,7 @@ type Runtime = {
   kind: "fix" | "repair";
   pull: PullReadiness | null;
   pendingTranscriptKey: string | null;
+  rateLimit: RunRateLimit | null;
   reviewDraft: string | null;
   reviewFeedback: Readonly<ReviewFeedback> | null;
   runId: string | null;
@@ -249,6 +258,7 @@ export const IDLE_RUN_STATE: RunState = Object.freeze({
   kind: "fix",
   message: "",
   output: "",
+  rateLimit: null,
   repairState: null,
   reviewAttemptToken: null,
   reviewRetry: null,
@@ -439,6 +449,20 @@ const startFailure = (
 
 const codeAgentLabel = (agent: Agent): string =>
   agent === "claude" ? "Claude Code" : "Codex";
+
+export const rateLimitFromEvent = (
+  event: AgentRunEvent,
+  agent: Agent,
+): RunRateLimit | null => {
+  if (event.type !== "error" && event.type !== "limit") return null;
+  if (
+    (event.type === "error" && event.code === RATE_LIMIT_EVENT_CODE) ||
+    isRateLimitMessage(event.message)
+  ) {
+    return Object.freeze({ agent, message: event.message });
+  }
+  return null;
+};
 
 const formatEvent = (event: AgentRunEvent): string | null => {
   switch (event.type) {
@@ -885,6 +909,7 @@ export function usePullRuns(
         kind: "fix",
         pendingTranscriptKey: null,
         pull: null,
+        rateLimit: null,
         reviewDraft:
           options.source === "review"
             ? (options.draft ?? options.feedback.body)
@@ -908,6 +933,7 @@ export function usePullRuns(
         headRefOid: null,
         kind: "fix",
         output: "",
+        rateLimit: null,
         repairState: null,
         source,
         status: source === "review" ? "preparing" : "starting",
@@ -1073,6 +1099,7 @@ export function usePullRuns(
                 runtime.source === "manual" && status === "completed"
                   ? ""
                   : existing.message,
+              rateLimit: runtime.rateLimit,
               reviewAttemptToken:
                 runtime.source === "review"
                   ? null
@@ -1168,6 +1195,8 @@ export function usePullRuns(
 
             if (terminal !== null) {
               const formatted = formatEvent(event);
+              const rateLimit = rateLimitFromEvent(event, runtime.agent);
+              if (rateLimit !== null) runtime.rateLimit = rateLimit;
               if (runtime.accepted) {
                 runtime.finalize(
                   terminal,
@@ -1185,6 +1214,7 @@ export function usePullRuns(
                   formatted === null
                     ? existing.output
                     : append(existing.output, formatted, event.type !== "text"),
+                rateLimit: rateLimit ?? existing.rateLimit,
                 status: terminal,
               }));
               settleAcceptance({
@@ -1333,6 +1363,7 @@ export function usePullRuns(
         kind: "repair",
         pendingTranscriptKey: null,
         pull,
+        rateLimit: null,
         reviewDraft: null,
         reviewFeedback: null,
         runId: null,

@@ -418,6 +418,7 @@ describe("Claude Code request and parser", () => {
       ),
     ).toEqual([
       {
+        code: "rate_limit",
         message: "You've hit your weekly limit · resets 3pm (Pacific/Auckland)",
         type: "error",
       },

@@ -429,6 +429,38 @@ describe("usePullRuns", () => {
     },
   );
 
+  it("keeps a rate-limit failure on the idle run after the transcript is archived", async () => {
+    const [pull] = pulls();
+    fixes.stream.mockImplementation(async function* (
+      request: ClaudeRunRequest,
+    ) {
+      yield {
+        number: request.number,
+        repository: request.repository,
+        runId: "rate-limit-run",
+        type: "start",
+      } satisfies ClaudeRunEvent;
+      yield {
+        code: "rate_limit",
+        message: "You've hit your weekly limit.",
+        type: "error",
+      } satisfies ClaudeRunEvent;
+    });
+    const view = renderPullRuns([pull]);
+
+    await act(async () => {
+      await finishRun(view.result.current.start(pull));
+    });
+
+    expect(view.result.current.states.get(pull.url)).toMatchObject({
+      rateLimit: {
+        agent: "claude",
+        message: "You've hit your weekly limit.",
+      },
+      status: "idle",
+    });
+  });
+
   it("accepts an automatic run before completion and preserves the manual draft", async () => {
     const gate = createDeferred<void>();
     const [pull] = pulls();

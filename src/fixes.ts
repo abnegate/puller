@@ -106,9 +106,16 @@ export type ClaudeRunEvent =
   | { type: "tool"; name: string; status?: string }
   | { type: "diagnostic"; text: string }
   | { type: "complete"; exitCode: number }
-  | { type: "error"; message: string }
+  | { type: "error"; code?: "rate_limit"; message: string }
   | { type: "cancelled"; message?: string }
   | { type: "limit"; message: string };
+
+export const RATE_LIMIT_EVENT_CODE = "rate_limit";
+
+export const isRateLimitMessage = (message: string): boolean =>
+  /weekly limit|rate limit|out of credits|no weighted tokens|usage limit|\bquota\b/i.test(
+    message,
+  );
 
 export type AgentRunEvent =
   | {
@@ -240,12 +247,27 @@ const parseEvent = (value: unknown, label = "Claude"): ClaudeRunEvent => {
       }
       break;
     case "error":
+      if (
+        isNonEmptyString(value.message) &&
+        (hasOnlyKeys(value, ["type", "message"]) ||
+          (hasOnlyKeys(value, ["type", "message", "code"]) &&
+            value.code === RATE_LIMIT_EVENT_CODE))
+      ) {
+        return value.code === RATE_LIMIT_EVENT_CODE
+          ? {
+              code: RATE_LIMIT_EVENT_CODE,
+              message: value.message,
+              type: "error",
+            }
+          : { message: value.message, type: "error" };
+      }
+      break;
     case "limit":
       if (
         hasOnlyKeys(value, ["type", "message"]) &&
         isNonEmptyString(value.message)
       ) {
-        return { message: value.message, type: value.type };
+        return { message: value.message, type: "limit" };
       }
       break;
     case "cancelled":
