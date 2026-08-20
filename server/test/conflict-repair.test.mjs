@@ -213,6 +213,7 @@ function context(overrides = {}) {
     spawn,
     validateFiles,
     ...(overrides.prepareCodex ? { prepareCodex: overrides.prepareCodex } : {}),
+    ...(overrides.prepareGrok ? { prepareGrok: overrides.prepareGrok } : {}),
     ...(overrides.stateRoot ? { stateRoot: overrides.stateRoot } : {}),
   });
   return {
@@ -527,6 +528,138 @@ describe("conflict repair manager", () => {
       expect(observed.events[0].output).toContain("[secret]");
       expect(observed.events[0].output).not.toContain(root);
       expect(cleanup).toHaveBeenCalledOnce();
+    } finally {
+      await manager.shutdown();
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  it("lets Grok edit a disposable conflict mirror while Puller copies back and publishes", async () => {
+    const root = await mkdtemp(join(homedir(), ".puller-conflict-test-"));
+    let staged = false;
+    let committed = false;
+    let committedContent = "";
+    const run = vi.fn(async (file, argumentsList) => {
+      const cwd = argumentsList[1];
+      if (argumentsList.includes("checkout")) {
+        const path = join(cwd, "src", "a.js");
+        await mkdir(join(cwd, "src"), { recursive: true });
+        await writeFile(
+          path,
+          "<<<<<<< HEAD\nhead\n=======\nbase\n>>>>>>> base\n",
+        );
+      }
+      if (argumentsList.includes("merge")) {
+        const error = new Error("conflict");
+        error.code = 1;
+        throw error;
+      }
+      if (argumentsList.includes("rev-parse")) {
+        const reference = argumentsList.at(-1);
+        if (reference === "refs/puller/base^{commit}") {
+          return { stderr: "", stdout: `${BASE}\n` };
+        }
+        if (reference === "refs/puller/head^{commit}") {
+          return { stderr: "", stdout: `${HEAD}\n` };
+        }
+        return {
+          stderr: "",
+          stdout: `${committed ? COMMIT : HEAD}\n`,
+        };
+      }
+      if (
+        argumentsList.includes("diff") &&
+        argumentsList.includes("--diff-filter=U")
+      ) {
+        return {
+          stderr: "",
+          stdout: staged ? "" : "src/a.js\0",
+        };
+      }
+      if (
+        argumentsList.includes("add") &&
+        argumentsList.includes("--") &&
+        argumentsList.includes("src/a.js")
+      ) {
+        staged = true;
+      }
+      if (argumentsList.includes("commit")) {
+        committed = true;
+        committedContent = await readFile(join(cwd, "src", "a.js"), "utf8");
+      }
+      return { stderr: "", stdout: "" };
+    });
+    const spawned = child();
+    let mirror;
+    const cleanup = vi.fn(async () => undefined);
+    const prepareGrok = vi.fn(async (options) => {
+      mirror = options.target;
+      expect(options.deniedPaths).toHaveLength(1);
+      expect(await readdir(mirror)).toEqual(["src"]);
+      return {
+        args: [
+          "-p",
+          "trusted conflict prompt",
+          "--output-format",
+          "streaming-json",
+        ],
+        cleanup,
+        command: "/Users/test/.grok/bin/grok",
+        cwd: mirror,
+        environment: {},
+        prompt: "trusted conflict prompt",
+      };
+    });
+    const spawn = vi.fn(() => {
+      queueMicrotask(() => {
+        void writeFile(join(mirror, "src", "a.js"), "head\nbase\n").then(() => {
+          spawned.stdout.write('{"type":"text","data":"Resolved."}\n');
+          spawned.stdout.write('{"type":"end","stopReason":"end_turn"}\n');
+          spawned.stdout.end();
+          spawned.stderr.end();
+          spawned.emit("close", 0, null);
+        });
+      });
+      return spawned;
+    });
+    const manager = createConflictRepairManager({
+      coordinator: createRunCoordinator({ limit: 1 }),
+      createId: () => "repair-grok",
+      createToken: () => "G".repeat(43),
+      executor: { json: vi.fn(), rest: vi.fn() },
+      inspectAccess: vi.fn(async () => ({ permissions: { push: true } })),
+      inspectPull: vi.fn(async () => pull()),
+      loadPull: vi.fn(async () => authoredPull()),
+      prepareGrok,
+      removeTemporary: (path) => rm(path, { force: true, recursive: true }),
+      run,
+      spawn,
+      stateRoot: root,
+    });
+    try {
+      const queued = manager.enqueue({ ...input, agent: "grok" });
+      await waitFor(manager, queued.id, ["ready", "conflict", "failed"]);
+      const observed = observation();
+      await manager.watch(
+        {
+          id: queued.id,
+          number: 7,
+          repository: "owner/repo",
+          token: queued.token,
+        },
+        observed.value,
+      );
+      expect(observed.events[0]).toMatchObject({ state: "ready" });
+      expect(queued.agent).toBe("grok");
+      expect(committedContent).toBe("head\nbase\n");
+      expect(observed.events[0].agent).toBe("grok");
+      expect(observed.events[0].output).toContain("Grok started.");
+      expect(cleanup).toHaveBeenCalledOnce();
+      expect(spawn).toHaveBeenCalledWith(
+        "/Users/test/.grok/bin/grok",
+        expect.arrayContaining(["-p", "--output-format", "streaming-json"]),
+        expect.objectContaining({ stdio: ["ignore", "pipe", "pipe"] }),
+      );
     } finally {
       await manager.shutdown();
       await rm(root, { force: true, recursive: true });

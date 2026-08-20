@@ -1670,6 +1670,65 @@ describe("verification run manager", () => {
     expect(codexCleanup).toHaveBeenCalledOnce();
   });
 
+  it("spawns Grok verification with streaming-json and observes text markers", async () => {
+    const grokCleanup = vi.fn(async () => undefined);
+    const prepareGrok = vi.fn(async () => ({
+      args: [
+        "-p",
+        "trusted grok prompt",
+        "--output-format",
+        "streaming-json",
+        "--sandbox",
+        "puller-read",
+      ],
+      cleanup: grokCleanup,
+      command: "/Users/test/.grok/bin/grok",
+      cwd: "/protected/snapshot",
+      environment: { PATH: "/usr/bin:/bin" },
+      prompt: "trusted grok prompt",
+    }));
+    const context = differentialManager({ prepareGrok });
+    const output = channel();
+    const run = await context.value.start(
+      { ...input, agent: "grok" },
+      output.value,
+    );
+    expect(context.spawn).toHaveBeenCalledWith(
+      "/Users/test/.grok/bin/grok",
+      expect.arrayContaining([
+        "-p",
+        "--output-format",
+        "streaming-json",
+        "--sandbox",
+        "puller-read",
+      ]),
+      expect.objectContaining({
+        cwd: "/protected/snapshot",
+        stdio: ["ignore", "pipe", "pipe"],
+      }),
+    );
+    context.child.stdout.write(
+      `${JSON.stringify({
+        type: "text",
+        data: `Verified. ${verificationMarker("verified", [behavioralRecipe])}`,
+      })}\n`,
+    );
+    context.child.stdout.write('{"type":"end","stopReason":"end_turn"}\n');
+    context.child.emit("close", 0, null);
+    await run.done;
+    expect(output.events[0]).toMatchObject({ agent: "grok", type: "start" });
+    expect(output.events).toContainEqual({
+      text: "Grok started.",
+      type: "diagnostic",
+    });
+    expect(output.events.at(-1)).toEqual({
+      type: "complete",
+      exitCode: 0,
+      outcome: "verified",
+    });
+    expect(grokCleanup).toHaveBeenCalledOnce();
+  });
+
   it("reports a Codex cleanup refusal instead of claiming verification succeeded", async () => {
     const codexCleanup = vi.fn(async () => {
       throw new CodexError(

@@ -203,6 +203,9 @@ function fixture(overrides = {}) {
     ...(overrides.prepareCodex === undefined
       ? {}
       : { prepareCodex: overrides.prepareCodex }),
+    ...(overrides.prepareGrok === undefined
+      ? {}
+      : { prepareGrok: overrides.prepareGrok }),
     ...(overrides.git === undefined ? {} : { git: overrides.git }),
     ...(overrides.runtime === undefined ? {} : { runtime: overrides.runtime }),
     removeTemporary: vi.fn(async () => undefined),
@@ -267,6 +270,70 @@ describe("review Claude runs", () => {
       '{"type":"item.completed","item":{"type":"agent_message","text":"Done."}}\n',
     );
     process.stdout.write('{"type":"turn.completed"}\n');
+    process.emit("close", 0, null);
+    await started.done;
+
+    expect(output.events.at(-1)).toEqual({ type: "complete", exitCode: 0 });
+    expect(
+      git.mock.calls.some(
+        ([, arguments_]) =>
+          arguments_.includes("push") &&
+          arguments_.includes("HEAD:refs/heads/fix/review"),
+      ),
+    ).toBe(true);
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it("lets Grok edit while Puller commits and normally pushes the review fix", async () => {
+    const process = child();
+    const cleanup = vi.fn(async () => undefined);
+    const prepareGrok = vi.fn(async () => ({
+      args: [
+        "-p",
+        "trusted review prompt",
+        "--output-format",
+        "streaming-json",
+      ],
+      cleanup,
+      command: "/Users/test/.grok/bin/grok",
+      cwd: "/trusted/workspace",
+      environment: {},
+      prompt: "trusted review prompt",
+    }));
+    let statuses = 0;
+    const git = vi.fn(async (_command, arguments_) => {
+      if (arguments_.includes("rev-parse")) {
+        return { stderr: "", stdout: `${HEAD}\n` };
+      }
+      if (arguments_.includes("status")) {
+        statuses += 1;
+        return {
+          stderr: "",
+          stdout: statuses === 1 ? " M src/example.js\n" : "",
+        };
+      }
+      return { stderr: "", stdout: "" };
+    });
+    const running = fixture({ child: process, git, prepareGrok });
+    const output = stream();
+    const started = await running.manager.start(
+      input({ agent: "grok" }),
+      output.value,
+    );
+
+    expect(prepareGrok).toHaveBeenCalledWith(
+      expect.objectContaining({
+        purpose: "review",
+        target: "/trusted/workspace",
+      }),
+    );
+    expect(running.spawn).toHaveBeenCalledWith(
+      "/Users/test/.grok/bin/grok",
+      expect.arrayContaining(["-p", "--output-format", "streaming-json"]),
+      expect.objectContaining({ stdio: ["ignore", "pipe", "pipe"] }),
+    );
+    process.stdout.write('{"type":"text","data":"Done."}\n');
+    process.stdout.write('{"type":"end","stopReason":"end_turn"}\n');
     process.emit("close", 0, null);
     await started.done;
 

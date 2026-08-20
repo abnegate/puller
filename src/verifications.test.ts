@@ -478,7 +478,7 @@ describe("useReleaseVerificationBatches", () => {
       ],
     ]);
     api.streamBatch.mockImplementation(async function* (request: {
-      agent: "claude" | "codex";
+      agent: "claude" | "codex" | "grok";
       releaseId: string;
       repository: string;
       tag: string;
@@ -539,7 +539,7 @@ describe("useReleaseVerificationBatches", () => {
   it("captures Codex for Verify all and every batch member", async () => {
     const item = batchRelease();
     api.streamBatch.mockImplementation(async function* (request: {
-      agent: "claude" | "codex";
+      agent: "claude" | "codex" | "grok";
       releaseId: string;
       repository: string;
       tag: string;

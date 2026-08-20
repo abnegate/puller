@@ -1,3 +1,4 @@
+import { agentLabel } from "./agent";
 import type { Agent, ReviewCommentSide } from "./types";
 
 export type RunSource = "manual" | "auto" | "review";
@@ -183,10 +184,7 @@ const validateReviewRequest = (
   }
 };
 
-const parseEvent = (
-  value: unknown,
-  label = "Claude",
-): ClaudeRunEvent => {
+const parseEvent = (value: unknown, label = "Claude"): ClaudeRunEvent => {
   if (!isRecord(value) || !isNonEmptyString(value.type)) {
     throw new Error(`${label} returned an invalid stream event.`);
   }
@@ -265,7 +263,9 @@ const parseAgentEvent = (value: unknown, label: string): AgentRunEvent => {
     isRecord(value) &&
     value.type === "start" &&
     hasOnlyKeys(value, ["agent", "type", "runId", "repository", "number"]) &&
-    (value.agent === "claude" || value.agent === "codex") &&
+    (value.agent === "claude" ||
+      value.agent === "codex" ||
+      value.agent === "grok") &&
     isNonEmptyString(value.runId) &&
     isNonEmptyString(value.repository) &&
     isInteger(value.number) &&
@@ -545,7 +545,7 @@ export async function* streamAgentRun(
     signal,
   );
 
-  const label = agent === "codex" ? "Codex" : "Claude";
+  const label = agentLabel(agent);
   if (!response.ok) {
     throw await getResponseError(response, `${label} could not be started`);
   }
@@ -630,7 +630,10 @@ export const cancelAgentRun = async (
   );
 
   if (!response.ok) {
-    throw await getResponseError(response, "The agent run could not be cancelled");
+    throw await getResponseError(
+      response,
+      "The agent run could not be cancelled",
+    );
   }
 };
 

@@ -436,8 +436,11 @@ const startFailure = (
   return { code, kind: "failed", message, source };
 };
 
-const codeAgentLabel = (agent: Agent): string =>
-  agent === "claude" ? "Claude Code" : "Codex";
+const codeAgentLabel = (agent: Agent): string => {
+  if (agent === "codex") return "Codex";
+  if (agent === "grok") return "Grok";
+  return "Claude Code";
+};
 
 const formatEvent = (event: AgentRunEvent): string | null => {
   switch (event.type) {
@@ -828,7 +831,7 @@ export function usePullRuns(
         return {
           code: "agent_invalid",
           kind: "failed",
-          message: "Select Claude or Codex for this automatic run.",
+          message: "Select Claude, Codex, or Grok for this automatic run.",
           source,
         };
       }

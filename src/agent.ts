@@ -17,13 +17,24 @@ type StoredAgent = {
 };
 
 export const isAgent = (value: unknown): value is Agent =>
-  value === "claude" || value === "codex";
+  value === "claude" || value === "codex" || value === "grok";
 
 export const normalizeAgent = (value: unknown): Agent =>
   isAgent(value) ? value : DEFAULT_AGENT;
 
-export const agentLabel = (agent: unknown): string =>
-  normalizeAgent(agent) === "codex" ? "Codex" : "Claude";
+export const agentLabel = (agent: unknown): string => {
+  const selected = normalizeAgent(agent);
+  if (selected === "codex") return "Codex";
+  if (selected === "grok") return "Grok";
+  return "Claude";
+};
+
+export const agentProductLabel = (agent: unknown): string => {
+  const selected = normalizeAgent(agent);
+  if (selected === "codex") return "Codex";
+  if (selected === "grok") return "Grok";
+  return "Claude Code";
+};
 
 const parseAgent = (raw: string | null): Agent => {
   if (raw === null) return DEFAULT_AGENT;
@@ -76,8 +87,7 @@ const subscribe = (notify: () => void): (() => void) => {
   const handleStorage = (event: StorageEvent) => {
     if (event.key !== null && event.key !== AGENT_STORAGE_KEY) return;
     storage();
-    snapshot =
-      event.key === null ? DEFAULT_AGENT : parseAgent(event.newValue);
+    snapshot = event.key === null ? DEFAULT_AGENT : parseAgent(event.newValue);
     memoryOnly = false;
     notify();
   };

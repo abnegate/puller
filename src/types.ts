@@ -1,9 +1,13 @@
 export type CIState = "success" | "pending" | "failure" | "none" | "unknown";
 
-export type Agent = "claude" | "codex";
+export type Agent = "claude" | "codex" | "grok";
 
 export type CICheckState =
-  Exclude<CIState, "none"> | "in_progress" | "neutral" | "queued" | "skipped";
+  | Exclude<CIState, "none">
+  | "in_progress"
+  | "neutral"
+  | "queued"
+  | "skipped";
 
 export type CICheck = {
   detailsUrl: string | null;
@@ -321,7 +325,8 @@ export type MergePullRepairResponse = {
 };
 
 export type MergePullResponse =
-  MergePullSuccessResponse | MergePullRepairResponse;
+  | MergePullSuccessResponse
+  | MergePullRepairResponse;
 
 export type RepairState =
   | "repair_queued"
@@ -442,7 +447,12 @@ export type ReleaseVerificationRequest = {
 };
 
 export type ReleaseVerificationState =
-  "queued" | "running" | "complete" | "error" | "cancelled" | "existing";
+  | "queued"
+  | "running"
+  | "complete"
+  | "error"
+  | "cancelled"
+  | "existing";
 
 export type ReleaseVerificationPull = VerificationRunRequest;
 

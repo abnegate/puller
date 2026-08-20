@@ -1,0 +1,4 @@
+{"type":"tool_call","toolCallId":"call_1","title":"Test","kind":"execute","status":"in_progress","toolName":"run_terminal_cmd","rawInput":{"command":"npm test"}}
+{"type":"tool_call_update","toolCallId":"call_1","status":"completed","toolName":"run_terminal_cmd","rawOutput":"Tests passed.\n"}
+{"type":"text","data":"Implemented and verified the change."}
+{"type":"end","stopReason":"end_turn","sessionId":"abc123"}

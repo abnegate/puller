@@ -20,12 +20,16 @@ import {
   createStreamRedactor,
   streamingClaudeArguments,
 } from "./claude.mjs";
-import { agentLabel, migrateAgent, validateAgent } from "./agent.mjs";
 import {
-  CodexError,
-  createCodexInvocation,
-  eventsForCodexLine,
-} from "./codex.mjs";
+  agentLabel,
+  followupSignal,
+  interruptSignal,
+  isIsolatedAgent,
+  migrateAgent,
+  validateAgent,
+} from "./agent.mjs";
+import { createCodexInvocation, eventsForCodexLine } from "./codex.mjs";
+import { createGrokInvocation, eventsForGrokLine } from "./grok.mjs";
 import {
   createTaskRepositoryCatalog,
   resolveTaskWorkspaceOptions,
@@ -211,9 +215,9 @@ function taskPrompt(task, input) {
     `An existing draft pull request is already open: ${task.pullRequest.url}`,
     `The checked-out task branch is ${task.branch}, based on ${task.base}.`,
     "",
-    input.agent === "codex"
-      ? "Implement the task below completely. Inspect the repository, make the changes, add or update tests, and run the relevant validation. Do not use Git or publish remote state; Puller will validate, commit, and push the intended changes after you finish."
-      : "Implement the task below completely. Inspect the repository, make the changes, add or update tests, run the relevant validation, commit every intended change, and push this existing branch to origin.",
+    input.agent === "claude"
+      ? "Implement the task below completely. Inspect the repository, make the changes, add or update tests, run the relevant validation, commit every intended change, and push this existing branch to origin."
+      : "Implement the task below completely. Inspect the repository, make the changes, add or update tests, and run the relevant validation. Do not use Git or publish remote state; Puller will validate, commit, and push the intended changes after you finish.",
     "Do not create another branch, worktree, pull request, or release. Do not close or merge the existing pull request.",
     "",
     input.prompt,
@@ -480,6 +484,7 @@ export function createTaskManager({
   repositoryRoot,
   write = writeFile,
   prepareCodex = createCodexInvocation,
+  prepareGrok = createGrokInvocation,
 } = {}) {
   const configured = resolveTaskWorkspaceOptions(environment);
   const stateRoot = resolve(configuredStateRoot || configured.stateRoot);
@@ -946,10 +951,7 @@ export function createTaskManager({
     }
   }
 
-  function terminate(
-    record,
-    signal = record.input.agent === "codex" ? "SIGINT" : "SIGTERM",
-  ) {
+  function terminate(record, signal = interruptSignal(record.input.agent)) {
     if (!record.child || record.childClosed) return;
     try {
       kill(-record.child.pid, signal);
@@ -984,10 +986,10 @@ export function createTaskManager({
     });
     record.killTimer = setTimer(() => {
       record.killTimer = null;
-      terminate(record, record.input.agent === "codex" ? "SIGTERM" : "SIGKILL");
+      terminate(record, followupSignal(record.input.agent));
       record.forceTimer = setTimer(() => {
         record.forceTimer = null;
-        if (record.input.agent === "codex") terminate(record, "SIGKILL");
+        if (isIsolatedAgent(record.input.agent)) terminate(record, "SIGKILL");
         release(record, true);
         record.resolveKill?.();
         record.resolveKill = null;
@@ -1086,13 +1088,14 @@ export function createTaskManager({
         onLimit: limit,
         onLine: (line) => {
           if (!line.trim()) return;
-          if (record.input.agent === "codex") {
-            for (const event of eventsForCodexLine(
-              line,
-              record.task.worktree,
-            )) {
+          if (isIsolatedAgent(record.input.agent)) {
+            const events =
+              record.input.agent === "grok"
+                ? eventsForGrokLine(line, record.task.worktree)
+                : eventsForCodexLine(line, record.task.worktree);
+            for (const event of events) {
               if (event.type === "protocol") {
-                record.codexCompleted = event.status === "completed";
+                record.streamCompleted = event.status === "completed";
               } else if (event.type === "error") {
                 stop(record, event.message);
               } else if (event.type === "text") {
@@ -1166,7 +1169,7 @@ export function createTaskManager({
       throw new TaskError(
         409,
         "task_head_changed",
-        "The task branch changed while Codex was running.",
+        `The task branch changed while ${agentLabel(record.input.agent)} was running.`,
       );
     }
     const status = await execute(
@@ -1178,7 +1181,7 @@ export function createTaskManager({
       throw new TaskError(
         409,
         "task_no_changes",
-        "Codex completed without making task changes.",
+        `${agentLabel(record.input.agent)} completed without making task changes.`,
       );
     }
     await execute(
@@ -1254,9 +1257,10 @@ export function createTaskManager({
     }
   }
 
-  async function cleanupCodex(record) {
-    const invocation = record.codex;
+  async function cleanupIsolated(record) {
+    const invocation = record.codex ?? record.grok;
     record.codex = null;
+    record.grok = null;
     if (invocation) await invocation.cleanup();
   }
 
@@ -1282,26 +1286,41 @@ export function createTaskManager({
     const decoders = createDecoders(record);
     let child;
     try {
-      if (record.input.agent === "codex") {
-        record.codex = await prepareCodex({
-          environment,
-          newTask: true,
-          prompt,
-          purpose: "task",
-          target: record.task.worktree,
-        });
-        child = spawn(record.codex.command, record.codex.args, {
-          cwd: record.codex.cwd,
+      if (isIsolatedAgent(record.input.agent)) {
+        const isolated =
+          record.input.agent === "grok"
+            ? await prepareGrok({
+                environment,
+                newTask: true,
+                prompt,
+                purpose: "task",
+                target: record.task.worktree,
+              })
+            : await prepareCodex({
+                environment,
+                newTask: true,
+                prompt,
+                purpose: "task",
+                target: record.task.worktree,
+              });
+        if (record.input.agent === "grok") record.grok = isolated;
+        else record.codex = isolated;
+        child = spawn(isolated.command, isolated.args, {
+          cwd: isolated.cwd,
           detached: true,
-          env: record.codex.environment,
+          env: isolated.environment,
           shell: false,
-          stdio: ["pipe", "pipe", "pipe"],
+          stdio:
+            record.input.agent === "codex"
+              ? ["pipe", "pipe", "pipe"]
+              : ["ignore", "pipe", "pipe"],
           windowsHide: true,
         });
         if (
-          !child.stdin ||
-          typeof child.stdin.end !== "function" ||
-          typeof child.stdin.once !== "function"
+          record.input.agent === "codex" &&
+          (!child.stdin ||
+            typeof child.stdin.end !== "function" ||
+            typeof child.stdin.once !== "function")
         ) {
           throw new TaskError(
             500,
@@ -1332,7 +1351,7 @@ export function createTaskManager({
         );
       }
     } catch (cause) {
-      await cleanupCodex(record).catch(() => {});
+      await cleanupIsolated(record).catch(() => {});
       throw new TaskError(
         500,
         `${record.input.agent}_start_failed`,
@@ -1344,10 +1363,13 @@ export function createTaskManager({
     record.childDone = new Promise((resolveDone) => {
       record.resolveChildDone = resolveDone;
     });
+    if (record.input.agent === "grok") {
+      output(record, "stderr", "Grok started.\n");
+    }
 
     try {
       child.once("close", (code, signal) => {
-        closeChild(record, record.input.agent !== "codex");
+        closeChild(record, !isIsolatedAgent(record.input.agent));
         void (async () => {
           try {
             if (record.shutdown) {
@@ -1361,22 +1383,22 @@ export function createTaskManager({
             } else if (record.failure) {
               await finish(record, "failed", record.failure);
             } else if (
-              record.input.agent === "codex" &&
-              (code !== 0 || !record.codexCompleted)
+              isIsolatedAgent(record.input.agent) &&
+              (code !== 0 || !record.streamCompleted)
             ) {
               await finish(
                 record,
                 "failed",
                 signal
-                  ? "Codex was terminated unexpectedly."
+                  ? `${agentLabel(record.input.agent)} was terminated unexpectedly.`
                   : code === 0
-                    ? "Codex exited without completing its turn."
-                    : "Codex exited with an error.",
+                    ? `${agentLabel(record.input.agent)} exited without completing its turn.`
+                    : `${agentLabel(record.input.agent)} exited with an error.`,
               );
             } else if (code === 0) {
-              if (record.input.agent === "codex") {
+              if (isIsolatedAgent(record.input.agent)) {
                 await publishCodexTask(record);
-                await cleanupCodex(record);
+                await cleanupIsolated(record);
               }
               await finish(record, "completed");
             } else {
@@ -1395,7 +1417,7 @@ export function createTaskManager({
               processError(error, "The task could not be published.").message,
             );
           } finally {
-            await cleanupCodex(record).catch(() => {});
+            await cleanupIsolated(record).catch(() => {});
           }
         })().catch(() => {});
       });
@@ -1485,7 +1507,8 @@ export function createTaskManager({
       childClosed: false,
       childDone: null,
       codex: null,
-      codexCompleted: false,
+      grok: null,
+      streamCompleted: false,
       controller: new AbortController(),
       events,
       failure: null,

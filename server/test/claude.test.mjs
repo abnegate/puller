@@ -1033,6 +1033,82 @@ describe("Claude Code run manager", () => {
     expect(context.resolver.verifyReview).toHaveBeenCalledOnce();
   });
 
+  it("spawns Grok with streaming-json after start and parses a completed turn", async () => {
+    const child = fakeChild();
+    const cleanup = vi.fn(async () => undefined);
+    const prepareGrok = vi.fn(async () => ({
+      args: [
+        "-p",
+        "trusted prompt",
+        "--output-format",
+        "streaming-json",
+        "--sandbox",
+        "puller-edit",
+        "--disable-web-search",
+      ],
+      cleanup,
+      command: "/Users/test/.grok/bin/grok",
+      cwd: "/trusted/auto/owner-repo-7",
+      environment: { PATH: "/usr/bin:/bin", GROK_HOME: "/protected/grok" },
+      prompt: "trusted prompt",
+    }));
+    const context = manager({ child, prepareGrok });
+    const output = channel();
+    const run = await context.value.start(
+      { ...input, agent: "grok" },
+      output.value,
+    );
+
+    expect(prepareGrok).toHaveBeenCalledWith(
+      expect.objectContaining({
+        purpose: "fix",
+        target: "/trusted/auto/owner-repo-7",
+      }),
+    );
+    expect(context.spawn).toHaveBeenCalledWith(
+      "/Users/test/.grok/bin/grok",
+      expect.arrayContaining([
+        "-p",
+        "--output-format",
+        "streaming-json",
+        "--disable-web-search",
+      ]),
+      expect.objectContaining({
+        cwd: "/trusted/auto/owner-repo-7",
+        stdio: ["ignore", "pipe", "pipe"],
+      }),
+    );
+    child.stdout.write(
+      '{"type":"tool_call","toolName":"run_terminal_cmd","status":"in_progress"}\n',
+    );
+    child.stdout.write('{"type":"text","data":"Done."}\n');
+    child.stdout.write('{"type":"end","stopReason":"end_turn"}\n');
+    child.emit("close", 0, null);
+    await run.done;
+
+    expect(output.events[0]).toMatchObject({
+      agent: "grok",
+      type: "start",
+    });
+    expect(output.events).toContainEqual({
+      text: "Grok started.",
+      type: "diagnostic",
+    });
+    expect(output.events).toContainEqual({
+      name: "run_terminal_cmd",
+      status: "started",
+      type: "tool",
+    });
+    expect(output.events.at(-1)).toEqual({ type: "complete", exitCode: 0 });
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(context.createTemporary).not.toHaveBeenCalled();
+    expect(
+      context.git.mock.calls.some(([, arguments_]) =>
+        arguments_.includes("push"),
+      ),
+    ).toBe(true);
+  });
+
   it("handles a synchronous Codex stdin error after installing its listener", async () => {
     const child = fakeChild();
     child.stdin = new PassThrough();

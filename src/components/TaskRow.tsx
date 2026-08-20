@@ -9,7 +9,7 @@ import {
 import { motion, useReducedMotion } from "motion/react";
 import { memo, type UIEvent, useLayoutEffect, useRef } from "react";
 
-import { agentLabel } from "../agent";
+import { agentLabel, agentProductLabel } from "../agent";
 import { getPullKey, type PullKey } from "../preferences";
 import { isTaskActive, type TaskState } from "../tasks";
 import { formatRelativeTime } from "../time";
@@ -59,7 +59,7 @@ function TaskRow({
   const follow = useRef(true);
   const active = isTaskActive(state.task);
   const label = agentLabel(state.task.agent);
-  const codeLabel = state.task.agent === "codex" ? "Codex" : "Claude Code";
+  const codeLabel = agentProductLabel(state.task.agent);
   const phaseLabel =
     state.task.phase === "running"
       ? `${label} running`

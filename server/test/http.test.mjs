@@ -666,6 +666,19 @@ describe("local action API", () => {
       agent: "claude",
     });
 
+    const grok = await fetch(`${running.origin}/api/agents/runs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ...base, agent: "grok" }),
+    });
+    expect(grok.status).toBe(200);
+    expect((await grok.text()).trim().split("\n").map(JSON.parse)[0]).toEqual(
+      expect.objectContaining({ agent: "grok" }),
+    );
+    expect(runManager.start.mock.calls[2][0]).toMatchObject({
+      agent: "grok",
+    });
+
     for (const value of [{ ...base }, { ...base, agent: "other" }]) {
       const response = await fetch(`${running.origin}/api/agents/runs`, {
         method: "POST",

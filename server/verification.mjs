@@ -23,12 +23,19 @@ import {
   eventsForClaudeLine,
   streamingClaudeArguments,
 } from "./claude.mjs";
-import { agentLabel, validateAgent } from "./agent.mjs";
+import {
+  agentLabel,
+  followupSignal,
+  interruptSignal,
+  isIsolatedAgent,
+  validateAgent,
+} from "./agent.mjs";
 import {
   CodexError,
   createCodexInvocation,
   eventsForCodexLine,
 } from "./codex.mjs";
+import { GrokError, createGrokInvocation, eventsForGrokLine } from "./grok.mjs";
 import {
   createVerificationMemoryCapture,
   escapeVerificationMemory,
@@ -122,7 +129,14 @@ function canonicalUrl(repository, number) {
 }
 
 function verificationLabel(agent) {
-  return agent === "claude" ? "Claude" : agentLabel(agent);
+  if (agent === "claude") return "Claude";
+  return agentLabel(agent);
+}
+
+function eventsForVerification(agent, line, cwd) {
+  if (agent === "codex") return eventsForCodexLine(line, cwd);
+  if (agent === "grok") return eventsForGrokLine(line, cwd);
+  return eventsForClaudeLine(line, cwd);
 }
 
 function assessmentDiagnostics(assessment) {
@@ -1163,9 +1177,38 @@ export function createVerificationTelemetry({
     }
   };
 
+  const observeGrok = (line) => {
+    let value;
+    try {
+      value = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (value?.type !== "tool_call" && value?.type !== "tool_call_update") {
+      return;
+    }
+    const name = String(value.toolName ?? value.title ?? "");
+    if (name !== "run_terminal_cmd") return;
+    const id = value.toolCallId ?? `grok-${name}`;
+    const command = value.rawInput?.command ?? value.rawInput?.cmd ?? name;
+    if (value.type === "tool_call") {
+      start(id, command);
+      return;
+    }
+    finish(
+      id,
+      command,
+      value.status === "completed" ? "completed" : "failed",
+      typeof value.rawOutput === "string"
+        ? value.rawOutput
+        : value.rawOutput?.output,
+    );
+  };
+
   return Object.freeze({
     observe(agent, line) {
       if (agent === "codex") observeCodex(line);
+      else if (agent === "grok") observeGrok(line);
       else observeClaude(line);
     },
     result: () => ({
@@ -1344,7 +1387,12 @@ export async function assessVerification({
 }
 
 function safeError(error) {
-  if (error instanceof ActionError || error instanceof CodexError) return error;
+  if (
+    error instanceof ActionError ||
+    error instanceof CodexError ||
+    error instanceof GrokError
+  )
+    return error;
   if (error instanceof WorkspaceError) {
     return new ActionError(error.status, error.code, error.message);
   }
@@ -1402,6 +1450,7 @@ export function createVerificationRunManager({
   identifyExecutable = identifyVerificationExecutable,
   preparePlan = createVerificationPlan,
   prepareCodex = createCodexInvocation,
+  prepareGrok = createGrokInvocation,
   validateRecipes = revalidateVerificationRecipes,
 } = {}) {
   if (typeof resolveRelease !== "function")
@@ -1450,10 +1499,7 @@ export function createVerificationRunManager({
   const runs = new Map();
   let stopping = false;
 
-  function terminate(
-    run,
-    signal = run.input.agent === "codex" ? "SIGINT" : "SIGTERM",
-  ) {
+  function terminate(run, signal = interruptSignal(run.input.agent)) {
     if (!run.child || run.closed) return;
     try {
       kill(-run.child.pid, signal);
@@ -1503,8 +1549,8 @@ export function createVerificationRunManager({
     if (!run.killTimer) {
       run.killTimer = setTimer(() => {
         run.killTimer = null;
-        terminate(run, run.input.agent === "codex" ? "SIGTERM" : "SIGKILL");
-        if (run.input.agent === "codex" && !run.termTimer) {
+        terminate(run, followupSignal(run.input.agent));
+        if (isIsolatedAgent(run.input.agent) && !run.termTimer) {
           run.termTimer = setTimer(() => terminate(run, "SIGKILL"), killGrace);
           run.termTimer.unref?.();
         }
@@ -1532,6 +1578,7 @@ export function createVerificationRunManager({
         await removeTemporary(run.temporary).catch(() => undefined);
       }
       await run.codex?.cleanup?.().catch(() => undefined);
+      await run.grok?.cleanup?.().catch(() => undefined);
       await Promise.allSettled([
         Promise.resolve().then(() => run.predecessor?.cleanup?.()),
         Promise.resolve().then(() => run.prepared.cleanup()),
@@ -1565,6 +1612,7 @@ export function createVerificationRunManager({
     let claims;
     let child;
     let codex;
+    let grok;
     let executablePath;
     let prompt;
     let temporary;
@@ -1700,8 +1748,8 @@ export function createVerificationRunManager({
           "The request was closed before verification started.",
         );
       }
-      if (input.agent === "codex") {
-        codex = await prepareCodex({
+      if (isIsolatedAgent(input.agent)) {
+        const isolatedOptions = {
           deniedPaths: [
             ...(executionCwd === prepared.cwd ? [] : [executionCwd]),
             ...(predecessor === undefined
@@ -1712,14 +1760,23 @@ export function createVerificationRunManager({
           prompt,
           purpose: "verification",
           target: prepared.cwd,
-        });
-        executablePath = codex.environment.PATH ?? "";
-        child = spawn(codex.command, codex.args, {
-          cwd: codex.cwd,
+        };
+        const isolated =
+          input.agent === "grok"
+            ? await prepareGrok(isolatedOptions)
+            : await prepareCodex(isolatedOptions);
+        if (input.agent === "grok") grok = isolated;
+        else codex = isolated;
+        executablePath = isolated.environment.PATH ?? "";
+        child = spawn(isolated.command, isolated.args, {
+          cwd: isolated.cwd,
           detached: true,
-          env: codex.environment,
+          env: isolated.environment,
           shell: false,
-          stdio: ["pipe", "pipe", "pipe"],
+          stdio:
+            input.agent === "codex"
+              ? ["pipe", "pipe", "pipe"]
+              : ["ignore", "pipe", "pipe"],
           windowsHide: true,
         });
       } else {
@@ -1741,10 +1798,12 @@ export function createVerificationRunManager({
           },
         );
       }
+      const needsStdin = input.agent !== "grok";
       if (
-        !child.stdin ||
-        typeof child.stdin.end !== "function" ||
-        typeof child.stdin.on !== "function" ||
+        (needsStdin &&
+          (!child.stdin ||
+            typeof child.stdin.end !== "function" ||
+            typeof child.stdin.on !== "function")) ||
         !child.stdout ||
         typeof child.stdout.on !== "function" ||
         typeof child.stdout.once !== "function" ||
@@ -1762,10 +1821,10 @@ export function createVerificationRunManager({
     } catch (error) {
       if (child?.pid) {
         try {
-          kill(-child.pid, input.agent === "codex" ? "SIGINT" : "SIGTERM");
+          kill(-child.pid, interruptSignal(input.agent));
         } catch {
           try {
-            child.kill?.(input.agent === "codex" ? "SIGINT" : "SIGTERM");
+            child.kill?.(interruptSignal(input.agent));
           } catch {
             // The process may have failed before it became signalable.
           }
@@ -1776,6 +1835,7 @@ export function createVerificationRunManager({
         await removeTemporary(temporary).catch(() => undefined);
       }
       await codex?.cleanup?.().catch(() => undefined);
+      await grok?.cleanup?.().catch(() => undefined);
       await Promise.allSettled([
         Promise.resolve().then(() => predecessor?.cleanup?.()),
         Promise.resolve().then(() => prepared?.cleanup?.()),
@@ -1791,7 +1851,8 @@ export function createVerificationRunManager({
     const run = {
       child,
       codex,
-      codexCompleted: false,
+      grok,
+      streamCompleted: false,
       channel,
       capture: createVerificationMemoryCapture(),
       cleaning: null,
@@ -1831,6 +1892,12 @@ export function createVerificationRunManager({
         text: "Codex 0.144.6 grants its sandbox access to standard macOS temporary roots; Puller keeps the protected release snapshot outside those roots.",
       });
     }
+    if (input.agent === "grok") {
+      write(run, {
+        type: "diagnostic",
+        text: "Grok started.",
+      });
+    }
     const label = verificationLabel(input.agent);
     const limit = (message) => stop(run, { type: "limit", message });
     const output = createLineDecoder({
@@ -1839,17 +1906,19 @@ export function createVerificationRunManager({
       onLine: (line) => {
         run.telemetry.observe(input.agent, line);
         if (input.agent === "claude") run.capture.observe(line);
-        const events =
-          input.agent === "codex"
-            ? eventsForCodexLine(line, prepared.executionCwd ?? prepared.cwd)
-            : eventsForClaudeLine(line, prepared.executionCwd ?? prepared.cwd);
+        const events = eventsForVerification(
+          input.agent,
+          line,
+          prepared.executionCwd ?? prepared.cwd,
+        );
         for (const event of events) {
           if (event.type === "error") {
             stop(run, event);
           } else if (event.type === "protocol") {
-            run.codexCompleted = event.status === "completed";
+            run.streamCompleted = event.status === "completed";
           } else if (event.type === "text") {
-            if (input.agent === "codex") run.capture.observeText(event.text);
+            if (isIsolatedAgent(input.agent))
+              run.capture.observeText(event.text);
             const text = run.redactor.push(event.text);
             if (text) write(run, { ...event, text });
           } else if (
@@ -1893,7 +1962,7 @@ export function createVerificationRunManager({
     child.stderr.on("data", consume(diagnostics));
     child.stdout.once("end", () => output.end());
     child.stderr.once("end", () => diagnostics.end());
-    child.stdin.on("error", () => {
+    child.stdin?.on?.("error", () => {
       if (!run.closed) {
         stop(run, {
           type: "error",
@@ -1914,16 +1983,17 @@ export function createVerificationRunManager({
           !run.terminal &&
           code === 0 &&
           !signal &&
-          (input.agent !== "codex" || run.codexCompleted);
-        let codexCleanupFailed = false;
-        if (completedNormally && input.agent === "codex") {
+          (!isIsolatedAgent(input.agent) || run.streamCompleted);
+        let isolatedCleanupFailed = false;
+        if (completedNormally && isIsolatedAgent(input.agent)) {
           try {
-            await run.codex.cleanup();
+            await (run.codex ?? run.grok)?.cleanup();
           } catch {
             completedNormally = false;
-            codexCleanupFailed = true;
+            isolatedCleanupFailed = true;
           } finally {
             run.codex = null;
+            run.grok = null;
           }
         }
         let assessment = null;
@@ -1987,7 +2057,7 @@ export function createVerificationRunManager({
                 releaseSnapshot: run.prepared.cwd,
               };
               const discover =
-                run.input.agent === "codex" &&
+                isIsolatedAgent(run.input.agent) &&
                 marker.outcome === "verified" &&
                 marker.recipes.length === 0;
               const plan = await preparePlan({
@@ -2040,12 +2110,12 @@ export function createVerificationRunManager({
                 }
               : {
                   type: "error",
-                  message: codexCleanupFailed
-                    ? "Codex verification completed, but its isolated runtime could not be removed safely."
+                  message: isolatedCleanupFailed
+                    ? `${label} verification completed, but its isolated runtime could not be removed safely.`
                     : signal
                       ? `${label} verification was terminated unexpectedly.`
-                      : input.agent === "codex" && code === 0
-                        ? "Codex verification exited without completing its turn."
+                      : isIsolatedAgent(input.agent) && code === 0
+                        ? `${label} verification exited without completing its turn.`
                         : `${label} verification exited with an error.`,
                 },
           );
@@ -2087,7 +2157,9 @@ export function createVerificationRunManager({
     );
     run.runtimeTimer.unref?.();
     try {
-      child.stdin.end(input.agent === "codex" ? codex.prompt : prompt);
+      if (input.agent !== "grok") {
+        child.stdin.end(input.agent === "codex" ? codex.prompt : prompt);
+      }
     } catch {
       stop(run, {
         type: "error",

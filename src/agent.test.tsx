@@ -130,7 +130,7 @@ describe("agent preference", () => {
 });
 
 describe("AgentToggle", () => {
-  it("offers an accessible Claude and Codex selector for future runs", () => {
+  it("offers an accessible Claude, Codex, and Grok selector for future runs", () => {
     const preference = renderHook(() => useAgentPreference());
     const view = render(
       <TooltipProvider>
@@ -160,6 +160,28 @@ describe("AgentToggle", () => {
         name: "Agent: Codex. Choose local coding agent.",
       }),
     ).toBeInTheDocument();
+
+    fireEvent.pointerDown(
+      screen.getByRole("button", {
+        name: "Agent: Codex. Choose local coding agent.",
+      }),
+      { button: 0, ctrlKey: false },
+    );
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Grok" }));
+    view.rerender(
+      <TooltipProvider>
+        <AgentToggle
+          agent={preference.result.current.agent}
+          onAgentChange={preference.result.current.setAgent}
+        />
+      </TooltipProvider>,
+    );
+    expect(
+      screen.getByRole("button", {
+        name: "Agent: Grok. Choose local coding agent.",
+      }),
+    ).toBeInTheDocument();
+    expect(window.localStorage.getItem(AGENT_STORAGE_KEY)).toContain("grok");
   });
 
   it("suppresses its tooltip while the agent menu is open", async () => {

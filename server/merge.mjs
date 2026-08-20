@@ -353,7 +353,9 @@ export function createMergeService({
                 });
                 if (
                   repair?.accepted === true &&
-                  (repair.agent === "claude" || repair.agent === "codex") &&
+                  (repair.agent === "claude" ||
+                    repair.agent === "codex" ||
+                    repair.agent === "grok") &&
                   typeof repair.id === "string" &&
                   repair.id !== "" &&
                   typeof repair.token === "string" &&

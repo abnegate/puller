@@ -1858,7 +1858,7 @@ describe("RecentReleases", () => {
       yield { exitCode: 0, outcome: "verified", type: "complete" };
     });
     api.streamBatch.mockImplementation(async function* (request: {
-      agent: "claude" | "codex";
+      agent: "claude" | "codex" | "grok";
       releaseId: string;
       repository: string;
       tag: string;
