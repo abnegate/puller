@@ -324,9 +324,9 @@ describe("usePullRuns", () => {
     });
     const transcriptStore = createMemoryRunTranscriptStore();
     const view = renderHook(
-      ({ agent }: { agent: "claude" | "codex" }) =>
+      ({ agent }: { agent: "claude" | "codex" | "grok" }) =>
         usePullRuns([pull], undefined, { agent, transcriptStore }),
-      { initialProps: { agent: "claude" as "claude" | "codex" } },
+      { initialProps: { agent: "claude" as "claude" | "codex" | "grok" } },
     );
 
     let claude!: RunStartOutcome;

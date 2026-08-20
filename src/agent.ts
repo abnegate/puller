@@ -17,16 +17,31 @@ type StoredAgent = {
 };
 
 export const isAgent = (value: unknown): value is Agent =>
-  value === "claude" || value === "codex";
+  value === "claude" || value === "codex" || value === "grok";
 
 export const normalizeAgent = (value: unknown): Agent =>
   isAgent(value) ? value : DEFAULT_AGENT;
 
-export const agentLabel = (agent: unknown): string =>
-  normalizeAgent(agent) === "codex" ? "Codex" : "Claude";
+export const agentLabel = (agent: unknown): string => {
+  const selected = normalizeAgent(agent);
+  if (selected === "codex") return "Codex";
+  if (selected === "grok") return "Grok";
+  return "Claude";
+};
 
-export const alternateAgent = (agent: unknown): Agent =>
-  normalizeAgent(agent) === "codex" ? "claude" : "codex";
+export const agentProductLabel = (agent: unknown): string => {
+  const selected = normalizeAgent(agent);
+  if (selected === "codex") return "Codex";
+  if (selected === "grok") return "Grok";
+  return "Claude Code";
+};
+
+export const alternateAgent = (agent: unknown): Agent => {
+  const selected = normalizeAgent(agent);
+  if (selected === "claude") return "grok";
+  if (selected === "grok") return "codex";
+  return "claude";
+};
 
 const parseAgent = (raw: string | null): Agent => {
   if (raw === null) return DEFAULT_AGENT;

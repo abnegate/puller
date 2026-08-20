@@ -96,6 +96,11 @@ const feedbackAgentCopy: Record<Agent, FeedbackAgentCopy> = {
     name: "Codex",
     run: "Codex run",
   },
+  grok: {
+    feedback: "Grok feedback",
+    name: "Grok",
+    run: "Grok run",
+  },
 };
 
 export type PullDiffCommentAnchor = {

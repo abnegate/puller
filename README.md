@@ -15,7 +15,8 @@ Puller keeps GitHub's result order and divides pull requests into **Ready**, **I
 - [GitHub CLI](https://cli.github.com/) authenticated for the repositories you want to inspect
 - At least one local agent:
   - Claude Code authenticated locally; or
-  - Codex `codex-cli-exec 0.144.6` on your `PATH` and authenticated locally. Homebrew, Linuxbrew, `/usr/local/bin`, and `~/.local/bin` are searched automatically. Set `CODEX_PATH` to an absolute executable if it lives somewhere else.
+  - Codex `codex-cli-exec 0.144.6` on your `PATH` and authenticated locally. Homebrew, Linuxbrew, `/usr/local/bin`, and `~/.local/bin` are searched automatically. Set `CODEX_PATH` to an absolute executable if it lives somewhere else; or
+  - Grok `grok 1.0.5` on your `PATH` and authenticated locally (`grok login`). `~/.grok/bin`, `~/.local/bin`, Homebrew, Linuxbrew, and `/usr/local/bin` are searched automatically. Set `GROK_PATH` to an absolute executable if it lives somewhere else.
 - Local clones or worktrees for repositories where an agent will run
 
 Check the command-line tools before starting:
@@ -25,6 +26,7 @@ gh auth status
 claude --version
 codex exec --version
 codex login status
+grok --version
 ```
 
 ## Run locally
@@ -63,9 +65,9 @@ Click a diff line to give the selected agent one-shot fix instructions, or shift
 
 **Merge** always asks for confirmation. The server then performs a fresh, complete GitHub check of authorship, open state, exact head SHA, review state, Greptile confidence, and CI before invoking an admin merge commit with a head-match guard. A stale browser row cannot authorize a merge. Puller never merges automatically; GitHub changes only after you press and confirm **Merge**.
 
-## Fix with Claude Code or Codex
+## Fix with Claude Code, Codex, or Grok
 
-Every agent-launching action has a Claude Code/Codex selector. The choice is captured when the action starts and remains attached to that run, including manual Fix, Auto, diff feedback, New Task, Verify, Verify all, and conflict repair. Each non-ready row has **Run fix**, which always targets the shepherd bar, and streamed terminal output. Comment on specific diff lines to give narrower review-fix instructions. Starting a Fix moves the row to **In progress** while preserving its agent and output across background refreshes. Cancel, browser disconnect, or server shutdown terminates the spawned process group.
+Every agent-launching action has a Claude Code/Codex/Grok selector. The choice is captured when the action starts and remains attached to that run, including manual Fix, Auto, diff feedback, New Task, Verify, Verify all, and conflict repair. Each non-ready row has **Run fix**, which always targets the shepherd bar, and streamed terminal output. Comment on specific diff lines to give narrower review-fix instructions. Starting a Fix moves the row to **In progress** while preserving its agent and output across background refreshes. Cancel, browser disconnect, or server shutdown terminates the spawned process group.
 
 **Auto** watches the canonical open-pull snapshot for new or edited issue comments, new unresolved review comments, new CI failure sequences, and a current-head Greptile review below `5/5`. Enabling it first records a baseline, so existing blockers are not dispatched as new work. Later matching evidence starts a context-rich Auto fix and moves that pull request to **In progress**; hidden pull requests remain watched.
 
@@ -83,9 +85,11 @@ Codex support is deliberately pinned to the locally audited `codex-cli-exec 0.14
 
 Codex 0.144.6's named profile necessarily includes the CLI's built-in `:minimal` filesystem baseline, which grants access to standard macOS temporary roots. Puller cannot subtract that baseline in this version. It keeps verification snapshots and real conflict-repair checkouts outside global temporary roots under protected `~/.puller` state; conflict repair exposes only a disposable non-Git mirror and explicitly denies the real checkout. Treat unrelated secrets in global temporary directories as potentially visible to a Codex run.
 
+Grok support is pinned to the locally audited `grok 1.0.5 (5115b46bc909)`. Puller finds that binary at `GROK_PATH`, `~/.grok/bin`, `~/.local/bin`, Homebrew, Linuxbrew, `/usr/local/bin`, or `PATH`, then refuses a different version or a swapped file until Puller restarts. It launches `grok -p` with `--output-format streaming-json`, `--sandbox` custom profiles based on `strict` (or `read-only` for Verify), `--disable-web-search`, `--no-subagents`, `--no-plan`, and Git/GitHub deny rules. Each run gets an ephemeral `GROK_HOME` containing only a copied `auth.json` and the generated sandbox profile. Grok's built-in sandbox writes to the process working directory, so Fix, Auto, review, New Task, Verify, and conflict repair start inside the trusted target (or the disposable conflict mirror). Grok cannot publish; Puller validates, commits, and pushes the result itself. On macOS, `strict`/`read-only` child-process network blocking is a documented no-op.
+
 ## New tasks
 
-The compact **New task** row searches the same favourite-aware repository catalog and lets you choose a remote base branch. Puller creates an isolated worktree and opens a pull request at the beginning of the task so the row is linked immediately, then starts the selected one-shot agent and streams its terminal output under **In progress**. Claude Code uses `--dangerously-skip-permissions`. Codex retains its named sandbox profile but intentionally starts inside the task worktree so repository instructions and skills can load. New Task is therefore powerful local execution with either provider; use it only with repositories and prompts you trust. Puller, not the agent, validates, commits, and pushes the completed change.
+The compact **New task** row searches the same favourite-aware repository catalog and lets you choose a remote base branch. Puller creates an isolated worktree and opens a pull request at the beginning of the task so the row is linked immediately, then starts the selected one-shot agent and streams its terminal output under **In progress**. Claude Code uses `--dangerously-skip-permissions`. Codex retains its named sandbox profile but intentionally starts inside the task worktree so repository instructions and skills can load. Grok also starts inside the task worktree so repository instructions can load, under `--sandbox puller-edit`. New Task is therefore powerful local execution with any selected provider; use it only with repositories and prompts you trust. Puller, not the agent, validates, commits, and pushes the completed change.
 
 ## Releases and verification
 
@@ -93,7 +97,7 @@ The compact **New task** row searches the same favourite-aware repository catalo
 
 Repository discovery for the release selector and release-action authorization includes repositories found in your open authored pull requests and in authored pull requests merged during the last 90 days. **Recently released** displays only releases published during the last week and groups them by the viewer's local calendar date. Displayed membership intersects authored merges with canonical pull request links in GitHub's release notes. **Verify** then rechecks exact membership against the adjacent release tags before Claude runs. Incomplete evidence is surfaced instead of being treated as verified membership.
 
-**Verify** starts a separate selected-agent run for one released pull request. The server first revalidates the exact release, pull number, pull URL, merged head SHA, and release commit, then creates an immutable archive snapshot from that exact commit already present in a trusted local clone. Snapshot creation disables hooks, filters, replacement objects, and user/system Git configuration; it performs no checkout, worktree creation, or fetch. Claude runs in safe mode with only `Read`, `Glob`, and `Grep`. Codex may use inspection commands inside its read-only named profile. Neither agent can edit the snapshot or use network tools, and neither may claim tests were executed. The response streams into the row and can be cancelled. Fix and Verify share the global local-agent run limit.
+**Verify** starts a separate selected-agent run for one released pull request. The server first revalidates the exact release, pull number, pull URL, merged head SHA, and release commit, then creates an immutable archive snapshot from that exact commit already present in a trusted local clone. Snapshot creation disables hooks, filters, replacement objects, and user/system Git configuration; it performs no checkout, worktree creation, or fetch. Claude runs in safe mode with only `Read`, `Glob`, and `Grep`. Codex may use inspection commands inside its read-only named profile. Grok is limited to `read_file`, `grep`, and `list_dir` under `--sandbox puller-read` (`read-only`). No selected agent can edit the snapshot or use network tools, and none may claim tests were executed. The response streams into the row and can be cancelled. Fix and Verify share the global local-agent run limit.
 
 Successful verification stores only validated, reusable repository recipes (for example known files, searches, manifests, and tools), never output or source contents. Memory defaults to `~/.puller/verification-memory`; set an absolute `PULLER_VERIFICATION_MEMORY_ROOT` to relocate it. Future verifications receive these bounded hints and revalidate every referenced path against the immutable snapshot before use.
 

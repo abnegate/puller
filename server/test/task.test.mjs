@@ -270,6 +270,63 @@ describe("new task manager", () => {
     await manager.close();
   });
 
+  it("runs a Grok task, requires stream completion, and lets Puller publish it", async () => {
+    const paths = await directories();
+    const test = harness({ codexChanges: true });
+    test.catalog.resolve.mockResolvedValue({
+      cwd: paths.source,
+      origin: "https://github.com/owner/repo",
+      repository: "owner/repo",
+    });
+    const grokCleanup = vi.fn(async () => undefined);
+    const prepareGrok = vi.fn(async () => ({
+      args: ["-p", "trusted task prompt", "--output-format", "streaming-json"],
+      cleanup: grokCleanup,
+      command: "/Users/test/.grok/bin/grok",
+      cwd: paths.source,
+      environment: {},
+      prompt: "trusted task prompt",
+    }));
+    const manager = createTaskManager({
+      ...test,
+      defer: (callback) => test.deferred.push(callback),
+      prepareGrok,
+      stateRoot: paths.stateRoot,
+      worktreeRoot: paths.worktreeRoot,
+    });
+    await manager.start(input({ agent: "grok" }));
+    test.deferred.shift()();
+    await waitFor(manager, "running");
+    await vi.waitFor(() => expect(test.spawn).toHaveBeenCalledOnce());
+    expect(test.spawn).toHaveBeenCalledWith(
+      "/Users/test/.grok/bin/grok",
+      ["-p", "trusted task prompt", "--output-format", "streaming-json"],
+      expect.objectContaining({
+        cwd: paths.source,
+        stdio: ["ignore", "pipe", "pipe"],
+      }),
+    );
+    test.child.stdout.write('{"type":"text","data":"Done."}\n');
+    test.child.stdout.write('{"type":"end","stopReason":"end_turn"}\n');
+    test.child.stdout.end();
+    test.child.emit("close", 0, null);
+    await vi.waitFor(() => {
+      expect(manager.list()).toEqual([
+        expect.objectContaining({
+          agent: "grok",
+          phase: "completed",
+        }),
+      ]);
+    });
+    expect(
+      test.run.mock.calls.some(
+        ([executable, args]) => executable === "git" && args.includes("commit"),
+      ),
+    ).toBe(true);
+    expect(grokCleanup).toHaveBeenCalledOnce();
+    await manager.close();
+  });
+
   it("escalates a cancelled Codex task from SIGINT through SIGTERM to SIGKILL", async () => {
     const paths = await directories();
     const test = harness();

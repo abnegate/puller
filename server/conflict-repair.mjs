@@ -37,12 +37,19 @@ import {
   eventsForClaudeLine,
   streamingClaudeArguments,
 } from "./claude.mjs";
-import { agentLabel, validateAgent } from "./agent.mjs";
+import {
+  agentLabel,
+  followupSignal,
+  interruptSignal,
+  isIsolatedAgent,
+  validateAgent,
+} from "./agent.mjs";
 import {
   CodexError,
   createCodexInvocation,
   eventsForCodexLine,
 } from "./codex.mjs";
+import { GrokError, createGrokInvocation, eventsForGrokLine } from "./grok.mjs";
 
 const SHA = /^[a-f0-9]{40}$/i;
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -676,7 +683,8 @@ function safeMessage(error) {
   if (
     error instanceof RepairError ||
     error instanceof ActionError ||
-    error instanceof CodexError
+    error instanceof CodexError ||
+    error instanceof GrokError
   )
     return error.message;
   return "Automatic conflict repair could not be completed.";
@@ -737,6 +745,7 @@ export function createConflictRepairManager({
   setTimer = setTimeout,
   clearTimer = clearTimeout,
   prepareCodex = createCodexInvocation,
+  prepareGrok = createGrokInvocation,
   stateRoot: configuredStateRoot,
 } = {}) {
   if (!executor || typeof executor.json !== "function")
@@ -948,19 +957,15 @@ export function createConflictRepairManager({
     if (!record.termination) {
       signalChild(
         record,
-        immediate
-          ? "SIGKILL"
-          : record.input.agent === "codex"
-            ? "SIGINT"
-            : "SIGTERM",
+        immediate ? "SIGKILL" : interruptSignal(record.input.agent),
       );
       record.termination = (async () => {
         let escalation;
         let force;
         if (!immediate) {
           escalation = setTimer(() => {
-            if (record.input.agent === "codex") {
-              signalChild(record, "SIGTERM");
+            if (isIsolatedAgent(record.input.agent)) {
+              signalChild(record, followupSignal(record.input.agent));
               force = setTimer(() => signalChild(record, "SIGKILL"), killGrace);
               force.unref?.();
             } else {
@@ -1056,10 +1061,9 @@ export function createConflictRepairManager({
   }
 
   async function prepare(input) {
-    const root =
-      input.agent === "codex"
-        ? await protectedConflictRoot(stateRoot)
-        : tmpdir();
+    const root = isIsolatedAgent(input.agent)
+      ? await protectedConflictRoot(stateRoot)
+      : tmpdir();
     const temporary = await createTemporary(join(root, "puller-conflict-"));
     const checkout = join(temporary, "checkout");
     try {
@@ -1174,7 +1178,7 @@ export function createConflictRepairManager({
     ) {
       throw new RepairError(
         "unsafe_conflict",
-        "Codex changed files outside the conflict allowlist.",
+        `${agentLabel(input.agent)} changed files outside the conflict allowlist.`,
       );
     }
     await validateFiles(mirrorState.mirror, prepared.conflictFiles);
@@ -1244,20 +1248,29 @@ export function createConflictRepairManager({
     await validateFiles(prepared.checkout, prepared.conflictFiles);
   }
 
-  async function runCodex(record, prepared, input) {
+  async function runIsolated(record, prepared, input) {
     const mirrorState = await createMirror(prepared);
     const prompt = buildConflictRepairPrompt(
       input,
       prepared.conflictFiles,
       mirrorState.mirror,
     );
-    const codex = await prepareCodex({
-      deniedPaths: [prepared.checkout],
-      environment,
-      prompt,
-      purpose: "conflict",
-      target: mirrorState.mirror,
-    });
+    const isolated =
+      input.agent === "grok"
+        ? await prepareGrok({
+            deniedPaths: [prepared.checkout],
+            environment,
+            prompt,
+            purpose: "conflict",
+            target: mirrorState.mirror,
+          })
+        : await prepareCodex({
+            deniedPaths: [prepared.checkout],
+            environment,
+            prompt,
+            purpose: "conflict",
+            target: mirrorState.mirror,
+          });
     let output = 0;
     let timer;
     let removeAbort;
@@ -1278,18 +1291,22 @@ export function createConflictRepairManager({
       delay: redactionDelay,
     });
     try {
-      child = spawn(codex.command, codex.args, {
-        cwd: codex.cwd,
+      child = spawn(isolated.command, isolated.args, {
+        cwd: isolated.cwd,
         detached: true,
-        env: codex.environment,
+        env: isolated.environment,
         shell: false,
-        stdio: ["pipe", "pipe", "pipe"],
+        stdio:
+          input.agent === "codex"
+            ? ["pipe", "pipe", "pipe"]
+            : ["ignore", "pipe", "pipe"],
         windowsHide: true,
       });
       if (
-        !child?.stdin ||
-        typeof child.stdin.end !== "function" ||
-        typeof child.stdin.once !== "function" ||
+        (input.agent === "codex" &&
+          (!child?.stdin ||
+            typeof child.stdin.end !== "function" ||
+            typeof child.stdin.once !== "function")) ||
         !child.stdout ||
         typeof child.stdout.on !== "function" ||
         typeof child.stdout.once !== "function" ||
@@ -1302,7 +1319,9 @@ export function createConflictRepairManager({
       }
       appendOutput(
         record,
-        "Codex 0.144.6 grants its sandbox access to standard macOS temporary roots; Puller exposes only a disposable non-Git conflict mirror and keeps the real checkout outside those roots.\n",
+        input.agent === "grok"
+          ? "Grok started.\n"
+          : "Codex 0.144.6 grants its sandbox access to standard macOS temporary roots; Puller exposes only a disposable non-Git conflict mirror and keeps the real checkout outside those roots.\n",
       );
       const closed = registerChild(record, child);
       const decoder = createLineDecoder({
@@ -1310,7 +1329,11 @@ export function createConflictRepairManager({
         onLimit: () => fail(),
         onLine(line) {
           if (!line || rejected) return;
-          for (const event of eventsForCodexLine(line, mirrorState.mirror)) {
+          const events =
+            input.agent === "grok"
+              ? eventsForGrokLine(line, mirrorState.mirror)
+              : eventsForCodexLine(line, mirrorState.mirror);
+          for (const event of events) {
             if (event.type === "protocol") {
               completed = event.status === "completed";
             } else if (event.type === "error") {
@@ -1349,7 +1372,7 @@ export function createConflictRepairManager({
       child.stderr.on("data", consume(diagnostics));
       child.stderr.once("end", () => diagnostics.end());
       child.once("error", () => fail());
-      child.stdin.once("error", () => fail());
+      child.stdin?.once?.("error", () => fail());
       const abort = () =>
         fail(
           new RepairError(
@@ -1366,7 +1389,9 @@ export function createConflictRepairManager({
         record.controller.signal.removeEventListener("abort", abort);
       timer = setTimer(() => fail(), runtime);
       timer.unref?.();
-      child.stdin.end(codex.prompt);
+      if (input.agent === "codex") {
+        child.stdin.end(isolated.prompt);
+      }
       try {
         const result = await Promise.race([closed, failure]);
         decoder.end();
@@ -1385,7 +1410,7 @@ export function createConflictRepairManager({
         await record.childClosed;
         releaseChild(record, child);
       }
-      await codex.cleanup();
+      await isolated.cleanup();
     }
   }
 
@@ -1633,8 +1658,8 @@ export function createConflictRepairManager({
     record.workspace = prepared.checkout;
     try {
       record.reservation?.reserveWorkspace?.(prepared.checkout);
-      if (input.agent === "codex") {
-        await runCodex(record, prepared, input);
+      if (isIsolatedAgent(input.agent)) {
+        await runIsolated(record, prepared, input);
       } else {
         await runClaude(record, prepared, input);
       }

@@ -577,6 +577,46 @@ describe("streamAgentRun", () => {
     );
   });
 
+  it("accepts a Grok start event on the provider-neutral endpoint", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(tokenResponse())
+      .mockResolvedValueOnce(
+        streamResponse([
+          '{"agent":"grok","type":"start","runId":"run-grok","repository":"appwrite/cloud","number":102}\n',
+          '{"type":"complete","exitCode":0}\n',
+        ]),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const events = [];
+    for await (const event of streamAgentRun({
+      ...request,
+      agent: "grok",
+      source: "manual",
+    })) {
+      events.push(event);
+    }
+
+    expect(events[0]).toMatchObject({
+      agent: "grok",
+      runId: "run-grok",
+      type: "start",
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/agents/runs",
+      expect.objectContaining({
+        body: JSON.stringify({
+          agent: "grok",
+          ...request,
+          source: "manual",
+        }),
+        method: "POST",
+      }),
+    );
+  });
+
   it("rejects a start event from a different agent", async () => {
     vi.stubGlobal(
       "fetch",

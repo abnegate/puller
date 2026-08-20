@@ -9,12 +9,20 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 import { SnapshotError } from "./cache.mjs";
-import { AgentError, agentLabel, validateAgent } from "./agent.mjs";
+import {
+  AgentError,
+  agentLabel,
+  followupSignal,
+  interruptSignal,
+  isIsolatedAgent,
+  validateAgent,
+} from "./agent.mjs";
 import {
   CodexError,
   createCodexInvocation,
   eventsForCodexLine,
 } from "./codex.mjs";
+import { GrokError, createGrokInvocation, eventsForGrokLine } from "./grok.mjs";
 import { assessPull } from "./readiness.mjs";
 import {
   ReviewTaskError,
@@ -979,15 +987,15 @@ export function buildReviewPrompt(authorization, input) {
         ]),
     "",
     "Inspect the selected lines and surrounding code, implement the smallest complete fix, and run relevant local validation.",
-    ...(input.agent === "codex"
+    ...(input.agent === "claude"
       ? [
-          "Do not create commits, push, or modify Git metadata. Puller will validate, commit, and push the intended changes after you finish.",
-          "Never rewrite history, rebase, merge, reset, switch or create branches, change remotes, post GitHub comments, resolve review threads, or modify another worktree.",
-        ]
-      : [
           "You must create a new commit whose history descends from the submitted head, then push that commit to the already-proven existing pull request branch through the origin remote.",
           "Use only a normal non-force push. Never force push, rewrite or amend existing history, rebase, merge, reset, switch or create branches, change remotes, push another ref, post GitHub comments, resolve review threads, or modify another worktree.",
           "Finish only after the worktree is clean and the new commit has been pushed successfully.",
+        ]
+      : [
+          "Do not create commits, push, or modify Git metadata. Puller will validate, commit, and push the intended changes after you finish.",
+          "Never rewrite history, rebase, merge, reset, switch or create branches, change remotes, post GitHub comments, resolve review threads, or modify another worktree.",
         ]),
   ].join("\n");
 }
@@ -1506,6 +1514,12 @@ function freshAutoPull(pull, input) {
   return { pull, triggers };
 }
 
+function eventsForRun(agent, line, cwd) {
+  if (agent === "codex") return eventsForCodexLine(line, cwd);
+  if (agent === "grok") return eventsForGrokLine(line, cwd);
+  return eventsForClaudeLine(line, cwd);
+}
+
 export function createClaudeRunManager({
   cache,
   diffService = null,
@@ -1533,6 +1547,7 @@ export function createClaudeRunManager({
   environment = process.env,
   reportDiagnostic = console.error,
   prepareCodex = createCodexInvocation,
+  prepareGrok = createGrokInvocation,
   git = execFile,
 } = {}) {
   if (typeof loadPull !== "function")
@@ -1935,7 +1950,7 @@ export function createClaudeRunManager({
         throw new ActionError(
           409,
           "review_unchanged",
-          "Codex finished without producing a review change.",
+          `${agentLabel(run.agent)} finished without producing a review change.`,
         );
       }
       throwIfReviewAborted(run);
@@ -2045,10 +2060,7 @@ export function createClaudeRunManager({
     }
   }
 
-  function terminate(
-    run,
-    signal = run.agent === "codex" ? "SIGINT" : "SIGTERM",
-  ) {
+  function terminate(run, signal = interruptSignal(run.agent)) {
     if (!run.child || run.closed) return;
     try {
       kill(-run.child.pid, signal);
@@ -2106,17 +2118,17 @@ export function createClaudeRunManager({
     }
     write(run, event);
     terminate(run);
-    if (run.agent === "codex" && !run.termTimer) {
+    if (isIsolatedAgent(run.agent) && !run.termTimer) {
       run.termTimer = setTimer(() => {
         run.termTimer = null;
-        terminate(run, "SIGTERM");
+        terminate(run, followupSignal(run.agent));
         if (!run.killTimer) {
           run.killTimer = setTimer(() => terminate(run, "SIGKILL"), killGrace);
           run.killTimer.unref?.();
         }
       }, killGrace);
       run.termTimer.unref?.();
-    } else if (run.agent !== "codex" && !run.killTimer) {
+    } else if (!isIsolatedAgent(run.agent) && !run.killTimer) {
       run.killTimer = setTimer(() => terminate(run, "SIGKILL"), killGrace);
       run.killTimer.unref?.();
     }
@@ -2141,6 +2153,7 @@ export function createClaudeRunManager({
       Promise.resolve().then(() => discardTemporary(run.temporary)),
       Promise.resolve().then(() => run.review?.cleanup?.()),
       Promise.resolve().then(() => run.codex?.cleanup?.()),
+      Promise.resolve().then(() => run.grok?.cleanup?.()),
     ])
       .then((results) => {
         const reviewCleanup = results[1];
@@ -2151,10 +2164,13 @@ export function createClaudeRunManager({
           run.reviewCleanupReported = true;
           reportReviewCleanup(reviewCleanup.reason);
         }
-        if (results[2]?.status === "rejected") {
+        if (
+          results[2]?.status === "rejected" ||
+          results[3]?.status === "rejected"
+        ) {
           try {
             reportDiagnostic(
-              "[puller] Codex runtime cleanup failed; its isolated state was preserved for inspection.",
+              `[puller] ${agentLabel(run.agent)} runtime cleanup failed; its isolated state was preserved for inspection.`,
             );
           } catch {
             // Cleanup diagnostics cannot keep a terminal run active.
@@ -2328,6 +2344,7 @@ export function createClaudeRunManager({
     let cwd;
     let child;
     let codex = null;
+    let grok = null;
     let id;
     let redactor;
     let temporary;
@@ -2510,25 +2527,39 @@ export function createClaudeRunManager({
         cwd: workspaceKey,
         delay: redactionDelay,
       });
-      if (input.agent === "codex") {
-        codex = await prepareCodex({
-          environment,
-          prompt,
-          purpose: source === "review" ? "review" : "fix",
-          target: workspaceKey,
-        });
-        child = spawn(codex.command, codex.args, {
-          cwd: codex.cwd,
+      if (input.agent === "codex" || input.agent === "grok") {
+        const isolated =
+          input.agent === "codex"
+            ? await prepareCodex({
+                environment,
+                prompt,
+                purpose: source === "review" ? "review" : "fix",
+                target: workspaceKey,
+              })
+            : await prepareGrok({
+                environment,
+                prompt,
+                purpose: source === "review" ? "review" : "fix",
+                target: workspaceKey,
+              });
+        if (input.agent === "codex") codex = isolated;
+        else grok = isolated;
+        child = spawn(isolated.command, isolated.args, {
+          cwd: isolated.cwd,
           detached: true,
-          env: codex.environment,
+          env: isolated.environment,
           shell: false,
-          stdio: ["pipe", "pipe", "pipe"],
+          stdio:
+            input.agent === "codex"
+              ? ["pipe", "pipe", "pipe"]
+              : ["ignore", "pipe", "pipe"],
           windowsHide: true,
         });
         if (
-          !child.stdin ||
-          typeof child.stdin.end !== "function" ||
-          typeof child.stdin.once !== "function"
+          input.agent === "codex" &&
+          (!child.stdin ||
+            typeof child.stdin.end !== "function" ||
+            typeof child.stdin.once !== "function")
         ) {
           throw new ActionError(
             500,
@@ -2568,6 +2599,7 @@ export function createClaudeRunManager({
           Promise.resolve().then(() => discardTemporary(temporary)),
           Promise.resolve().then(() => releaseReviewWorkspace?.()),
           Promise.resolve().then(() => codex?.cleanup?.()),
+          Promise.resolve().then(() => grok?.cleanup?.()),
         ]);
       } finally {
         pulls.delete(pullKey);
@@ -2595,7 +2627,8 @@ export function createClaudeRunManager({
     const run = {
       agent: input.agent,
       codex,
-      codexCompleted: false,
+      grok,
+      streamCompleted: false,
       id,
       pullKey,
       workspaceKey,
@@ -2643,21 +2676,24 @@ export function createClaudeRunManager({
         text: "Codex 0.144.6 managed runs can access standard macOS temporary roots; repository and Git metadata restrictions remain enforced.",
       });
     }
+    if (input.agent === "grok") {
+      write(run, {
+        type: "diagnostic",
+        text: "Grok started.",
+      });
+    }
 
     const limit = (message) => stop(run, { type: "limit", message });
     const decoder = createLineDecoder({
       maximum: lineLimit,
       onLimit: () => limit(`${label} exceeded the per-line output limit.`),
       onLine: (line) => {
-        const events =
-          input.agent === "codex"
-            ? eventsForCodexLine(line, workspaceKey)
-            : eventsForClaudeLine(line, workspaceKey);
+        const events = eventsForRun(input.agent, line, workspaceKey);
         for (const event of events) {
           if (event.type === "error") {
             stop(run, event);
           } else if (event.type === "protocol") {
-            run.codexCompleted = event.status === "completed";
+            run.streamCompleted = event.status === "completed";
           } else if (event.type === "text") {
             const text = run.redactor.push(event.text);
             if (text) write(run, { ...event, text });
@@ -2711,10 +2747,14 @@ export function createClaudeRunManager({
         if (run.closed) return;
         let terminalEvent = null;
         if (!run.terminal) {
-          if (code === 0 && run.agent === "codex" && !run.codexCompleted) {
+          if (
+            code === 0 &&
+            isIsolatedAgent(run.agent) &&
+            !run.streamCompleted
+          ) {
             terminalEvent = {
               type: "error",
-              message: "Codex exited without completing its event stream.",
+              message: `${agentLabel(run.agent)} exited without completing its event stream.`,
             };
           } else if (code === 0 && run.source === "review") {
             try {
@@ -2723,7 +2763,7 @@ export function createClaudeRunManager({
               }
               await finishReview(
                 run,
-                run.agent === "codex" ? publishCodexReview : null,
+                isIsolatedAgent(run.agent) ? publishCodexReview : null,
               );
               terminalEvent = { type: "complete", exitCode: 0 };
             } catch {
@@ -2882,6 +2922,7 @@ export function actionError(error) {
     error instanceof ActionError ||
     error instanceof AgentError ||
     error instanceof CodexError ||
+    error instanceof GrokError ||
     error instanceof ReviewTaskError ||
     error instanceof WorkspaceError
   ) {

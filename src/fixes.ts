@@ -1,3 +1,4 @@
+import { agentLabel } from "./agent";
 import type { Agent, ReviewCommentSide } from "./types";
 
 export const DEFAULT_FIX_INSTRUCTIONS =
@@ -287,7 +288,9 @@ const parseAgentEvent = (value: unknown, label: string): AgentRunEvent => {
     isRecord(value) &&
     value.type === "start" &&
     hasOnlyKeys(value, ["agent", "type", "runId", "repository", "number"]) &&
-    (value.agent === "claude" || value.agent === "codex") &&
+    (value.agent === "claude" ||
+      value.agent === "codex" ||
+      value.agent === "grok") &&
     isNonEmptyString(value.runId) &&
     isNonEmptyString(value.repository) &&
     isInteger(value.number) &&
@@ -567,7 +570,7 @@ export async function* streamAgentRun(
     signal,
   );
 
-  const label = agent === "codex" ? "Codex" : "Claude";
+  const label = agentLabel(agent);
   if (!response.ok) {
     throw await getResponseError(response, `${label} could not be started`);
   }

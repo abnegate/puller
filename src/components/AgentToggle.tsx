@@ -21,7 +21,7 @@ type AgentToggleProps = {
 };
 
 const description =
-  "Applies to future runs only; active and queued work keeps its original agent. Codex 0.144.6 uses its standard macOS sandbox, including temporary-root access. New tasks intentionally load repository instructions.";
+  "Applies to future runs only; active and queued work keeps its original agent. Codex 0.144.6 uses its standard macOS sandbox, including temporary-root access. Grok 1.0.5 uses an isolated GROK_HOME and the strict sandbox (read-only for Verify). New tasks intentionally load repository instructions.";
 
 export default function AgentToggle({
   agent,
@@ -72,6 +72,7 @@ export default function AgentToggle({
         >
           <DropdownMenuRadioItem value="claude">Claude</DropdownMenuRadioItem>
           <DropdownMenuRadioItem value="codex">Codex</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="grok">Grok</DropdownMenuRadioItem>
         </DropdownMenuRadioGroup>
         <p className="px-1.5 pt-1 pb-0.5 text-[0.6875rem] leading-4 text-muted-foreground">
           New runs only

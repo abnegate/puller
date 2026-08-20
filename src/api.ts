@@ -536,7 +536,7 @@ const isRepository = (value: unknown): value is string =>
   value.split("/").every((part) => part !== "." && part !== "..");
 
 const isAgent = (value: unknown): value is Agent =>
-  value === "claude" || value === "codex";
+  value === "claude" || value === "codex" || value === "grok";
 
 const isTaskId = (value: unknown): value is string =>
   typeof value === "string" && TASK_ID.test(value);

@@ -1220,13 +1220,13 @@ describe("PullRow controlled Fix presentation", () => {
 
     const notice = screen.getByRole("status", { name: /rate limit/i });
     expect(notice).toHaveTextContent("You've hit your weekly limit.");
-    const swap = screen.getByRole("button", { name: "Switch to Codex" });
+    const swap = screen.getByRole("button", { name: "Switch to Grok" });
     fireEvent.click(swap);
     expect(
-      screen.getByText("Using Codex. Run fix to continue."),
+      screen.getByText("Using Grok. Run fix to continue."),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Switch to Codex" }),
+      screen.queryByRole("button", { name: "Switch to Grok" }),
     ).not.toBeInTheDocument();
   });
 

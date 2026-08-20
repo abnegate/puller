@@ -11,6 +11,7 @@ describe("agent contract", () => {
   it.each([
     ["claude", "Claude Code"],
     ["codex", "Codex"],
+    ["grok", "Grok"],
   ])("accepts %s", (agent, label) => {
     expect(validateAgent(agent)).toBe(agent);
     expect(agentLabel(agent)).toBe(label);
@@ -25,7 +26,9 @@ describe("agent contract", () => {
   it.each(["", "Codex", "claude-code", null, 1, {}])(
     "rejects an invalid agent",
     (agent) => {
-      expect(() => validateAgent(agent)).toThrow("Select Claude or Codex");
+      expect(() => validateAgent(agent)).toThrow(
+        "Select Claude, Codex, or Grok",
+      );
     },
   );
 });
